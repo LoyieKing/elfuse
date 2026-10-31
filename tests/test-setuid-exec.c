@@ -153,11 +153,8 @@ static int stage_owner(unsigned owner)
     return 1;
 }
 
-/* Whether the *guest* runs as root, which decides what a chown means to the
- * emulation. It says nothing about the host: elfuse can be running as host root
- * while the guest is uid 1000, so a chown the guest performs may still land
- * physically. Checks that turn on that difference resolve it from the observed
- * outcome rather than from this.
+/* --user can make guest credentials differ from the host. Observe the physical
+ * chown result before deciding which set-id transitions the host permits.
  */
 static int caller_is_privileged(void)
 {

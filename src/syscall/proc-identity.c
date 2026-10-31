@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "syscall/linux-wire.h"
 #include "syscall/internal.h"
@@ -23,9 +24,8 @@ static _Atomic int64_t guest_pid = 1, parent_pid = 0;
 static _Atomic bool child_subreaper;
 static _Atomic bool soft_newpid;
 static _Atomic int dumpable = 1; /* Linux PR_SET/GET_DUMPABLE */
-static _Atomic uint32_t emu_uid = GUEST_UID, emu_euid = GUEST_UID;
-static _Atomic uint32_t emu_suid = GUEST_UID, emu_gid = GUEST_GID;
-static _Atomic uint32_t emu_egid = GUEST_GID, emu_sgid = GUEST_GID;
+static _Atomic uint32_t emu_uid, emu_euid, emu_suid;
+static _Atomic uint32_t emu_gid, emu_egid, emu_sgid;
 
 static pthread_mutex_t session_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic int64_t guest_sid = 1, guest_pgid = 1;
@@ -35,8 +35,8 @@ static _Atomic int32_t guest_has_ctty = 1;
 static _Atomic bool fakeroot_enabled = false;
 
 static _Atomic bool initial_ids_staged = false;
-static _Atomic uint32_t initial_uid = GUEST_UID;
-static _Atomic uint32_t initial_gid = GUEST_GID;
+static _Atomic uint32_t initial_uid;
+static _Atomic uint32_t initial_gid;
 
 void proc_set_fakeroot_enabled(bool enabled)
 {
@@ -91,12 +91,14 @@ void proc_identity_init(void)
     child_subreaper = false;
     atomic_store_explicit(&dumpable, 1, memory_order_relaxed);
 
-    uint32_t uid = GUEST_UID;
-    uint32_t gid = GUEST_GID;
+    uint32_t uid = (uint32_t) getuid();
+    uint32_t euid = (uint32_t) geteuid();
+    uint32_t gid = (uint32_t) getgid();
+    uint32_t egid = (uint32_t) getegid();
 
     if (proc_fakeroot_enabled()) {
-        uid = 0;
-        gid = 0;
+        uid = euid = 0;
+        gid = egid = 0;
     }
 
     /* A staged --user wins over the defaults and over fakeroot; consumed here
@@ -106,14 +108,16 @@ void proc_identity_init(void)
                                  memory_order_acquire)) {
         uid = atomic_load_explicit(&initial_uid, memory_order_relaxed);
         gid = atomic_load_explicit(&initial_gid, memory_order_relaxed);
+        euid = uid;
+        egid = gid;
     }
 
-    emu_uid = uid;
-    emu_euid = uid;
-    emu_suid = uid;
-    emu_gid = gid;
-    emu_egid = gid;
-    emu_sgid = gid;
+    atomic_store_explicit(&emu_uid, uid, memory_order_relaxed);
+    atomic_store_explicit(&emu_euid, euid, memory_order_relaxed);
+    atomic_store_explicit(&emu_suid, euid, memory_order_relaxed);
+    atomic_store_explicit(&emu_gid, gid, memory_order_relaxed);
+    atomic_store_explicit(&emu_egid, egid, memory_order_relaxed);
+    atomic_store_explicit(&emu_sgid, egid, memory_order_relaxed);
     guest_sid = 1;
     guest_pgid = 1;
     guest_fg_pgrp = 1;

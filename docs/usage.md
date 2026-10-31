@@ -59,6 +59,14 @@ request or a malformed `--env` entry is rejected before the VM is created, and
 a bad request fails with a diagnostic instead of launching a guest that runs as
 something other than what was asked for.
 
+By default the guest inherits the host's real and effective UID/GID. Saved IDs
+start at the corresponding effective IDs. These values initialize guest state;
+later guest credential changes do not change the host process credentials.
+
+Without account files in a sysroot, the synthetic passwd/group files associate
+the guest's effective UID/GID with the existing user entry. Sysroot account
+files take precedence; inheriting a numeric ID does not import macOS usernames.
+
 `--user UID[:GID]` sets the identity the guest reports through `getuid` and
 `getgid`. It does not change the host process credentials: elfuse translates the
 guest's syscalls, so the number the guest sees is elfuse's to choose. The spec is

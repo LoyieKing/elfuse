@@ -15,10 +15,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <unistd.h>
 
 #include "syscall/proc.h"
 #include "syscall/proc-identity.h"
-#include "syscall/linux-wire.h"
 
 /* Mock shim_globals_publish_pgsid to avoid linking the entire guest shim
  * subsystem
@@ -45,12 +45,12 @@ int main(void)
     proc_set_fakeroot_enabled(false);
     proc_identity_init();
 
-    assert(proc_get_uid() == GUEST_UID);
-    assert(proc_get_euid() == GUEST_UID);
-    assert(proc_get_suid() == GUEST_UID);
-    assert(proc_get_gid() == GUEST_GID);
-    assert(proc_get_egid() == GUEST_GID);
-    assert(proc_get_sgid() == GUEST_GID);
+    assert(proc_get_uid() == getuid());
+    assert(proc_get_euid() == geteuid());
+    assert(proc_get_suid() == geteuid());
+    assert(proc_get_gid() == getgid());
+    assert(proc_get_egid() == getegid());
+    assert(proc_get_sgid() == getegid());
     assert(proc_fakeroot_enabled() == false);
 
     /* Test 2: Enable via API */
@@ -88,8 +88,8 @@ int main(void)
         fakeroot = true;
     proc_set_fakeroot_enabled(fakeroot);
     proc_identity_init();
-    assert(proc_get_uid() == GUEST_UID);
-    assert(proc_get_gid() == GUEST_GID);
+    assert(proc_get_uid() == getuid());
+    assert(proc_get_gid() == getgid());
     assert(proc_fakeroot_enabled() == false);
 
     /* Test 5: consume-once. A leftover would leak one launch's --user into the
@@ -106,8 +106,8 @@ int main(void)
     assert(proc_get_sgid() == 5678);
 
     proc_identity_init();
-    assert(proc_get_uid() == GUEST_UID);
-    assert(proc_get_gid() == GUEST_GID);
+    assert(proc_get_uid() == getuid());
+    assert(proc_get_gid() == getgid());
 
     /* Test 6: the elfuse_launch fail path drops the staging
      * (proc_clear_initial_ids contract in proc.h).
@@ -115,10 +115,22 @@ int main(void)
     proc_set_initial_ids(1234, 5678);
     proc_clear_initial_ids();
     proc_identity_init();
-    assert(proc_get_uid() == GUEST_UID);
-    assert(proc_get_euid() == GUEST_UID);
-    assert(proc_get_gid() == GUEST_GID);
-    assert(proc_get_egid() == GUEST_GID);
+    assert(proc_get_uid() == getuid());
+    assert(proc_get_euid() == geteuid());
+    assert(proc_get_gid() == getgid());
+    assert(proc_get_egid() == getegid());
+
+    uid_t host_uid = getuid(), host_euid = geteuid();
+    gid_t host_gid = getgid(), host_egid = getegid();
+    proc_set_fakeroot_enabled(true);
+    proc_identity_init();
+    assert(proc_sys_setgid(5678) == 0);
+    assert(proc_sys_setuid(1234) == 0);
+    assert(proc_get_uid() == 1234 && proc_get_gid() == 5678);
+    assert(getuid() == host_uid && geteuid() == host_euid);
+    assert(getgid() == host_gid && getegid() == host_egid);
+    proc_set_fakeroot_enabled(false);
+    proc_identity_init();
 
     printf("test-identity-override-host: PASS\n");
     return 0;

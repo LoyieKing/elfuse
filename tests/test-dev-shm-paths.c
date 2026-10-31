@@ -703,13 +703,7 @@ static void test_execve_real_binary_runs(const char *self)
         return;
     }
 
-    /* Grant world-execute so elfuse's exec-permission model (which compares the
-     * emulated euid against the host file's owner) admits the copy regardless
-     * of the runner's host uid. Without this the check is owner-only (0700) and
-     * the exec runs or is rejected depending on whether the host uid happens to
-     * match the emulated GUEST_UID, making this case pass on some CI runners
-     * and skip on others.
-     */
+    /* Explicit guest credentials may differ from the host file owner. */
     if (chmod(shm_exec, 0777) != 0) {
         (void) unlink(shm_exec);
         FAIL("chmod shm exec copy");

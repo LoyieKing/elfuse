@@ -12,6 +12,7 @@
 #include <sys/types.h> /* gid_t */
 #include <sys/wait.h>  /* waitpid */
 #include <unistd.h>    /* getgroups */
+#include <sys/auxv.h>
 
 #include "test-harness.h"
 #include "raw-syscall.h"
@@ -131,18 +132,19 @@ int main(void)
 
     printf("test-credentials: UID/GID, capabilities, priority, affinity\n");
 
-    long uid = raw_syscall0(__NR_getuid);
-    long expected_id = (uid == 0) ? 0 : 1000;
+    long expected_id = (long) getauxval(AT_UID);
+    long expected_euid = (long) getauxval(AT_EUID);
+    long expected_gid = (long) getauxval(AT_GID);
+    long expected_egid = (long) getauxval(AT_EGID);
 
-    /* Baseline: UID/GID should match expected_id */
     TEST("getuid matches expected");
     EXPECT_TRUE(raw_syscall0(__NR_getuid) == expected_id, "unexpected uid");
 
     TEST("geteuid matches expected");
-    EXPECT_TRUE(raw_syscall0(__NR_geteuid) == expected_id, "unexpected euid");
+    EXPECT_TRUE(raw_syscall0(__NR_geteuid) == expected_euid, "unexpected euid");
 
     TEST("getgid matches expected");
-    EXPECT_TRUE(raw_syscall0(__NR_getgid) == expected_id, "unexpected gid");
+    EXPECT_TRUE(raw_syscall0(__NR_getgid) == expected_gid, "unexpected gid");
 
     /* getresuid returns coherent triple */
     TEST("getresuid coherent");
@@ -150,8 +152,8 @@ int main(void)
         unsigned int ruid = 0, euid = 0, suid = 0;
         long rc = raw_syscall3(__NR_getresuid, (long) &ruid, (long) &euid,
                                (long) &suid);
-        EXPECT_TRUE(rc == 0 && ruid == expected_id && euid == expected_id &&
-                        suid == expected_id,
+        EXPECT_TRUE(rc == 0 && ruid == expected_id && euid == expected_euid &&
+                        suid == expected_euid,
                     "getresuid mismatch");
     }
 
@@ -237,14 +239,14 @@ int main(void)
         unsigned int rgid = 0, egid = 0, sgid = 0;
         long rc = raw_syscall3(__NR_getresgid, (long) &rgid, (long) &egid,
                                (long) &sgid);
-        EXPECT_TRUE(rc == 0 && rgid == expected_id && egid == expected_id &&
-                        sgid == expected_id,
+        EXPECT_TRUE(rc == 0 && rgid == expected_gid && egid == expected_egid &&
+                        sgid == expected_egid,
                     "getresgid mismatch");
     }
 
     /* setgid: same constraints as setuid */
     TEST("setgid(expected) succeeds");
-    EXPECT_TRUE(raw_syscall1(__NR_setgid, expected_id) == 0, "setgid failed");
+    EXPECT_TRUE(raw_syscall1(__NR_setgid, expected_gid) == 0, "setgid failed");
 
     TEST("setgid(other) returns expected status");
     {
@@ -265,7 +267,7 @@ int main(void)
 
     TEST("setgroups model");
     {
-        unsigned int group = (unsigned int) expected_id;
+        unsigned int group = (unsigned int) expected_gid;
         long rc = raw_syscall2(__NR_setgroups, 1, (long) &group);
         if (expected_id == 0)
             EXPECT_TRUE(rc == 0, "setgroups root no-op failed");
@@ -310,12 +312,12 @@ int main(void)
                 "setfsuid did not return current euid");
 
     TEST("setfsgid(other) returns expected_id");
-    EXPECT_TRUE(
-        raw_syscall1(__NR_setfsgid, expected_id == 0 ? 1000 : 0) == expected_id,
-        "setfsgid did not return current egid");
+    EXPECT_TRUE(raw_syscall1(__NR_setfsgid, expected_id == 0 ? 1000 : 0) ==
+                    expected_egid,
+                "setfsgid did not return current egid");
 
     TEST("setfsgid(expected_id) returns expected_id");
-    EXPECT_TRUE(raw_syscall1(__NR_setfsgid, expected_id) == expected_id,
+    EXPECT_TRUE(raw_syscall1(__NR_setfsgid, expected_gid) == expected_egid,
                 "setfsgid did not return current egid");
 
     /* setfsuid(-1) / setfsgid(-1) is the canonical glibc "read fsuid without
@@ -329,7 +331,7 @@ int main(void)
 
     TEST("setfsgid(-1) reports current fsgid");
     EXPECT_TRUE(
-        raw_syscall1(__NR_setfsgid, (long) (unsigned) -1) == expected_id,
+        raw_syscall1(__NR_setfsgid, (long) (unsigned) -1) == expected_egid,
         "setfsgid(-1) did not report current egid");
 
     /* capset: unprivileged process cannot set capabilities */
@@ -350,12 +352,7 @@ int main(void)
     {
         gid_t list[64];
         int ngroups = getgroups(64, list);
-        if (expected_id == 0) {
-            EXPECT_TRUE(ngroups == 1 && list[0] == 0,
-                        "fakeroot getgroups mismatch");
-        } else {
-            EXPECT_TRUE(ngroups >= 0, "getgroups failed");
-        }
+        EXPECT_TRUE(ngroups >= 0, "getgroups failed");
     }
 
     /* setpriority/getpriority coherence */
@@ -376,6 +373,7 @@ int main(void)
 
     TEST("getpriority live thread TID");
     {
+        long parent_prio = raw_syscall2(__NR_getpriority, 0, 0);
         long ret = spawn_priority_child();
         if (ret < 0) {
             FAIL("clone failed");
@@ -384,12 +382,12 @@ int main(void)
                 raw_futex_wait((int *) &prio_child_ready, 0);
 
             long prio = raw_syscall2(__NR_getpriority, 0, prio_child_tid);
-            EXPECT_TRUE(prio == 20, "getpriority(live tid) mismatch");
+            EXPECT_TRUE(prio == parent_prio, "child did not inherit nice");
             release_priority_child();
         }
     }
 
-    TEST("setpriority live thread TID rejected");
+    TEST("setpriority live thread TID is isolated");
     {
         long ret = spawn_priority_child();
         if (ret < 0) {
@@ -401,12 +399,15 @@ int main(void)
             raw_syscall3(__NR_setpriority, 0, 0, 0);
             long baseline_prio = raw_syscall2(__NR_getpriority, 0, 0);
             int tid = prio_child_tid;
-            long rc = raw_syscall3(__NR_setpriority, 0, tid, 5);
+            int nice = 20 - (int) baseline_prio + 1;
+            if (nice > 19)
+                nice = 19;
+            long rc = raw_syscall3(__NR_setpriority, 0, tid, nice);
             long self_prio = raw_syscall2(__NR_getpriority, 0, 0);
             long tid_prio = raw_syscall2(__NR_getpriority, 0, tid);
-            EXPECT_TRUE(rc == -3 && self_prio == baseline_prio &&
-                            tid_prio == baseline_prio,
-                        "setpriority(live tid) changed global nice");
+            EXPECT_TRUE(
+                rc == 0 && self_prio == baseline_prio && tid_prio == 20 - nice,
+                "task nice mutation leaked or was rejected");
             release_priority_child();
             prio_dead_tid = tid;
         }

@@ -36,9 +36,6 @@ typedef struct {
     uint64_t pstate;   /* SPSR_EL1 */
 } linux_user_pt_regs_t;
 
-/* Emulated guest identity: all UID/GID variants return these values. */
-#define GUEST_UID 1000
-#define GUEST_GID 1000
 
 /* Linux errno values. */
 #define LINUX_EPERM 1

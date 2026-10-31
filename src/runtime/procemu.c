@@ -3063,17 +3063,19 @@ static int intercept_open_dispatch(const guest_t *g,
 
     /* /etc/passwd -> synthetic passwd with root + current user */
     if (!strcmp(path, "/etc/passwd")) {
-        return proc_emit_literal(
+        return proc_emit_fmt(
             "root:x:0:0:root:/root:/bin/sh\n"
-            "user:x:1000:1000:user:/home/user:/bin/sh\n");
+            "user:x:%u:%u:user:/home/user:/bin/sh\n",
+            proc_get_euid(), proc_get_egid());
     }
 
     /* /etc/group -> synthetic group file */
     if (!strcmp(path, "/etc/group")) {
-        return proc_emit_literal(
+        return proc_emit_fmt(
             "root:x:0:\n"
             "staff:x:20:\n"
-            "user:x:1000:\n");
+            "user:x:%u:\n",
+            proc_get_egid());
     }
 
     /* /sys/devices/system/cpu[/...] -> synthetic CPU topology stub. Backs the

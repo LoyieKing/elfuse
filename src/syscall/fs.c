@@ -3958,17 +3958,8 @@ static int64_t chown_result(int host_rc,
     if (host_rc < 0 && errno != EPERM)
         return linux_errno();
     if (host_st) {
-        /* cur_uid/cur_gid must be the owner the guest *currently sees*, not the
-         * raw host stat values. The two differ on macOS where the host user UID
-         * (e.g. 501) does not match GUEST_UID (1000), and whenever the file
-         * already has an overlay entry that virtualises its owner.
-         * chown_overlay_set uses cur_uid/cur_gid for both the early-exit no-op
-         * guard and the stale-entry removal guard; passing the physical UID
-         * evaluates those guards in the wrong ID namespace.
-         *
-         * Apply the existing overlay to a temporary copy of the host stat to
-         * obtain the guest-visible owner before forwarding to
-         * chown_overlay_set.
+        /* The overlay's no-op and removal checks need the guest-visible owner,
+         * including any earlier virtual chown on this inode.
          */
         struct stat guest_st = *host_st;
         chown_overlay_apply(&guest_st);

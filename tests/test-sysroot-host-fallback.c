@@ -25,6 +25,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -142,12 +143,25 @@ int main(int argc, char **argv)
         PASS();
 
     TEST("absent sysroot group file falls back to synthetic intercept");
-    if (read_file_nul("/etc/group", buf, sizeof(buf)) <= 0)
-        FAIL("read /etc/group failed");
-    else if (strncmp(buf, "root:x:0:\nstaff:x:20:\nuser:x:1000:\n", 32))
-        FAIL("did not fall back to synthetic group intercept");
-    else
-        PASS();
+    {
+        FILE *groups = fopen("/etc/group", "r");
+        if (!groups)
+            FAIL("read /etc/group failed");
+        else {
+            struct group *group;
+            while ((group = fgetgrent(groups)) != NULL) {
+                if (!strcmp(group->gr_name, "user"))
+                    break;
+            }
+            if (!group)
+                FAIL("synthetic user group missing");
+            else if (group->gr_gid != getegid())
+                FAIL("synthetic user group does not match guest GID");
+            else
+                PASS();
+            fclose(groups);
+        }
+    }
 
     TEST("blocked guest system path does not fall back to host");
     {

@@ -62,8 +62,8 @@ typedef struct {
     char **envp;
 
     /* When true, uid/gid are staged before bring-up so the auxv AT_UID/AT_GID
-     * snapshot and getuid()/getgid() agree. When false the guest runs under
-     * GUEST_UID/GUEST_GID (0 under fakeroot), never the host identity.
+     * snapshot and getuid()/getgid() agree. Otherwise credentials inherit the
+     * host's real/effective IDs, or uid/gid 0 under fakeroot.
      */
     bool has_creds;
     uint32_t uid, gid;

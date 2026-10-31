@@ -330,7 +330,8 @@ int main(void)
         int len = sizeof(cred);
         r = raw_syscall5(__NR_getsockopt, sv[0], LINUX_SOL_SOCKET,
                          LINUX_SO_PEERCRED, (long) &cred, (long) &len);
-        if (r == 0 && cred.pid == pid && cred.uid == 1000 && cred.gid == 1000)
+        if (r == 0 && cred.pid == pid && cred.uid == getuid() &&
+            cred.gid == getgid())
             PASS();
         else {
             printf("FAIL: SO_PEERCRED: r=%ld pid=%d uid=%u gid=%u (errno=%d)\n",
@@ -394,7 +395,7 @@ int main(void)
 
         if (cmsg_level == LINUX_SOL_SOCKET &&
             cmsg_type == LINUX_SCM_CREDENTIALS && recv_cred.pid == pid &&
-            recv_cred.uid == 1000 && recv_cred.gid == 1000)
+            recv_cred.uid == getuid() && recv_cred.gid == getgid())
             PASS();
         else {
             printf(
