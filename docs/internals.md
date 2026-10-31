@@ -111,7 +111,7 @@ Key files:
 | `src/syscall/proc.c` | vCPU run loop, `wait4`, ptrace coordination, HVC #6 routing |
 | `src/syscall/exec.c` | `execve`: ELF reload, interpreter resolve, vCPU restart |
 | `src/runtime/forkipc.c`, `fork-state.c` | `fork`/`clone` state transfer over the fork IPC channel |
-| `src/runtime/thread.c`, `futex.c` | guest thread table, futex wait queues |
+| `src/runtime/thread.c`, `futex.c`, `sched/` | task lifetime, per-VM scheduling and priority-inherited futex waits |
 | `src/runtime/procemu.c` | `/proc`, `/dev`, and selected pseudo-files |
 | `src/runtime/usb-sysfs.c` | synthetic `/dev/bus/usb` and `/sys/bus/usb` trees from the IOKit registry |
 | `src/runtime/proctitle.c` | argv / comm rewriting for `prctl PR_SET_NAME` |
@@ -370,6 +370,23 @@ aligned address from the `Rt` register); HVF traps DC ZVA via `HCR_EL2.TDZ=1`.
 | #11 | EL0 fault | SIGSEGV/SIGILL delivery; GPRs in frame |
 | #12 | EL0 system-instruction trap | cache maintenance logging (DC CVAU, IC IVAU, …) and `MSR TPIDR_EL0` emulation |
 | #13 | Ptrace interrupt | the shim restores the saved SVC frame before this stop, so ptrace snapshots architectural registers |
+| #14 | SYNC_CORE trampoline done | the host redirected this vCPU to vector slot `0x600`, which executed guest `IC IALLU`/`DSB ISH`/`ISB` and saved `ELR_EL1`/`SPSR_EL1`; the host acknowledges the barrier generation in `vcpu_pool_barrier_ack_current()`. No register is an input; the shim restores all GPRs and `ERET`s to the interrupted `PC`/`CPSR` |
+
+### Guest Barriers And SYNC_CORE
+
+`vcpu_pool_membarrier(sync_core)` publishes a per-VM generation, kicks every
+owner that can execute guest code, and returns after each such owner
+acknowledges.  A plain expedited barrier is a host full fence plus `ISB` on the
+owner at its next safe point.  `MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE`
+additionally needs the guest-side I-cache invalidation on every target vCPU:
+`IC IALLU` is per-PE, and an IS-broadcast `TLBI` does not wait for or perform
+it.  The owner therefore redirects its paused vCPU to vector slot `0x600` (the
+unused AArch32 synchronous slot) with `ELR_EL1`/`SPSR_EL1` holding the
+interrupted `PC`/`CPSR` and `CPSR` set to EL1h+DAIF.  The trampoline preserves
+the complete GPR set, runs `IC IALLU`, `DSB ISH`, `ISB`, and enters `HVC #14`;
+the host only acknowledges and returns, and the trampoline `ERET`s to the exact
+interrupted state.  A task that is not mounted keeps its generation lag and
+runs the same trampoline before its next guest instruction.
 
 ### Critical Vector-Entry Rule
 
@@ -489,13 +506,10 @@ apart. The deadline such a timeout produces is added to the clock with
 saturation, since the largest one Linux accepts is within seconds of
 overflowing a 64-bit millisecond count.
 
-An interrupted receive with a finite timeout forbids the SVC restart only
-when the interruption is one the guest can see. `io_wait_fd_timed_or_-
-interrupted()` also reports `EINTR` for the dispatcher's own execve
-handoff, which no signal accompanies; forbidding there turned a sibling's
-`execve` into an `EINTR` on a `recvmsg`. The restarted call instead resumes
-the deadline the interrupted attempt was using, which is what Linux's
-`restart_block` carries.
+Netlink receive retains its absolute timeout in task-owned continuation state.
+A parked receive adopts that deadline when re-dispatched instead of receiving
+a fresh timeout. Finite-timeout interruption forbids automatic SVC restart;
+untimed waits follow the signal handler's restart policy.
 
 `SOL_NETLINK` is emulated under the same contract `bind()` gives -- the
 membership and the flags are recorded, and no multicast traffic is ever
@@ -567,21 +581,48 @@ time. Validation: `tests/test-msync.c`,
 
 ## Threads And Futexes
 
-Guest threads map 1:1 to host pthreads. Each guest thread owns one vCPU and
-shares the same guest address space. HVF supports multiple vCPUs per VM,
-each bound to the host thread that created it; multiple vCPUs share guest
-physical memory via `hv_vm_map()`. Up to `MAX_THREADS = 64` guest threads
-are supported per VM.
+Each guest user thread is a `thread_entry_t` task with saved architectural
+state. Tasks run on a per-VM logical CPU pool; a worker owns its HVF handle
+and host pthread. Slot 0 adopts the bootstrap vCPU, and additional workers
+are created lazily from runnable demand up to the CPU limit. Task count does
+not determine vCPU count. Forked host processes have independent schedulers;
+Darwin schedules competition between VMs.
 
-### Thread Table
+`sched.c` owns per-CPU fair, RT and deadline queues, placement, budgets and
+base/effective scheduling attributes. Fair queues use an augmented red-black
+tree and CPU-local virtual time derived from Zircon mechanics. FIFO/RR and
+EDF/CBS policies use Linux selection and budget rules. Mach thread CPU samples
+around guest/host transitions feed separate user and service totals.
+
+Only the outer worker loop changes `current_thread`. Syscall handlers request
+yield, migration or park; their own return protocol completes before a switch.
+`proc_resume_task` resolves completed waits through that same return protocol.
+Waits retain task-owned continuations, and IO readiness is driven by a kqueue
+pump with lifetime-pinned, generation-tagged registrations. Idle workers wait
+for ready work or timer events instead of unwinding the VM.
+
+Blocking read/write descriptors use the IO continuation path. Socket stream
+sends and MSG_WAITALL receives retain their byte offset across readiness parks,
+including vector and message APIs. A park sentinel propagates to dispatch;
+only final completion writes X0 or emits the shim return marker.
+
+FUSE clients run synchronous protocol work on service pthreads while their
+tasks park. Jobs own host parameters, reply buffers, a task reference and park
+sequence. The owner consumes the result and writes guest memory after remount;
+service threads never access HVF registers. RELEASE replies retire detached
+requests asynchronously. Fork returns EAGAIN while a sibling retains a FUSE
+service job, so a snapshot cannot race its descriptor or session publication.
+
+### Thread / Kernel-Task Table
 
 `src/runtime/thread.c` and `thread.h`:
 
-- `thread_entry_t` per thread holds the vCPU handle plus its explicit validity,
-  host pthread, per-thread signal mask, `clear_child_tid` (for
-  `CLONE_CHILD_CLEARTID`), and the thread's `SP_EL1` exception stack.
+- A task owns `guest_ctx`, scheduling state, signal masks and frame metadata,
+  restart witnesses, wait continuations, `clear_child_tid` and its `SP_EL1`
+  exception stack. It owns no HVF handle or host pthread. Lifetime references
+  prevent storage reuse while asynchronous operations still name the task.
 - `_Thread_local current_thread` gives O(1) access from syscall handlers.
-- Each thread receives a 4 KiB EL1 exception stack carved out of the shim
+- Each task receives a 4 KiB EL1 exception stack carved out of the shim
   data region.
 
 ### Futex
@@ -590,10 +631,11 @@ are supported per VM.
 
 - The classic ops: `FUTEX_WAIT`, `FUTEX_WAKE`, `FUTEX_WAIT_BITSET`,
   `FUTEX_WAKE_BITSET`, `FUTEX_REQUEUE`, `FUTEX_CMP_REQUEUE`, `FUTEX_WAKE_OP`.
-- A subset of priority-inheritance ops: `FUTEX_LOCK_PI`, `FUTEX_UNLOCK_PI`,
-  `FUTEX_TRYLOCK_PI`. Priority semantics are not actually inherited -- the
-  ops behave as ordinary mutex acquire/release, which is enough for glibc
-  and musl to make forward progress.
+- PI operations `FUTEX_LOCK_PI`, `FUTEX_UNLOCK_PI`, `FUTEX_TRYLOCK_PI` and
+  PI requeue maintain local owner/waiter relations. Effective priority is
+  donated through blocking chains; handoff selects the highest effective
+  priority and FIFO order among equals. Base scheduling attributes remain
+  unchanged. Cross-VM priority donation is not guaranteed.
 - `futex_waitv` (syscall 449) for batch waits across up to 128 futex
   addresses.
 - Robust-list cleanup: `set_robust_list` / `get_robust_list` are wired up
@@ -635,17 +677,19 @@ via `TLBI VMALLE1IS` from any vCPU; hardware coherency is verified by
 
 ### Thread Group Exit
 
-`exit_group` sets a global `exit_group_requested` flag, calls
-`thread_for_each(thread_force_exit_cb)` which invokes `hv_vcpus_exit()` on
-all worker vCPUs to break them out of `hv_vcpu_run()`, and joins worker
-threads with a timeout so `CLEARTID` cleanup can complete.
+`exit_group` publishes the exit request, wakes parked tasks and kicks pool
+workers. The worker loop saves or terminates the mounted task before
+`thread_exit_task` performs robust-list, PI, CLEARTID and lifecycle cleanup.
+Exit cleanup has one claimant. Pool shutdown joins owner pthreads before VM
+memory is unmapped; task lifetime never depends on per-task pthread joins.
 
-### Not Implemented
+### Compatibility Boundary
 
-- True priority inheritance for the PI futex ops. The ops are wired up but
-  behave as ordinary mutexes; this matches what glibc and musl need for
-  forward progress, not real RT scheduling.
-- CPU affinity (`sched_setaffinity`) returns the all-CPUs mask.
+The [scheduler reference](scheduler.md) describes per-VM behavior and the
+accepted cross-VM scheduling differences. Common fork/exec/wait remains
+required. Exec with independent live users of a shared mm is
+rejected before resetting that shared address space. CPU affinity names local
+logical CPUs; equal CPU numbers in different VMs do not imply exclusion.
 
 ## Fork, Clone, And `execve`
 
@@ -754,10 +798,10 @@ same guest memory, and the same page tables.
 
 In `src/runtime/forkipc.c`:
 
-1. `hv_vcpu_create()` and per-thread `SP_EL1` allocation.
-2. Set the child SP, `TPIDR_EL0` (TLS), and copy the parent's signal mask.
-3. `pthread_create()` running `vcpu_run_loop()` for the child vCPU.
-4. Return the child TID to the parent; the child runs with `X0 = 0`.
+1. Allocate a task and its `SP_EL1` exception stack.
+2. Save the child register context, set SP/TLS and inherit signal/scheduler state.
+3. Publish TID side effects and enqueue the task on a legal logical CPU.
+4. Return its TID to the parent; the child resumes with `X0 = 0`.
 
 ### `execve`
 
@@ -767,6 +811,18 @@ like any other guest path, rebuilds page tables,
 and restarts the vCPU. Signal handlers are reset to `SIG_DFL` per POSIX:
 `SIG_IGN` stays `SIG_IGN`, and pending and blocked masks are preserved.
 This happens in `signal_reset_for_exec()` after `guest_reset`.
+
+An ordinary pthread caller executes the replacement on its current worker.
+After pre-commit validation, sibling tasks terminate against the old image;
+unmounted siblings can be claimed for cleanup without being scheduled.
+Successful replacement commits the survivor's TID to the thread-group PID.
+This path has no handoff to the original leader's host pthread.
+
+The replacement is entered on the surviving task's own `SP_EL1` slot, not on
+the shim-data block top (slot 0). A non-leader `execve` retires the old leader
+and leaves its slot free for the next clone; reusing it while the survivor
+still ran on it would put that clone's exception frames and the new leader's
+on the same 4KiB.
 
 ## Signals
 
@@ -787,7 +843,7 @@ Key points:
 - Guest `ITIMER_REAL` is emulated internally rather than being forwarded to
   host `setitimer`, because macOS shares `alarm()` and
   `setitimer(ITIMER_REAL)` as a single timer, and `elfuse` already needs
-  `alarm()` for its per-iteration vCPU watchdog.
+  that timer for its execution watchdog.
 - `signal_check_timer()` is called from the vCPU loop after each syscall.
 - After `SYSCALL_EXEC_HAPPENED`, the vCPU loop verifies that `ELR_EL1` is
   non-zero -- a defensive check against HVF register-sync bugs.

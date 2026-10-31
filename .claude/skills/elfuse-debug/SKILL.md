@@ -33,13 +33,12 @@ classification is the first bisection, and it is free:
 | `CRASH_HV_CHECK` | Hypervisor.framework refused a call. Host-side: a mapping or permission elfuse asked for is not one HVF allows. |
 | `CRASH_ELR_ZERO` | Register state after exec is not what the host wrote. A return-to-EL0 path problem, not a loader problem. |
 | `CRASH_UNEXPECTED_EXIT` | `hv_vcpu_run()` returned an exit reason the loop does not handle. Host-side: HVF or the run loop, not the guest. |
-| `CRASH_TIMEOUT` | One `hv_vcpu_run()` iteration exceeded the `--timeout` watchdog. |
+| `CRASH_TIMEOUT` | Guest execution made no exception progress within the `--timeout` watchdog window. |
 
-`CRASH_TIMEOUT` is the one that gets misread. The watchdog bounds a single run
-iteration, not total runtime, so a CPU-bound guest can trip it legitimately and
-`--timeout 0` is the right answer there. A guest that is actually stuck (futex,
-wait, poll) trips it too, and raising the timeout only makes it take longer to
-say so.
+`CRASH_TIMEOUT` measures stalled guest execution across scheduler preemption,
+not total process lifetime. CPU-bound work can trigger it legitimately;
+`--timeout 0` disables that limit. A task parked in a syscall is outside the
+execution watchdog. Diagnose a blocked wait from the harness timeout sample.
 
 ## Build a loop that goes red
 

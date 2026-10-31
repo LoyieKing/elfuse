@@ -23,7 +23,7 @@ linker resolved against an external sysroot via `--sysroot`.
 - Static and dynamically linked `x86_64-linux` ELF binaries via Apple
   Rosetta (auto-detected from the ELF header, opt out with
   `--no-rosetta`)
-- Linux-style processes, threads (1:1 with HVF vCPUs, up to 64),
+- Linux-style processes, threads (kernel tasks multiplexed onto ncpu HVF vCPUs),
   signals, timers, futexes (incl. PI ops), and polling
 - Guest reads and writes the macOS filesystem directly; no overlay or
   volume mount layer
@@ -215,13 +215,17 @@ do.
   per host process; Linux-style `fork` is implemented by
   `posix_spawn`-ing a fresh `elfuse` host process and transferring
   state (see [docs/internals.md](docs/internals.md)).
-- Up to 64 concurrent guest threads per VM (`MAX_THREADS = 64`).
+- Each VM has an independent logical CPU scheduler and an HVF worker pool
+  created on demand, bounded by host ncpu. Tasks carry saved state and can
+  migrate between workers; task count is bounded by memory and the SP_EL1 pool.
 - The implemented syscall set is `src/syscall/dispatch.tbl`; anything
   outside it returns `-ENOSYS` rather than silently succeeding.
-- `FUTEX_LOCK_PI` and friends behave as plain mutex acquire / release;
-  true priority-inheritance scheduling is not modeled.
-- `sched_setaffinity` is honored as a no-op (returns the all-CPUs
-  mask); the host scheduler picks the actual CPU.
+- PI futexes donate effective scheduling priority within one VM. Cross-VM
+  priority donation, FIFO/RR precedence and shared CPU bandwidth are not
+  guaranteed; Darwin schedules the fork backends against each other.
+- `sched_setaffinity` / `sched_getaffinity` constrain local logical CPUs.
+  Equal CPU numbers in separate VMs do not imply exclusion. See the
+  [scheduler compatibility boundary](docs/fork-scheduling.md).
 - `/proc`, `/dev`, and mount data are synthetic compatibility views,
   not host pass-throughs.
 - USB interfaces bound to an Apple class driver (CDC serial, HID, FTDI)

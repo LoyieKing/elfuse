@@ -675,6 +675,53 @@ start and, when one has moved by exit, write a line to stderr and exit 86.
 `test-rlimit-seed` goes the other way: it sets host limits with `ulimit` before
 elfuse starts and reads what the guest's `/proc/self/limits` shows.
 
+## Scheduler replacement acceptance
+
+[Scheduler architecture](scheduler.md) describes state ownership and Linux
+compatibility boundaries.
+[Scheduler regressions](../tests/scheduler/README.md) contains the focused
+guest test commands. [Classic suites](../tests/classic/README.md) documents
+kselftest and Linux Test Project build, import, and execution.
+
+The runtime uses a per-VM scheduler and lazy HVF worker pool. Acceptance covers
+task scheduling and common fork/exec/wait behavior. Cross-VM scheduling
+order/capacity and full shared-mm exec separation are accepted limits;
+unsupported exec must fail safely. The focused guide classifies required
+cases and diagnostic Linux comparisons. Runners preserve mismatches as FAIL
+even when a documented comparison is outside the cutover gate. Run filtered
+slices before selecting a full external suite.
+
+Observed on Apple M4 Pro, macOS 26.5.1 (25F80), Apple clang 17.0.0 and
+aarch64-unknown-linux-gnu GCC 15.2.0:
+
+| Lane | Result |
+|------|--------|
+| focused scheduler | 21 PASS, 1 diagnostic cross-VM FIFO FAIL |
+| elfuse-aarch64 matrix | 318 PASS, 0 FAIL, 10 SKIP |
+| qemu-aarch64 matrix | 292 PASS, 0 FAIL, 35 SKIP |
+| elfuse-x86_64 matrix | 78 PASS, 0 FAIL, 1 SKIP |
+| LLDB integration | 18 PASS |
+| FUSE contract | PASS, including single-CPU request progress |
+| UBSAN | 77 runtime tests and shared lanes passed |
+
+The Linux oracle is Alpine 6.18.59-0-virt, PREEMPT_DYNAMIC, root with
+CapEff 000001ffffffffff, CPUs 0-3 and RT runtime 950000 us. Its kernel
+SHA-256 is 25dcaf5ddff2dba4dfdb8eca510c43a282ec91bc822d7b369964c12aea0c5bfa.
+The kernel configuration is not exported through /proc/config.gz. DEADLINE
+throttle/yield and local PI also passed with only CPU 0 online.
+
+The full check completed its functional lanes but returned nonzero at the
+performance guardrail: host load exceeded 38 on 14 CPUs, so its verdict was
+UNMEASURED. ASAN hangs and TSAN crashes during host runtime initialization;
+empty programs built with the same sanitizers reproduce both failures.
+Neither lane establishes memory or race safety on this host.
+
+One final teardown spin run exceeded a 15-second harness limit. Subsequent
+spin and bringup runs each exited with the expected status 42 in 45 of 45
+attempts. No blocked stack was captured; the isolated timeout remains
+unexplained and is not evidence of a resolved teardown race.
+
+
 ## Validation Strategy By Change Type
 
 Suggested minimum validation:

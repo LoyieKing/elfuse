@@ -76,7 +76,7 @@ ligature ﬁb / fib              COLLIDE   compatibility mapping, not just NFD
 ohm Ωa / Ωa (U+2126 / U+03A9)  COLLIDE   singleton normalization
 korean 한 NFC / jamo NFD        COLLIDE
 deseret 𐐀y / 𐐨y                COLLIDE   case folding reaches beyond the BMP
-chinese 文档 / 文件             distinct  CJK has no case
+chinese U+6587 U+6863 / U+6587 U+4EF6  distinct  CJK has no case
 turkish ıd / id                distinct
 cherokee Ꭰx / ᏸx               distinct  cased in Unicode 8, but not folded here
 ```
@@ -115,7 +115,7 @@ real spelling.
 
 ```
 .ef=524541444d45          is the guest name  README
-.ef=e69687e6a1a32e747874                     文档.txt
+.ef=e69687e6a1a32e747874                     U+6587 U+6863 followed by .txt
 ```
 
 An escaped name is the four-byte prefix `.ef=` followed by a payload encoding
