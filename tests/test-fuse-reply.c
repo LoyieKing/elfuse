@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -293,6 +294,18 @@ static void expect_file_readable(void)
 
 int main(void)
 {
+    cpu_set_t allowed;
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) < 0)
+        die("sched_getaffinity");
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+        if (!CPU_ISSET(cpu, &allowed))
+            continue;
+        CPU_ZERO(&allowed);
+        CPU_SET(cpu, &allowed);
+        if (sched_setaffinity(0, sizeof(allowed), &allowed) < 0)
+            die("sched_setaffinity");
+        break;
+    }
     char mount_dir[] = "/tmp/elfuse-fuse-reply.XXXXXX";
     if (!mkdtemp(mount_dir))
         die("mkdtemp");
@@ -321,6 +334,11 @@ int main(void)
         usleep(1000);
     if (!ctx.stalled) {
         fprintf(stderr, "daemon never saw the first LOOKUP\n");
+        return 1;
+    }
+    errno = 0;
+    if (fork() != -1 || errno != EAGAIN) {
+        fprintf(stderr, "fork accepted an outstanding FUSE service job\n");
         return 1;
     }
     start_thread(&second, stat_main, &second_rc, "pthread_create(second stat)");

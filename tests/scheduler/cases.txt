@@ -1,0 +1,41 @@
+# Scheduler contract scenarios: <test binary> <scenario>
+# "test-sched-attr-abi" takes no scenario argument (written as "-").
+#
+# The runner passes SCENARIO as the only argument to the cross-compiled guest
+# binary (or to a native Linux build with --native). Scenario names must match
+# the tables in tests/test-sched-task-state.c, tests/test-sched-fork-domain.c,
+# tests/test-sched-policy-rt.c, and tests/test-sched-policy-dl.c.
+#
+# RT cases exit 77 when CAP_SYS_NICE/RLIMIT_RTPRIO is unavailable; DEADLINE
+# and PI need CAP_SYS_NICE; affinity migration exits 77 unless two CPUs are
+# allowed. A skip leaves the requirement uncovered and is not a pass.
+#
+
+test-sched-task-state nice-inherit-isolate
+test-sched-task-state signal-affinity-migrate
+test-sched-task-state process-cputime-thread-exit
+
+test-sched-attr-abi -
+test-sched-fork-domain fork-inherit-isolate
+
+test-sched-fork-domain rt-fifo-excludes-fork
+
+# Same-VM policy ordering and accounting for the replacement scheduler.
+test-sched-policy -
+test-sched-policy-rt rr-rotation
+test-sched-policy-rt rr-preempt-quantum
+test-sched-policy-rt fifo-yield-order
+test-sched-policy-rt fifo-wake-preempt
+test-sched-policy-dl deadline-throttle
+test-sched-policy-dl deadline-yield
+test-sched-policy-dl affinity-migrate
+
+# Forced fair preemption, PI donation, and threaded/leader-exit lifecycle.
+test-sched-preempt -
+test-futex-pi-inherit -
+test-threaded-exec -
+test-threaded-exec worker
+test-thread-leader-exit -
+test-eintr-restart -
+test-mqueue -
+test-sched-capabilities -

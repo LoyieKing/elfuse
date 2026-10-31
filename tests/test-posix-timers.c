@@ -71,6 +71,32 @@ static int take_signal(int signum, siginfo_t *info)
 
 static void test_create(void)
 {
+    struct sigevent directed = {
+        .sigev_notify = SIGEV_THREAD_ID,
+        .sigev_signo = SIGUSR1,
+        .sigev_value.sival_int = 73,
+    };
+#ifdef __GLIBC__
+    directed._sigev_un._tid = (int) syscall(SYS_gettid);
+#else
+    directed.sigev_notify_thread_id = (int) syscall(SYS_gettid);
+#endif
+    int directed_id;
+    require(syscall(SYS_timer_create, CLOCK_MONOTONIC, &directed,
+                    &directed_id) == 0,
+            "create directed timer");
+    struct itimerspec directed_value = {.it_value.tv_nsec = 1000000};
+    require(
+        syscall(SYS_timer_settime, directed_id, 0, &directed_value, NULL) == 0,
+        "arm directed timer");
+    siginfo_t directed_info;
+    TEST("thread notification preserves signal metadata");
+    EXPECT_TRUE(take_signal(SIGUSR1, &directed_info) == SIGUSR1 &&
+                    directed_info.si_code == SI_TIMER &&
+                    directed_info.si_value.sival_int == 73,
+                "directed timer notification lost");
+    require(syscall(SYS_timer_delete, directed_id) == 0,
+            "delete directed timer");
     /* Use the kernel ABI: libc can reject a bad signal before timer_create. */
     int signals[] = {0, -1, 65, INT_MAX, 1, 64};
     for (unsigned i = 0; i < sizeof(signals) / sizeof(signals[0]); i++) {
@@ -396,19 +422,6 @@ int main(int argc, char **argv)
             test_cleanup(SIGUSR1, rearm);
             test_cleanup(SIGRTMIN, rearm);
         }
-        struct sigevent event = {
-            .sigev_notify = SIGEV_THREAD_ID,
-            .sigev_signo = SIGUSR1,
-        };
-#ifdef __GLIBC__
-        event._sigev_un._tid = getpid();
-#else
-        event.sigev_notify_thread_id = getpid();
-#endif
-        int id;
-        TEST("thread notification reports ENOSYS");
-        EXPECT_ERRNO(syscall(SYS_timer_create, CLOCK_MONOTONIC, &event, &id),
-                     ENOSYS, "unsupported notification misreported");
     } else {
         test_create();
         test_settime_flags();

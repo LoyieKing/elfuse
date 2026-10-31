@@ -250,11 +250,18 @@ static void test_unsupported_flags(void)
     }
     ca.pidfd = 0;
 
-    /* CLONE_NEWPID not supported */
+    /* SoftNS soft-accepts CLONE_NEW* (strip + continue) so pidfd NSpid /
+     * NEWUSER|NEWPID|PIDFD kselftests can run; expect a successful fork.
+     */
     ca.flags = 0x20000000; /* CLONE_NEWPID */
+    ca.exit_signal = 17;
     ret = raw_clone3(&ca, CLONE_ARGS_SIZE_VER0);
-    CHECK(ret == -22, "clone3 CLONE_NEWPID returned %ld (expected -EINVAL)",
+    CHECK(ret >= 0, "clone3 CLONE_NEWPID returned %ld (expected >= 0 soft-NS)",
           ret);
+    if (ret == 0)
+        raw_syscall1(__NR_exit, 0);
+    else if (ret > 0)
+        raw_syscall4(__NR_wait4, ret, 0, 0, 0);
 }
 
 /* Test 5: clone3 with larger struct (zero tail = ok) */
@@ -673,9 +680,8 @@ static void test_partial_deferred_stack_munmap(void)
         munmap(reuse_stack, stack_size);
 }
 
-/* Test 15: legacy clone(2) rejects CLONE_NEW* namespace flags with EINVAL,
- * matching clone3 (issue #44). Before the fix these flags fell through to a
- * plain fork that falsely appeared to succeed. CLONE_NEWTIME is omitted: it
+/* Test 15: SoftNS soft-accepts CLONE_NEW* on clone(2)/clone3 (strip flags and
+ * fork) for pidfd NSpid and related kselftests. CLONE_NEWTIME is omitted: it
  * lives in the CSIGNAL low byte and is not reachable through clone(2).
  */
 static void test_legacy_clone_namespaces(void)
@@ -692,10 +698,9 @@ static void test_legacy_clone_namespaces(void)
     for (size_t i = 0; i < sizeof(ns_flags) / sizeof(ns_flags[0]); i++) {
         /* SIGCHLD (17) in the low byte makes this a fork-like clone. */
         long ret = raw_clone(ns_flags[i].flag | 17, NULL, NULL, 0, NULL);
-        CHECK(ret == -22 /* EINVAL */,
-              "clone(%s) returned %ld (expected -EINVAL)", ns_flags[i].name,
-              ret);
-        if (ret == 0) /* defensive: a leaked child must not run the suite */
+        CHECK(ret >= 0, "clone(%s) returned %ld (expected >= 0 soft-NS)",
+              ns_flags[i].name, ret);
+        if (ret == 0) /* child must not run the suite */
             raw_syscall1(__NR_exit, 0);
         else if (ret > 0)
             raw_syscall4(__NR_wait4, ret, 0, 0, 0);

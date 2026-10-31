@@ -308,7 +308,6 @@ QEMU_SKIP="
     test-tier-a
     test-syscall-fidelity
     test-fd-family
-    test-scm-creds
     test-proc-fidelity
     test-proc-smap
     test-fuse-reply
@@ -371,9 +370,9 @@ QEMU_SKIP="
 #   and about host UIDs no sysroot maps into the guest, neither of which a
 #   real kernel has; the qemu reference lane also runs as genuine root, where
 #   a chown to any owner succeeds physically and setuid is honoured from it.
-# test-sched-policy: exercises elfuse's explicitly-a-stub scheduler policy
-#   layer (see the file's own header) -- RT class changes are always
-#   -EPERM'd regardless of privilege, whereas real root can set them.
+# test-sched-policy: asserts the Linux scheduler-policy ABI (BATCH/IDLE real,
+#   RT permission from CAP_SYS_NICE or RLIMIT_RTPRIO, nice from RLIMIT_NICE).
+#   It branches on the caller's privilege, so it has no elfuse-only divergence.
 # test-rseq: the double-register and unregister-wrong-signature cases return
 #   different results on the real kernel; root cause not fully pinned down
 #   (possibly libc-level rseq interaction) -- flagged for follow-up rather
@@ -389,9 +388,6 @@ QEMU_SKIP="
 # test-fd-family: elfuse deliberately preserves a pending signal after an
 #   EFAULT signalfd read; the real kernel drops it -- an intentional
 #   improvement over a real Linux quirk, not a bug.
-# test-scm-creds: SO_PEERCRED/SCM_CREDENTIALS assert elfuse's default
-#   emulated guest identity (uid/gid 1000); the qemu reference lane runs as
-#   real root (uid/gid 0).
 # test-proc-fidelity: /proc/self/oom_score rejects a writable open outright
 #   under elfuse, while a real kernel allows the open and only rejects the
 #   write -- a genuine behavioral difference worth reviewing on its own,
@@ -789,6 +785,8 @@ run_unit_tests()
     test_check "$runner" "test-ptrace-interrupt" "OK: ptrace-stop reports EL0" \
         "$bindir/test-ptrace-interrupt"
     test_check "$runner" "test-sigsuspend" "PASS|0 failed" "$bindir/test-sigsuspend"
+    test_check "$runner" "test-eintr-restart" "0 failed" \
+        "$bindir/test-eintr-restart"
     test_check "$runner" "test-tgkill-directed" "0 failed" "$bindir/test-tgkill-directed"
     test_check "$runner" "test-sigill" "0 failed" "$bindir/test-sigill"
     test_check "$runner" "test-kill-broadcast" "0 failed" \
@@ -1049,8 +1047,9 @@ run_unit_tests()
     test_check "$runner" "test-setuid-exec-fakeroot" "all tests passed" \
         --fakeroot "$bindir/test-setuid-exec"
 
-    printf "\nScheduler policy stub\n"
+    printf "\nScheduler policy ABI\n"
     test_rc "$runner" "test-sched-policy" 0 "$bindir/test-sched-policy"
+    test_rc "$runner" "test-sched-affinity" 0 "$bindir/test-sched-affinity"
 
     printf "\nmembarrier\n"
     test_rc "$runner" "test-membarrier" 0 "$bindir/test-membarrier"

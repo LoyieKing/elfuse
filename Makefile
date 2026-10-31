@@ -538,6 +538,29 @@ $(BUILD_DIR)/test-pthread: tests/test-pthread.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
+# test-sched-preempt needs -lpthread (oversubscribed CPU-bound spinners)
+$(BUILD_DIR)/test-sched-preempt: tests/test-sched-preempt.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-sched-affinity pins threads to CPU0 and checks mount constraints
+$(BUILD_DIR)/test-sched-affinity: tests/test-sched-affinity.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+$(BUILD_DIR)/test-sched-task-state $(BUILD_DIR)/test-sched-fork-domain: $(BUILD_DIR)/%: tests/%.c tests/test-harness.h tests/raw-syscall.h | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+$(BUILD_DIR)/test-futex-pi-inherit: tests/test-futex-pi-inherit.c tests/test-harness.h | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+$(BUILD_DIR)/test-sched-policy-rt $(BUILD_DIR)/test-sched-policy-dl $(BUILD_DIR)/test-thread-leader-exit $(BUILD_DIR)/test-eintr-restart $(BUILD_DIR)/test-mqueue: $(BUILD_DIR)/%: tests/%.c tests/test-harness.h tests/raw-syscall.h | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lrt -lpthread
+
+
 # test-sysroot-name-soak churns from worker threads plus forked children
 $(BUILD_DIR)/test-sysroot-name-soak: tests/test-sysroot-name-soak.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"

@@ -77,6 +77,12 @@ static _Noreturn void unexpected_call(const char *name)
 
 _Thread_local thread_entry_t *current_thread;
 
+bool vcpu_pool_current_vcpu(hv_vcpu_t *out)
+{
+    (void) out;
+    unexpected_call(__func__);
+}
+
 thread_entry_t *thread_find(int64_t tid)
 {
     unexpected_call(__func__);

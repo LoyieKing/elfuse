@@ -40,7 +40,6 @@ int passes = 0, fails = 0;
 #define L_MSG_DONTWAIT 0x40
 #define L_MSG_WAITALL 0x100
 #define L_MSG_PEEK 0x02
-#define L_MSG_DONTWAIT 0x40
 
 static int drip_fd;
 
@@ -151,25 +150,46 @@ int main(void)
     close(sv[0]);
     close(sv[1]);
 
-    TEST("a blocking MSG_WAITALL gathers the whole request");
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
-        FAIL("socketpair failed");
-        SUMMARY("test-socket-waitall");
-        return 1;
+    for (int mode = 0; mode < 4; mode++) {
+        TEST(mode == 0   ? "recv gathers across worker unmounts"
+             : mode == 1 ? "recvmsg gathers across worker unmounts"
+             : mode == 2 ? "recvmmsg gathers across worker unmounts"
+                         : "vector recvmsg gathers across worker unmounts");
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+            FAIL("socketpair failed");
+            SUMMARY("test-socket-waitall");
+            return 1;
+        }
+        drip_fd = sv[1];
+        if (write(sv[1], "ab", 2) != 2)
+            FAIL("priming write failed");
+        pthread_t t;
+        if (pthread_create(&t, NULL, feeder, NULL) != 0)
+            FAIL("pthread_create failed");
+        memset(buf, 0, sizeof(buf));
+        struct iovec receive_iov[2] = {
+            {.iov_base = buf, .iov_len = mode == 3 ? 5 : sizeof(buf)},
+            {.iov_base = buf + 5, .iov_len = sizeof(buf) - 5},
+        };
+        struct mmsghdr receive_msg = {
+            .msg_hdr = {.msg_iov = receive_iov,
+                        .msg_iovlen = mode == 3 ? 2 : 1},
+        };
+        if (mode == 0)
+            n = recv(sv[0], buf, sizeof(buf), L_MSG_WAITALL);
+        else if (mode == 2) {
+            n = recvmmsg(sv[0], &receive_msg, 1, L_MSG_WAITALL, NULL);
+            if (n == 1)
+                n = receive_msg.msg_len;
+        } else
+            n = recvmsg(sv[0], &receive_msg.msg_hdr, L_MSG_WAITALL);
+        pthread_join(t, NULL);
+        EXPECT_TRUE(n == (ssize_t) sizeof(buf) &&
+                        memcmp(buf, "abXXXXXXXXXXXXXX", sizeof(buf)) == 0,
+                    "WAITALL lost bytes or reported a short count");
+        close(sv[0]);
+        close(sv[1]);
     }
-    drip_fd = sv[1];
-    if (write(sv[1], "ab", 2) != 2)
-        FAIL("priming write failed");
-    pthread_t t;
-    if (pthread_create(&t, NULL, feeder, NULL) != 0)
-        FAIL("pthread_create failed");
-    memset(buf, 0, sizeof(buf));
-    n = recv(sv[0], buf, sizeof(buf), L_MSG_WAITALL);
-    pthread_join(t, NULL);
-    EXPECT_TRUE(n == (ssize_t) sizeof(buf),
-                "a blocking MSG_WAITALL stopped short of its request");
-    close(sv[0]);
-    close(sv[1]);
 
     TEST("EOF ends a gather with the partial count");
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {

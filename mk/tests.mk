@@ -2141,3 +2141,9 @@ endif
 ## Verify the vCPU watchdog still kills a wedged guest and spares a blocked one
 test-vcpu-watchdog: $(VCPU_WATCHDOG_DEPS)
 	@bash tests/test-vcpu-watchdog.sh $(ELFUSE_BIN) $(TEST_DIR)
+
+.PHONY: scheduler-tests-build scheduler-tests
+scheduler-tests-build: $(addprefix $(BUILD_DIR)/,test-sched-task-state test-sched-fork-domain test-sched-attr-abi test-sched-policy test-sched-policy-rt test-sched-policy-dl test-sched-preempt test-futex-pi-inherit test-threaded-exec test-thread-leader-exit test-eintr-restart test-mqueue test-sched-capabilities)
+
+scheduler-tests: $(ELFUSE_BIN) scheduler-tests-build
+	@bash tests/scheduler/run.sh --elfuse

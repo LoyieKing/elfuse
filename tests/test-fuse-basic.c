@@ -131,6 +131,8 @@ static int reply_frame(int fd,
     if (len)
         memcpy(buf + sizeof(out), payload, len);
     if (write(fd, buf, sizeof(out) + len) != (ssize_t) (sizeof(out) + len)) {
+        if (errno == EBADF || errno == ENOTCONN)
+            pthread_exit(NULL);
         perror("write(/dev/fuse)");
         return -1;
     }
@@ -163,6 +165,8 @@ static void *daemon_main(void *arg)
     for (;;) {
         ssize_t nr = read(ctx->fusefd, buf, sizeof(buf));
         if (nr < 0) {
+            if (errno == EINTR)
+                continue;
             if (errno == ENOTCONN || errno == EBADF)
                 return NULL;
             perror("read(/dev/fuse)");

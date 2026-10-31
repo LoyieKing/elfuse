@@ -111,12 +111,6 @@ int main(void)
             raw_syscall1(__NR_close, r);
     }
 
-    /* pidfd_getfd returns ENOSYS (not implemented) */
-    TEST("pidfd_getfd returns ENOSYS");
-    {
-        long r = raw_syscall3(__NR_pidfd_getfd, 0, 0, 0);
-        EXPECT_TRUE(r == -38 /* LINUX_ENOSYS */, "expected -ENOSYS");
-    }
 
     TEST("clone3 rejects null pidfd output");
     test_clone_failure(0, -EFAULT);

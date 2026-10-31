@@ -42,8 +42,9 @@
 
 #define EXIT_CODE 42
 
-/* Stay well under elfuse's MAX_THREADS (64); every worker here runs forever, so
- * they are all alive at teardown alongside the main thread.
+/* Modest concurrency: every worker here runs forever, so they are all alive at
+ * teardown alongside the main thread. (Logical threads are no longer capped at
+ * 64; this test is about teardown with live vCPUs, not the table ceiling.)
  */
 #define WORKERS 40
 #define STACK_SIZE 16384
