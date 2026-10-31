@@ -8,6 +8,7 @@ C_FORMAT_FILES := $(shell git ls-files --cached --others --exclude-standard \
                            -- 'src/**/*.[ch]' 'src/*.[ch]' \
                            'tests/*.c' 'tests/*.h' \
                            'frama-c-stubs/**/*.h' 'frama-c-stubs/*.h')
+C_FORMAT_FILES := $(wildcard $(C_FORMAT_FILES))
 SHELL_SCRIPTS := $(shell git ls-files --cached --others --exclude-standard \
                          -- '*.sh')
 PYTHON_FORMAT_FILES := $(shell git ls-files --cached --others \

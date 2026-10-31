@@ -97,7 +97,7 @@ BUILD_FLAVOR_PREV := $(shell cat $(BUILD_FLAVOR_STAMP) 2>/dev/null)
 # existed records nothing and its objects carry unknown flags. An empty tree
 # with no stamp is neither, and treating it as a mismatch is what deleted
 # scan-build's report directory on every fresh checkout.
-BUILD_FLAVOR_OBJS := $(wildcard $(BUILD_DIR)/*.o $(BUILD_DIR)/*/*.o)
+BUILD_FLAVOR_OBJS := $(wildcard $(BUILD_DIR)/*.o $(BUILD_DIR)/*/*.o $(BUILD_DIR)/*/*/*.o)
 
 ifneq ($(BUILD_FLAVOR_OBJS),)
 ifeq ($(BUILD_FLAVOR_PREV),)

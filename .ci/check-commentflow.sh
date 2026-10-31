@@ -38,7 +38,7 @@ fi
 # mapfile, and "make check-format" runs this locally.
 files=()
 while IFS= read -rd '' f; do
-    files+=("$f")
+    [ -f "$f" ] && files+=("$f")
 done < <(git ls-files -z --cached --others --exclude-standard \
     -- 'src/**/*.[ch]' 'src/*.[ch]' \
     'tests/*.c' 'tests/*.h' \

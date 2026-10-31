@@ -19,6 +19,7 @@ tree.
 
 import argparse
 import subprocess
+import pathlib
 import sys
 import unicodedata
 
@@ -45,7 +46,8 @@ def source_files():
         text=True,
         check=True,
     ).stdout
-    return sorted({p for p in out.split("\0") if p.endswith(SUFFIXES)})
+    return sorted({p for p in out.split("\0")
+                   if p.endswith(SUFFIXES) and pathlib.Path(p).is_file()})
 
 
 def offenders(text):
