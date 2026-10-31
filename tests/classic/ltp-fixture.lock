@@ -1,0 +1,6 @@
+# Pinned upstream LTP release used by tests/classic/fetch-and-build-ltp.sh.
+# Release: https://github.com/linux-test-project/ltp/releases/tag/20260930
+# Digest is the upstream ltp-full-20260930.tar.xz.sha256 asset.
+LTP_VERSION=20260930
+LTP_URL=https://github.com/linux-test-project/ltp/releases/download/20260930/ltp-full-20260930.tar.xz
+LTP_SHA256=b9837481134fa6eabce91c2fba57d96695f81360468f83e11e6982584ad4d29d

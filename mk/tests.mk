@@ -2142,8 +2142,27 @@ endif
 test-vcpu-watchdog: $(VCPU_WATCHDOG_DEPS)
 	@bash tests/test-vcpu-watchdog.sh $(ELFUSE_BIN) $(TEST_DIR)
 
-.PHONY: scheduler-tests-build scheduler-tests
+## Build (if needed) and run curated classic kselftests under build/elfuse
+.PHONY: classic-tests classic-tests-build
+classic-tests-build:
+	@bash tests/classic/fetch-and-build.sh
+
+classic-tests: $(ELFUSE_BIN)
+	@if [ ! -x build/classic/ks-futex_requeue ]; then \
+		printf "$(YELLOW)▸ classic bins missing; fetching/building$(RESET)\n"; \
+		bash tests/classic/fetch-and-build.sh; \
+	fi
+	@printf "$(BLUE)▸ Running$(RESET) classic-tests\n"
+	@bash tests/classic/run.sh
+
+.PHONY: scheduler-tests-build scheduler-tests ltp-tests-build ltp-tests
 scheduler-tests-build: $(addprefix $(BUILD_DIR)/,test-sched-task-state test-sched-fork-domain test-sched-attr-abi test-sched-policy test-sched-policy-rt test-sched-policy-dl test-sched-preempt test-futex-pi-inherit test-threaded-exec test-thread-leader-exit test-eintr-restart test-mqueue test-sched-capabilities)
 
 scheduler-tests: $(ELFUSE_BIN) scheduler-tests-build
 	@bash tests/scheduler/run.sh --elfuse
+
+ltp-tests-build:
+	@bash tests/classic/fetch-and-build-ltp.sh
+
+ltp-tests: $(ELFUSE_BIN)
+	@bash tests/classic/run.sh --ltp-only

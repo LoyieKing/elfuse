@@ -1,0 +1,45 @@
+# Curated LTP syscall tests, one per line: <binary> [args...].
+# Names and sources come from the pinned release in ltp-fixture.lock
+# (testcases/kernel/syscalls/*/<binary>.c). The runner executes
+# $LTP_DIR/testcases/bin/<binary>; a missing binary is a failure, never a skip.
+#
+# sched_getparam / sched_setparam / scheduler / affinity
+sched_getparam01
+sched_getparam03
+sched_setparam01
+sched_setparam04
+sched_getscheduler02
+sched_setscheduler01
+sched_getaffinity01
+sched_setaffinity01
+sched_yield01
+sched_rr_get_interval02
+#
+# fork
+fork01
+fork03
+fork04
+fork05
+fork07
+fork08
+fork09
+fork10
+#
+# futex
+futex_wait01
+futex_wait02
+futex_wake01
+futex_wake02
+futex_wait_bitset01
+futex_waitv01
+futex_cmp_requeue01
+#
+# CPU clocks, sleep and sched_getcpu
+clock_gettime01
+clock_getres01
+clock_nanosleep01
+clock_nanosleep02
+nanosleep01
+nanosleep02
+getcpu01
+getcpu02
