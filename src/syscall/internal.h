@@ -73,19 +73,12 @@
  *   oom_write_lock (runtime/procemu.c): /proc/self/oom_score_adj writer; holds
  *                                     fd_lock beneath it through
  *                                     proc_oom_refresh_live_fds_locked
+ *   mq_lock (syscall/mqueue.c): queue objects; nests fd_lock and scheduler
+ *                                     timer operations while arming waits
  *   fd_lock      (syscall/fdtable.c): FD table (alloc/close/dup)
  *   epoll inst   (syscall/poll.c):    per-epoll-instance regs[]; taken under
  *                                     fd_lock by the close hook, taken alone
  *                                     (no fd_lock held) by epoll_ctl/pwait
- *   exec_handoff_lock (syscall/exec.c): the one execve handoff slot; nested
- *                                     under mmap_lock only by
- *                                     exec_handoff_reset, and holds sig_lock
- *                                     beneath it through
- *                                     signal_restore_blocked. A requester drops
- *                                     mmap_lock before taking it: waiting for
- *                                     the slot under mmap_lock deadlocks
- *                                     against the leader, which needs that lock
- *                                     to run the request that frees the slot
  *   sig_lock     (syscall/signal.c):  signal handlers/pending/blocked
  *   thread_lock  (runtime/thread.c):  thread table
  *   sfd_lock     (syscall/fd.c):      special fd (never held with thread_lock)
@@ -100,14 +93,32 @@
  *                                     cwd_lock dropped
  *   pid_lock     (syscall/proc.c):    process table / wait state
  *   pidfd_lock   (syscall/proc-pidfd.c): pidfd registry
+ *   futex_lifetime_mutex (runtime/futex.c): waiter and waitv-group lifetime.
+ *                                     The task's published token is loaded and
+ *                                     first dereferenced under it, and every
+ *                                     free of a waiter or group holds it, so a
+ *                                     retirement cannot return the record to
+ *                                     the allocator under a reader that got
+ *                                     the pointer first. Outer to
+ *                                     futex_pi_mutex, the bucket locks,
+ *                                     thread_lock (through PI detach) and
+ *                                     sched_lock where a completion is
+ *                                     published; signal claims (sig_lock) run
+ *                                     before it, never beneath it
  *   futex bucket (runtime/futex.c):   per-bucket, index-ordered if >1. Also
  *                                     taken alone by futex_kick, beneath
  *                                     whatever lock a signal is queued under,
  *                                     the FUSE session lock among them. That
- *                                     closes no cycle: a bucket lock holds only
- *                                     another bucket's and a futex_waitv group
- *                                     lock beneath it, and a signal is queued
- *                                     under neither
+ *                                     closes no cycle: a bucket lock holds
+ *                                     only another bucket's beneath it, and a
+ *                                     signal is queued under neither
+ *   futex_pi_mutex (runtime/futex.c): PI ownership graph; nests bucket locks
+ *                                     and scheduler state operations
+ *   io_wait_lock (syscall/io.c): event registrations and continuations;
+ *                                     nests sched_lock during completion
+ *   slice_lock (runtime/sched/vcpu_pool.c): timer deadlines; nests sched_lock
+ *   barrier_lock (runtime/sched/vcpu_pool.c): serializes barrier generations;
+ *                                     nests per-slot handle_lock for kicks
  *   cwd_lock     (syscall/proc-state.c): cached guest cwd. A leaf on every
  *                                     path but one: proc_acquire_cwd_view
  *                                     returns still holding it, and both
@@ -158,6 +169,8 @@
  *                                    usbdev_loop_lock (usbdev.c)
  *                                    usbdev_fixture_lock (usbdev-fixture.c)
  *   wake_lock (syscall/wakeup-pipe.c)
+ *   sched_lock (runtime/sched/sched.c)   pool_lock (runtime/sched/vcpu_pool.c)
+ *   handle_lock (runtime/sched/vcpu_pool.c): per-slot HVF handle lifetime
  *
  * log_mutex is the one leaf every other entry may hold: a lock anywhere in
  * either list can log while held. It sits below the whole order rather than
@@ -664,7 +677,7 @@ static inline bool fd_type_is_synthetic(int type)
 {
     return type == FD_EVENTFD || type == FD_SIGNALFD || type == FD_TIMERFD ||
            type == FD_INOTIFY || type == FD_NETLINK || type == FD_PIDFD ||
-           type == FD_EPOLL || type == FD_USBDEV;
+           type == FD_MQUEUE || type == FD_EPOLL || type == FD_USBDEV;
 }
 
 /* The status bits the host description is authoritative for. Everything outside

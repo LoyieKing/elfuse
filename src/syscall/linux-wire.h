@@ -335,6 +335,18 @@ typedef struct {
 #define LINUX_MS_INVALIDATE 0x2
 #define LINUX_MS_SYNC 0x4
 
+/* Linux mount(2) flags (uapi/linux/mount.h). MS_ASYNC/SYNC/INVALIDATE share
+ * values with msync; the remount/propagation bits are mount-only.
+ */
+#define LINUX_MS_REMOUNT 0x20
+#define LINUX_MS_BIND 0x1000
+#define LINUX_MS_REC 0x4000
+#define LINUX_MS_SILENT 0x8000
+#define LINUX_MS_UNBINDABLE 0x20000
+#define LINUX_MS_PRIVATE 0x40000
+#define LINUX_MS_SLAVE 0x80000
+#define LINUX_MS_SHARED 0x100000
+
 /* Linux mremap flags. */
 #define LINUX_MREMAP_MAYMOVE 1
 #define LINUX_MREMAP_FIXED 2
@@ -382,7 +394,10 @@ typedef struct {
 /* Linux clocks and POSIX timer flags. */
 #define LINUX_CLOCK_REALTIME 0
 #define LINUX_CLOCK_MONOTONIC 1
+#define LINUX_CLOCK_PROCESS_CPUTIME_ID 2
+#define LINUX_CLOCK_THREAD_CPUTIME_ID 3
 #define LINUX_CLOCK_BOOTTIME 7
+#define LINUX_CLOCK_TAI 11
 #define LINUX_TIMER_ABSTIME 1
 #define LINUX_SIGEV_SIGNAL 0
 #define LINUX_SIGEV_NONE 1
@@ -409,6 +424,49 @@ typedef struct {
 #define LINUX_SCHED_DEADLINE 6
 #define LINUX_SCHED_RESET_ON_FORK 0x40000000
 
+/* getpriority/setpriority selector (include/uapi/linux/resource.h). */
+#define LINUX_PRIO_PROCESS 0
+#define LINUX_PRIO_PGRP 1
+#define LINUX_PRIO_USER 2
+
+/* Extended scheduling attributes (uapi/linux/sched/types.h, Linux 6.18).
+ * SCHED_EXT is a valid policy number in the reference kernel but elfuse has no
+ * sched_ext BPF scheduler, so the ABI rejects it explicitly instead of
+ * accepting a class it cannot select.
+ */
+#define LINUX_SCHED_EXT 7
+#define LINUX_SCHED_ATTR_SIZE_VER0 48U
+#define LINUX_SCHED_ATTR_SIZE_VER1 56U
+
+/* sched_attr::sched_flags (include/uapi/linux/sched/types.h). */
+#define LINUX_SCHED_FLAG_RESET_ON_FORK 0x01U
+#define LINUX_SCHED_FLAG_RECLAIM 0x02U
+#define LINUX_SCHED_FLAG_DL_OVERRUN 0x04U
+#define LINUX_SCHED_FLAG_KEEP_POLICY 0x08U
+#define LINUX_SCHED_FLAG_KEEP_PARAMS 0x10U
+#define LINUX_SCHED_FLAG_UTIL_CLAMP_MIN 0x20U
+#define LINUX_SCHED_FLAG_UTIL_CLAMP_MAX 0x40U
+#define LINUX_SCHED_FLAG_UTIL_CLAMP \
+    (LINUX_SCHED_FLAG_UTIL_CLAMP_MIN | LINUX_SCHED_FLAG_UTIL_CLAMP_MAX)
+#define LINUX_SCHED_FLAG_ALL 0x7fU
+/* Kernel-internal flag: never accepted from user space. */
+#define LINUX_SCHED_FLAG_SUGOV 0x10000000U
+
+typedef struct {
+    uint32_t size;
+    uint32_t sched_policy;
+    uint64_t sched_flags;
+    int32_t sched_nice;
+    uint32_t sched_priority;
+    uint64_t sched_runtime;
+    uint64_t sched_deadline;
+    uint64_t sched_period;
+    uint32_t sched_util_min;
+    uint32_t sched_util_max;
+} linux_sched_attr_t;
+
+_Static_assert(sizeof(linux_sched_attr_t) == LINUX_SCHED_ATTR_SIZE_VER1,
+               "Linux sched_attr size");
 /* Linux struct sched_param (POSIX); only sched_priority is exposed. */
 typedef struct {
     int32_t sched_priority;
@@ -572,6 +630,7 @@ typedef struct {
 #define FD_FUSE_DIR 16
 #define FD_URANDOM 17
 #define FD_USBDEV 18
+#define FD_MQUEUE 19
 #define FD_VIRTUAL_PATH_MAX 64
 
 /* File sealing flags (F_SEAL_*) for memfd_create. Tracked per-FD. */

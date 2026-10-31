@@ -45,6 +45,10 @@
 
 #include "runtime/forkipc.h"
 #include "runtime/futex.h"
+#include "runtime/thread.h"
+#include "runtime/sched/vcpu_pool.h"
+#include "runtime/sched/exec.h"
+#include "runtime/sched/sched.h"
 
 #include "syscall/abi.h"
 #include "syscall/linux-wire.h"
@@ -71,6 +75,7 @@
 #include "proved/timespec.h"
 
 #include "syscall/time.h"
+#include "syscall/mqueue.h"
 
 #include "core/shim-globals.h"
 
@@ -94,6 +99,15 @@
 #define HV_SYS_REG_ACTLR_EL1 ((hv_sys_reg_t) 0xc081)
 #endif
 
+/* The execution backend owns the task->vCPU mapping. A handle of 0 is a legal
+ * HVF handle, so the bool is the only "no current execution" signal.
+ */
+static bool syscall_current_vcpu(hv_vcpu_t *out)
+{
+    return vcpu_pool_current_vcpu(out);
+}
+
+
 
 void syscall_init(void)
 {
@@ -111,6 +125,7 @@ void syscall_init(void)
      * callers do not race on lazy init.
      */
     eventfd_init();
+    mqueue_init();
     signalfd_init();
     timerfd_init();
     inotify_init();
@@ -137,7 +152,7 @@ void syscall_init(void)
  * Returns int64_t result, or a sentinel: SYSCALL_EXEC_HAPPENED for
  * exec/sigreturn, (INT64_MIN | code) for exit/exit_group. Wrappers that need
  * mmap_lock acquire it internally. Wrappers that need the vCPU handle use
- * current_thread->vcpu.
+ * vcpu_pool_current_vcpu().
  */
 typedef int64_t (*syscall_handler_t)(guest_t *g,
                                      uint64_t x0,
@@ -343,6 +358,12 @@ SC_FORWARD(sc_epoll_pwait,    sys_epoll_pwait(g, (int) x0, x1, (int) x2, (int) x
 /* Special FDs */
 SC_FORWARD(sc_eventfd2,          sys_eventfd2((unsigned int) x0, (int) x1))
 SC_FORWARD(sc_signalfd4,         sys_signalfd4(g, (int) x0, x1, x2, (int) x3))
+SC_FORWARD(sc_mq_open,          sys_mq_open(g, x0, (int) x1, x2, x3))
+SC_FORWARD(sc_mq_unlink,        sys_mq_unlink(g, x0))
+SC_FORWARD(sc_mq_timedsend,     sys_mq_timedsend(g, (int) x0, x1, x2, (unsigned) x3, x4))
+SC_FORWARD(sc_mq_timedreceive,  sys_mq_timedreceive(g, (int) x0, x1, x2, x3, x4))
+SC_FORWARD(sc_mq_notify,        sys_mq_notify(g, (int) x0, x1))
+SC_FORWARD(sc_mq_getsetattr,    sys_mq_getsetattr(g, (int) x0, x1, x2))
 SC_FORWARD(sc_timerfd_create,    sys_timerfd_create((int) x0, (int) x1))
 SC_FORWARD(sc_timerfd_settime,   sys_timerfd_settime(g, (int) x0, (int) x1, x2, x3))
 SC_FORWARD(sc_timerfd_gettime,   sys_timerfd_gettime(g, (int) x0, x1))
@@ -356,6 +377,8 @@ SC_FORWARD(sc_clock_getres,     sys_clock_getres(g, (int) x0, x1))
 SC_FORWARD(sc_nanosleep,        sys_nanosleep(g, x0, x1))
 SC_FORWARD(sc_clock_nanosleep,  sys_clock_nanosleep(g, (int) x0, (int) x1, x2, x3))
 SC_FORWARD(sc_gettimeofday,     sys_gettimeofday(g, x0, x1))
+SC_FORWARD(sc_adjtimex,         sys_adjtimex(g, x0))
+SC_FORWARD(sc_clock_adjtime,    sys_clock_adjtime(g, (int) x0, x1))
 SC_FORWARD(sc_setitimer,        sys_setitimer(g, (int) x0, x1, x2))
 SC_FORWARD(sc_timer_create,     sys_timer_create(g, (int) x0, x1, x2))
 SC_FORWARD(sc_timer_gettime,    sys_timer_gettime(g, (int) x0, x1))
@@ -393,6 +416,9 @@ SC_FORWARD(sc_sched_setparam,       sys_sched_setparam(g, (int) x0, x1))
 SC_FORWARD(sc_sched_get_priority_min, sys_sched_get_priority_min((int) x0))
 SC_FORWARD(sc_sched_get_priority_max, sys_sched_get_priority_max((int) x0))
 SC_FORWARD(sc_sched_rr_get_interval,  sys_sched_rr_get_interval(g, (int) x0, x1))
+SC_FORWARD(sc_sched_setattr, sys_sched_setattr(g, (int) x0, x1, (unsigned) x2))
+SC_FORWARD(sc_sched_getattr,
+           sys_sched_getattr(g, (int) x0, x1, (unsigned) x2, (unsigned) x3))
 
 /* Process identity is modeled as one Linux process inside this elfuse instance.
  */
@@ -442,7 +468,7 @@ SC_FORWARD(sc_gettid,  current_thread ? thread_tid(current_thread) : proc_get_pi
 /* pidfd */
 SC_FORWARD(sc_pidfd_open,        sys_pidfd_open(g, (int64_t) x0, (unsigned int) x1))
 SC_FORWARD(sc_pidfd_send_signal, sys_pidfd_send_signal(g, (int) x0, (int) x1, x2, (unsigned int) x3))
-SC_FORWARD(sc_pidfd_getfd,       -LINUX_ENOSYS)
+SC_FORWARD(sc_pidfd_getfd,       sys_pidfd_getfd(g, (int) x0, (int) x1, (unsigned int) x2))
 
 /* Process-management calls that need child tables or wait semantics. */
 SC_FORWARD(sc_wait4,  sys_wait4(g, (int) x0, x1, (int) x2, x3))
@@ -681,7 +707,7 @@ static int64_t sc_setpgid(guest_t *g,
     return ret;
 }
 SC_STUB(sc_fadvise64,           0)
-SC_STUB(sc_sched_yield,         (sched_yield(), 0))
+SC_STUB(sc_sched_yield,         (sched_yield_current(), 0))
 SC_STUB(sc_mlock,               0)
 SC_STUB(sc_munlock,             0)
 SC_STUB(sc_mlockall,            0)
@@ -805,60 +831,19 @@ static int64_t sc_get_mempolicy(guest_t *g,
 /* capset: unprivileged process cannot set capabilities. */
 SC_FORWARD(sc_capset, -LINUX_EPERM)
 
-/* sched_setaffinity: accept masks that include CPU 0, reject empty masks. */
-static int64_t sc_sched_setaffinity(guest_t *g,
-                                    uint64_t x0,
-                                    uint64_t x1,
-                                    uint64_t x2,
-                                    uint64_t x3,
-                                    uint64_t x4,
-                                    uint64_t x5,
-                                    bool verbose)
-{
-    (void) x3;
-    (void) x4;
-    (void) x5;
-    (void) verbose;
-    int pid = (int) x0;
-    uint64_t cpusetsize = x1, mask_gva = x2;
-    /* Only self */
-    if (pid != 0 && pid != (int) proc_get_pid())
-        return -LINUX_ESRCH;
-    if (cpusetsize == 0)
-        return -LINUX_EINVAL;
-
-    /* Linux accepts short masks as long as at least one supplied bit is set.
-     * elfuse only supports CPU 0, so require bit 0 in the first byte.
-     */
-    if (cpusetsize > sizeof(uint64_t))
-        cpusetsize = sizeof(uint64_t);
-    uint64_t mask = 0;
-    if (guest_read_small(g, mask_gva, &mask, cpusetsize) < 0)
-        return -LINUX_EFAULT;
-    if (!(mask & 1))
-        return -LINUX_EINVAL;
-    return 0;
-}
-
-/* Callback for thread_for_each: force-exit each worker vCPU. Skips the calling
- * thread. Used by exit_group and membarrier.
+/* Namespaces are not implemented.
+ *
+ * Return EPERM so kselftests that probe unshare(CLONE_NEW*) skip rather than
+ * Bail out on ENOSYS.
  */
-static void thread_force_exit_cb(thread_entry_t *t, void *ctx)
-{
-    (void) ctx;
-    if (t == current_thread)
-        return;
+SC_FORWARD(sc_unshare, -LINUX_EPERM)
+SC_FORWARD(sc_setns, -LINUX_EPERM)
 
-    /* Skip a slot that is active but has not yet published its vCPU (a sibling
-     * still in thread_create_and_run bring-up): it is not in hv_vcpu_run, and
-     * handing hv_vcpus_exit a zero handle is invalid. Runs under thread_lock
-     * via thread_for_each, so this read is race-free. Same guard as
-     * thread_interrupt_all / thread_quiesce_siblings.
-     */
-    if (!t->vcpu_valid)
-        return;
-    hv_vcpus_exit(&t->vcpu, 1);
-}
+/* Affinity is an ordinary result plus a scheduler migration request. The task
+ * keeps running on its current CPU until the execution loop reaches a switch
+ * point; no half-parked SYSCALL_PARKED return and no X0 injection.
+ */
+SC_FORWARD(sc_sched_setaffinity, sys_sched_setaffinity(g, (int) x0, x1, x2))
 
 /* membarrier: real implementation with barrier semantics. */
 
@@ -904,10 +889,13 @@ static int64_t sc_membarrier(guest_t *g,
     case MEMBARRIER_CMD_GLOBAL_EXPEDITED:
     case MEMBARRIER_CMD_PRIVATE_EXPEDITED:
     case MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE:
-        /* Issue full barrier on this thread, force context switch on others */
+        /* Real per-VM barrier: every mounted owner executes the barrier and
+         * acks; SYNC_CORE acks only after the shim's IC IALLU/DSB/ISB. A kick
+         * alone is not a completed barrier.
+         */
         atomic_thread_fence(memory_order_seq_cst);
-        thread_for_each(thread_force_exit_cb, NULL);
-        return 0;
+        return vcpu_pool_membarrier(cmd ==
+                                    MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE);
     case MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED:
     case MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED:
     case MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE:
@@ -947,7 +935,7 @@ static int64_t sc_exit_group(guest_t *g,
      */
     proc_request_exit_group((int) x0);
     wakeup_pipe_signal();
-    thread_for_each(thread_force_exit_cb, NULL);
+    vcpu_pool_kick_all_mounted();
 
     /* Workers parked on internal condvars (fork barrier, ptrace stop/wait) see
      * neither the pipe nor the vCPU kick; broadcast so they re-check the
@@ -955,6 +943,13 @@ static int64_t sc_exit_group(guest_t *g,
      * guest_destroy, for the forked-child path) gives up on them.
      */
     thread_wake_exit_waiters();
+
+    /* Async futex/sleep/io parks are not on those condvars and are not inside
+     * hv_vcpu_run (force_exit is a no-op). Cancel them now so a forever
+     * FUTEX_WAIT helper (ks-futex_wait_timeout lock_pi) does not outlive the
+     * exiting thread and hang SoftNS child teardown until the harness timeout.
+     */
+    thread_wake_all_blocked();
     return SC_EXIT_SENTINEL | ((int) x0 & 0xFF);
 }
 
@@ -1384,7 +1379,10 @@ static int64_t sc_rt_sigreturn(guest_t *g,
     (void) x4;
     (void) x5;
     (void) verbose;
-    int ret = signal_rt_sigreturn(current_thread->vcpu, g);
+    hv_vcpu_t vcpu;
+    if (!syscall_current_vcpu(&vcpu))
+        return -LINUX_EIO;
+    int ret = signal_rt_sigreturn(vcpu, g);
     return (ret == SYSCALL_EXEC_HAPPENED) ? SYSCALL_EXEC_HAPPENED : ret;
 }
 
@@ -1416,9 +1414,13 @@ static int64_t sc_prctl(guest_t *g,
     case LINUX_PR_GET_NO_NEW_PRIVS:
         return 1;
     case LINUX_PR_SET_DUMPABLE:
+        /* Only 0 (SUID_DUMP_DISABLE) and 1 (SUID_DUMP_USER) are valid. */
+        if (x1 != 0 && x1 != 1)
+            return -LINUX_EINVAL;
+        proc_set_dumpable((int) x1);
         return 0;
     case LINUX_PR_GET_DUMPABLE:
-        return 1;
+        return proc_get_dumpable();
     case LINUX_PR_SET_CHILD_SUBREAPER:
         proc_set_child_subreaper(x1 != 0);
         proc_registry_publish_self();
@@ -1450,8 +1452,10 @@ static int64_t sc_prctl(guest_t *g,
             return -LINUX_EINVAL;
         if (current_thread) {
             uint64_t actlr = 0;
-            hv_vcpu_get_sys_reg(current_thread->vcpu, HV_SYS_REG_ACTLR_EL1,
-                                &actlr);
+            hv_vcpu_t vcpu;
+            if (!syscall_current_vcpu(&vcpu))
+                return -LINUX_EIO;
+            hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ACTLR_EL1, &actlr);
             return (actlr & (1ULL << 1)) ? LINUX_PR_SET_MEM_MODEL_TSO
                                          : LINUX_PR_SET_MEM_MODEL_DEFAULT;
         }
@@ -1496,11 +1500,20 @@ static int64_t sc_get_robust_list(guest_t *g,
     (void) x4;
     (void) x5;
     (void) verbose;
+
+    /* Linux: pid 0 = current; otherwise look up by tid/pid. Same-mm CLONE_VM
+     * siblings (ks-robust_list test_get_robust_list_child) must succeed.
+     */
     int64_t target_pid = (int64_t) (int) x0;
-    if (target_pid != 0 && target_pid != proc_get_pid() &&
-        (!current_thread || target_pid != thread_tid(current_thread)))
-        return -LINUX_ESRCH;
-    uint64_t head_val = current_thread ? current_thread->robust_list_head : 0;
+    thread_entry_t *target;
+    if (target_pid == 0) {
+        target = current_thread;
+    } else {
+        target = thread_find(target_pid);
+        if (!target)
+            return -LINUX_ESRCH;
+    }
+    uint64_t head_val = target ? target->robust_list_head : 0;
     uint64_t len_val = 24;
     if (x1 && guest_write_small(g, x1, &head_val, sizeof(head_val)) < 0)
         return -LINUX_EFAULT;
@@ -1567,9 +1580,10 @@ static int64_t sc_rseq(guest_t *g,
     if (t->rseq_gva != 0)
         return -LINUX_EBUSY; /* Already registered */
 
-    /* Write initial rseq fields: cpu_id_start=0, cpu_id=0, rseq_cs=0, flags=0
+    /* Write initial rseq fields. cpu_id tracks the pool slot so concurrent
+     * threads do not all publish CPU 0 (see rseq_set_cpu_ids).
      */
-    uint32_t cpu_id = 0;
+    uint32_t cpu_id = (uint32_t) sched_thread_cpu(t);
     uint64_t rseq_cs = 0;
     uint32_t rseq_flags = 0;
     if (guest_write_small(g, rseq_addr + 0, &cpu_id, sizeof(cpu_id)) < 0 ||
@@ -1582,6 +1596,8 @@ static int64_t sc_rseq(guest_t *g,
     t->rseq_gva = rseq_addr;
     t->rseq_len = rseq_len;
     t->rseq_signature = sig;
+    /* node_id / mm_cid when the registered length covers them. */
+    rseq_set_cpu_ids(g, t, cpu_id, 0);
     return 0;
 }
 
@@ -1628,6 +1644,10 @@ static int64_t sc_flock(guest_t *g,
             if (errno != EWOULDBLOCK) {
                 ret = linux_errno();
                 break;
+            }
+            if (io_park_can_unmount()) {
+                host_fd_ref_close(&host_ref);
+                return io_park_unmount(-1, 0, -1);
             }
             ret = io_retry_backoff(&backoff);
             if (ret < 0)
@@ -2196,8 +2216,11 @@ static int64_t sc_execve(guest_t *g,
     (void) x3;
     (void) x4;
     (void) x5;
+    hv_vcpu_t vcpu;
+    if (!syscall_current_vcpu(&vcpu))
+        return -LINUX_EIO;
     mmap_lock_acquire();
-    int64_t r = sys_execve(current_thread->vcpu, g, x0, x1, x2, verbose, NULL);
+    int64_t r = sys_execve(vcpu, g, x0, x1, x2, verbose, NULL);
     mmap_lock_release();
     return r;
 }
@@ -2212,7 +2235,9 @@ static int64_t sc_execveat(guest_t *g,
                            bool verbose)
 {
     (void) x5;
-    hv_vcpu_t vcpu = current_thread->vcpu;
+    hv_vcpu_t vcpu;
+    if (!syscall_current_vcpu(&vcpu))
+        return -LINUX_EIO;
     int dirfd = (int) x0, flags = (int) x4;
 
     /* Resolve the target path before taking mmap_lock (path resolution may call
@@ -2309,8 +2334,10 @@ static int64_t sc_clone(guest_t *g,
         (unsigned long long) x0, (unsigned long long) x1,
         (unsigned long long) x2, (unsigned long long) x3,
         (unsigned long long) x4);
-    return sys_clone(current_thread->vcpu, g, x0, x1, 0, 0, x2, x2, x3, x4,
-                     verbose);
+    hv_vcpu_t vcpu;
+    if (!syscall_current_vcpu(&vcpu))
+        return -LINUX_EIO;
+    return sys_clone(vcpu, g, x0, x1, 0, 0, x2, x2, x3, x4, verbose);
 }
 
 static int64_t sc_clone3(guest_t *g,
@@ -2328,7 +2355,10 @@ static int64_t sc_clone3(guest_t *g,
     (void) x5;
     log_debug("clone3(args=0x%llx, size=%llu)", (unsigned long long) x0,
               (unsigned long long) x1);
-    return sys_clone3(current_thread->vcpu, g, x0, x1, verbose);
+    hv_vcpu_t vcpu;
+    if (!syscall_current_vcpu(&vcpu))
+        return -LINUX_EIO;
+    return sys_clone3(vcpu, g, x0, x1, verbose);
 }
 
 static int64_t sc_ptrace(guest_t *g,
@@ -2481,28 +2511,28 @@ static void escape_log_string(char *dest, const char *src, size_t dest_sz)
     dest[d] = '\0';
 }
 
-/* Per-vCPU, like cpu_tlbi_req and for the same reason: only the owning thread
- * touches its own vCPU registers, so this needs no lock and cannot be torn by
- * another vCPU's epilogue. See syscall_restart_arm in syscall/proc.h.
+/* Syscall restart classification is task-owned (thread_entry_t
+ * syscall_restart). It spans guest entries and must follow a task across vCPU
+ * migration, so unlike cpu_tlbi_req it cannot be host TLS. Only the task's
+ * owner worker touches its vCPU registers, so no lock is needed; a task has at
+ * most one owner at a time.
  */
-static _Thread_local struct {
-    bool armed;
-    bool restarted;       /* this invocation is the re-executed SVC */
-    bool forbidden;       /* a wait consumed part of a guest deadline */
-    uint64_t elr_rewound; /* what the arm wrote, so cancel can recognize it */
-    uint64_t elr_after_svc;
-    uint64_t nr; /* syscall the arm was for; see syscall_dispatch */
-    int64_t result;
-} cpu_restart_req;
+static task_syscall_restart_t *restart_state(void)
+{
+    return current_thread ? &current_thread->syscall_restart : NULL;
+}
 
 void syscall_restart_forbid(void)
 {
-    cpu_restart_req.forbidden = true;
+    task_syscall_restart_t *r = restart_state();
+    if (r)
+        r->forbidden = true;
 }
 
 bool syscall_is_restarted(void)
 {
-    return cpu_restart_req.restarted;
+    task_syscall_restart_t *r = restart_state();
+    return r ? r->restarted : false;
 }
 
 void syscall_restart_arm(hv_vcpu_t vcpu,
@@ -2510,39 +2540,84 @@ void syscall_restart_arm(hv_vcpu_t vcpu,
                          uint64_t nr,
                          int64_t result)
 {
-    cpu_restart_req.armed = true;
-    cpu_restart_req.nr = nr;
-    cpu_restart_req.elr_after_svc = elr_after_svc;
-    cpu_restart_req.elr_rewound = elr_after_svc - 4;
-    cpu_restart_req.result = result;
-    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, cpu_restart_req.elr_rewound);
+    task_syscall_restart_t *r = restart_state();
+    if (!r)
+        return;
+    r->armed = true;
+    r->nr = nr;
+    r->elr_after_svc = elr_after_svc;
+    r->elr_rewound = elr_after_svc - 4;
+    r->result = result;
+    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, r->elr_rewound);
 }
 
 void syscall_restart_cancel(hv_vcpu_t vcpu)
 {
-    if (!cpu_restart_req.armed)
+    task_syscall_restart_t *r = restart_state();
+    if (!r || !r->armed)
         return;
-    cpu_restart_req.armed = false;
+    r->armed = false;
 
     /* Only undo a rewind the guest has not already left. Anything else moved
-     * ELR_EL1 on (a handoff that succeeded and reloaded the image, a fault
+     * ELR_EL1 on (an execve that succeeded and reloaded the image, a fault
      * path), and putting the old value back would resume the wrong place.
      */
     uint64_t elr = 0;
     hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr);
-    if (elr != cpu_restart_req.elr_rewound)
+    if (elr != r->elr_rewound)
         return;
 
     /* No syscall-number witness here, unlike the dispatch test. By the time a
-     * cancel runs, X8 is the TLBI wire value the epilogue wrote rather than the
-     * syscall number, so comparing it would refuse every cancel and strand the
-     * rewind. tests/test-exec-handoff.c covers it: the "signal delivered on top
-     * of a handoff" case fails outright when this reads X8.
+     * cancel runs, X8 carries the TLBI wire value the epilogue wrote rather
+     * than the syscall number, so comparing it would refuse every cancel and
+     * strand the rewind. The ELR compare above is the witness that matters: it
+     * proves the guest has not left the rewind yet.
      */
 
-    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1,
-                        cpu_restart_req.elr_after_svc);
-    hv_vcpu_set_reg(vcpu, HV_REG_X0, (uint64_t) cpu_restart_req.result);
+    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, r->elr_after_svc);
+    hv_vcpu_set_reg(vcpu, HV_REG_X0, (uint64_t) r->result);
+}
+
+/* Arm a Linux ERESTARTSYS restart for the wait that just returned @result.
+ *
+ * A wait that consumed something called syscall_restart_forbid() and is not
+ * restartable. Everything else that reports EINTR is restartable only when an
+ * interrupting signal is what ended it: without one the result came from a
+ * teardown refusal or a host failure, and re-executing the call would replay an
+ * operation that was not a wait at all. signal_pending_interruption answers
+ * that with the same disposition filter and dequeue order signal_deliver uses,
+ * so SIG_IGN, a default ignore, and the stop/continue dispositions arm nothing.
+ *
+ * The signal actually delivered then decides the flag (signal.c): SA_RESTART
+ * keeps this rewind and the handler's rt_sigreturn re-enters the syscall; a
+ * handler without it cancels the rewind and receives -EINTR; no handler at all
+ * leaves the rewind in place, which is Linux's ERESTARTNOINTR shape for an
+ * ERESTARTSYS that ran no handler. X0 is left untouched here so the guest's
+ * original first argument survives, and the shim restores X1-X30 (X8 included)
+ * from its own saved frame when the SVC re-executes.
+ *
+ * Returns true when the caller must skip writing the result to X0.
+ */
+static bool syscall_restart_consider(hv_vcpu_t vcpu,
+                                     uint64_t nr,
+                                     int64_t result)
+{
+    task_syscall_restart_t *r = restart_state();
+    if (!r || result != -LINUX_EINTR || r->forbidden)
+        return false;
+
+    /* Teardown is not a restartable wait: the task is being reaped and must not
+     * run the call again.
+     */
+    if (thread_stop_requested() || !signal_pending_interruption(NULL))
+        return false;
+
+    uint64_t elr = 0;
+    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr);
+    if (elr < 4)
+        return false;
+    syscall_restart_arm(vcpu, elr, nr, result);
+    return true;
 }
 
 int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
@@ -2552,20 +2627,21 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
     /* A restart that survived to here was taken, and ELR_EL1 plus the syscall
      * number prove it: on SVC entry ELR is the address after the instruction,
      * which matches only if this is the same SVC the arm rewound to. Anything
-     * that moved on in between (a cancel, or a handed-off execve that succeeded
-     * and reloaded the image) fails the compare and reads as a fresh call. ELR
-     * is read only when armed, and the number is the X8 the dispatch reads
-     * anyway, so the common path pays nothing.
+     * that moved on in between (a cancel, or an execve that succeeded and
+     * reloaded the image) fails the compare and reads as a fresh call. ELR is
+     * read only when armed, and the number is the X8 the dispatch reads anyway,
+     * so the common path pays nothing.
      *
      * The number is checked too, because ELR alone is not a witness once a
      * syscall can be answered without reaching here. An EL1 fast path serves a
      * rewound SVC entirely in the shim, so this record survives into a later
      * call; musl funnels every cancellable syscall through one svc in
      * __syscall_cp_asm, so that later call arrives at the same ELR and would
-     * read as the restart. It is a real sequence: park in an untimed
-     * FUTEX_WAIT, take a leader-work EINTR, have the handed-off execve fail,
-     * then have futex_wait_fast answer the re-executed SVC with EAGAIN, and
-     * connect() at net.c is the reader that would swallow a genuine EISCONN.
+     * read as the restart. The shape is real: an untimed FUTEX_WAIT that a
+     * signal restarted, a shim futex fast path answering the re-executed SVC
+     * with EAGAIN without an HVC, and then any later cancellable call at the
+     * same site. sys_connect is the reader that would swallow a genuine
+     * EISCONN.
      *
      * The shim restores X8 from its saved frame, so a rewound SVC re-executes
      * the same syscall. Requiring the number to match therefore admits only the
@@ -2575,21 +2651,23 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
      * an EL1 fast path may read syscall_is_restarted(). A stale record can
      * outlive its arm (any fast path prolongs it, not just the futex one), and
      * the number match is what keeps it from being read as a restart of an
-     * unrelated call. Today the two readers are sys_connect and the netlink
-     * receive, neither of which has a fast path. A fast path added to either,
-     * or a restart-reading branch added to a syscall that has one, needs a
-     * per-vCPU gate forcing the rewound SVC through the HVC instead.
+     * unrelated call. Today the only reader is sys_connect in net.c, which has
+     * no fast path. A fast path added there, or a restart-reading branch added
+     * to a syscall that has one, needs a per-task gate forcing the rewound SVC
+     * through the HVC instead.
      */
-    cpu_restart_req.forbidden = false;
-    cpu_restart_req.restarted = false;
+    task_syscall_restart_t *restart = restart_state();
+    if (restart) {
+        restart->forbidden = false;
+        restart->restarted = false;
+    }
     hv_vcpu_get_reg(vcpu, HV_REG_X8, &x8);
-    if (cpu_restart_req.armed) {
+    if (restart && restart->armed) {
         uint64_t entry_elr = 0;
-        cpu_restart_req.armed = false;
+        restart->armed = false;
         hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &entry_elr);
-        cpu_restart_req.restarted =
-            entry_elr == cpu_restart_req.elr_after_svc &&
-            x8 == cpu_restart_req.nr;
+        restart->restarted =
+            entry_elr == restart->elr_after_svc && x8 == restart->nr;
     }
 
     x0 = 0;
@@ -2700,6 +2778,11 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
                 host_fd_ref_close(&host_ref);
                 goto slow_path;
             }
+            if (fast_st.can_block &&
+                !(fast_st.nonblock_owned && fast_st.guest_nonblock)) {
+                host_fd_ref_close(&host_ref);
+                goto slow_path;
+            }
             uint64_t count = x2;
             if (count == 0) {
                 host_fd_ref_close(&host_ref);
@@ -2717,30 +2800,9 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
                 goto slow_path;
             }
 
-            /* Readiness is not a reservation: a sibling thread or a forked
-             * process on the same open file description can take the bytes
-             * before this thread gets to them, and a transfer that then blocks
-             * parks this vCPU where hv_vcpus_exit and the wakeup pipe cannot
-             * reach it. io_xfer runs the transfer without that risk, waiting
-             * interruptibly when it has to, and reports a negative only for the
-             * cases the slow path has to answer: an interrupted wait, and a
-             * read on a pty master whose slaves are gone.
-             *
-             * Regular files never block (can_block is false) and go straight to
-             * the host call.
-             */
             ssize_t ret;
-            if (fast_st.can_block) {
-                short ev = (nr == SYS_read) ? POLLIN : POLLOUT;
-                struct iovec iov = {.iov_base = buf, .iov_len = count};
-                if (io_xfer(fd, host_ref.fd, ev, &iov, 1, &ret, &fast_st) < 0) {
-                    host_fd_ref_close(&host_ref);
-                    goto slow_path;
-                }
-            } else {
-                ret = (nr == SYS_read) ? read(host_ref.fd, buf, count)
-                                       : write(host_ref.fd, buf, count);
-            }
+            ret = (nr == SYS_read) ? read(host_ref.fd, buf, count)
+                                   : write(host_ref.fd, buf, count);
             if (ret >= 0) {
                 host_fd_ref_close(&host_ref);
                 result = ret;
@@ -2844,6 +2906,15 @@ slow_path:
             }
             thread_note_syscall(-1);
             return SYSCALL_EXEC_HAPPENED;
+        } else if (result == SYSCALL_PARKED) {
+            /* Async park: do not write X0; HVC #5 unmounts the worker. */
+            if (hist_start_ns) {
+                uint64_t hist_end_ns = syscall_hist_now_ns();
+                if (hist_end_ns >= hist_start_ns)
+                    syscall_hist_record(nr, hist_end_ns - hist_start_ns);
+            }
+            thread_note_syscall(-1);
+            return SYSCALL_PARKED;
         }
     } else {
         log_warn(
@@ -2889,28 +2960,37 @@ fast_done:
             }
         }
 
-        /* Arm rather than report; syscall_restart_arm in syscall/proc.h holds
-         * the contract, and syscall_restart_forbid the waits that opt out.
+        /* Two Linux restart shapes share this epilogue. A normal wait that
+         * reports EINTR carries ERESTARTSYS unless it forbade the restart;
+         * FUTEX_WAIT_REQUEUE_PI before CMP_REQUEUE_PI carries ERESTARTNOINTR,
+         * which re-enters the wait whatever the handler's SA_RESTART says and
+         * therefore must not arm the task's record (signal_deliver would cancel
+         * that on a handler without SA_RESTART).
          *
-         * No signal test here, deliberately. A queued signal may still be
-         * discarded at delivery (SIG_IGN, default-ignore), so refusing on one
-         * would hand back the very EINTR this removes. Only a delivery that
-         * commits to a handler frame cancels.
+         * Neither writes X0 when it rewinds: the guest's original arguments
+         * have to be the ones the re-executed SVC sees, and the shim restores
+         * X1-X30, X8 included, from its own frame on the ERET.
          */
         bool restart_armed = false;
-        if (result == -LINUX_EINTR && !cpu_restart_req.forbidden &&
-            thread_stop_is_leader_work_only()) {
+        if (result == -LINUX_EINTR && current_thread &&
+            exec_park_requeue_pi_take(current_thread)) {
             uint64_t elr = 0;
             hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr);
-            if (elr >= 4) {
-                syscall_restart_arm(vcpu, elr, x8, result);
-                restart_armed = true;
-            }
+            if (elr >= 4)
+                hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, elr - 4);
+            restart_armed = true; /* skip writing EINTR into X0 */
+        } else {
+            restart_armed = syscall_restart_consider(vcpu, x8, result);
         }
 
         /* Write result back to X0 */
         if (!restart_armed)
             hv_vcpu_set_reg(vcpu, HV_REG_X0, (uint64_t) result);
+
+        /* A parked result is injected by the execution backend when the task is
+         * remounted (proc_resume_task). No handler switches context now, so
+         * there is no stale park_result to repair here.
+         */
 
         /* Signal the shim to flush TLB if this vCPU modified page tables.
          * Protocol after HVC #5 lives in tlbi_request_emit_to_vcpu (see

@@ -38,6 +38,9 @@
 #define AT_EXECFN 31
 #define AT_PLATFORM 15
 #define AT_MINSIGSTKSZ 51
+/* Linux uapi/linux/auxvec.h: glibc getauxval for rseq feature discovery. */
+#define AT_RSEQ_FEATURE_SIZE 27
+#define AT_RSEQ_ALIGN 28
 
 /* Maximum number of uint64_t words needed to serialize the auxv emitted by
  * build_linux_stack(), including the AT_NULL terminator pair.

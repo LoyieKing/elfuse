@@ -115,6 +115,8 @@
 #define SYS_sched_get_priority_max 125
 #define SYS_sched_get_priority_min 126
 #define SYS_sched_rr_get_interval 127
+#define SYS_sched_setattr 274
+#define SYS_sched_getattr 275
 #define SYS_kill 129
 #define SYS_tkill 130
 #define SYS_tgkill 131
@@ -152,6 +154,8 @@
 #define SYS_umask 166
 #define SYS_prctl 167
 #define SYS_gettimeofday 169
+#define SYS_settimeofday 170
+#define SYS_adjtimex 171
 #define SYS_getpid 172
 #define SYS_getppid 173
 #define SYS_getuid 174
@@ -160,6 +164,12 @@
 #define SYS_getegid 177
 #define SYS_gettid 178
 #define SYS_sysinfo 179
+#define SYS_mq_open 180
+#define SYS_mq_unlink 181
+#define SYS_mq_timedsend 182
+#define SYS_mq_timedreceive 183
+#define SYS_mq_notify 184
+#define SYS_mq_getsetattr 185
 #define SYS_socket 198
 #define SYS_socketpair 199
 #define SYS_bind 200
@@ -186,6 +196,7 @@
 #define SYS_madvise 233
 #define SYS_wait4 260
 #define SYS_prlimit64 261
+#define SYS_clock_adjtime 266
 #define SYS_syncfs 267
 #define SYS_renameat2 276
 #define SYS_getrandom 278
@@ -243,6 +254,8 @@
 #define SYS_personality 92
 #define SYS_capget 90
 #define SYS_capset 91
+#define SYS_unshare 97
+#define SYS_setns 268
 #define SYS_get_robust_list 100
 #define SYS_openat2 437
 #define SYS_faccessat2 439

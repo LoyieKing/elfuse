@@ -399,7 +399,24 @@ void signal_refresh_pending_hint(void);
 
 /* Check if any unblocked signal is pending. */
 int signal_pending(void);
+
+struct thread_entry;
+
+/* True when a signal the guest can actually observe is pending for the calling
+ * thread, and whether that signal's handler asked for SA_RESTART.
+ *
+ * The answer is taken from the signal signal_deliver() will run next, in its
+ * own dequeue order (a claimed shared signal, then the private set, then the
+ * shared set), not from the pending set as a whole: a wait interrupted by one
+ * signal must be restarted or reported according to that handler's flag, and an
+ * unrelated second pending signal with the opposite flag must not decide it.
+ * Signals delivery discards (SIG_IGN, default ignore/stop/continue) do not
+ * interrupt a wait and are skipped; a terminating default action interrupts but
+ * cannot restart. *restart_out is set only when there is an interrupting
+ * signal.
+ */
 bool signal_pending_interruption(bool *restart_out);
+bool signal_pending_interruption_for(struct thread_entry *t, bool *restart_out);
 
 /* True when a signal that reaches the guest is pending for the calling thread,
  * with a process-directed one moved into this thread's private set first. A
@@ -408,6 +425,14 @@ bool signal_pending_interruption(bool *restart_out);
  * complete_signal() interrupts only the one thread it picks.
  */
 bool signal_claim_interruption(void);
+
+
+/* Same as signal_claim_interruption(), but claim for @t rather than
+ * current_thread. Used when a kicker completes another thread's async park:
+ * only the claimer may leave with -EINTR (Linux complete_signal semantics).
+ */
+bool signal_claim_interruption_for(struct thread_entry *t);
+bool signal_claim_interruption_for_ex(struct thread_entry *t, bool poll_timers);
 
 /* True if anything that would normally be drained by signal_check_timer is
  * currently live: an unblocked pending signal, OR any of the three guest
@@ -446,6 +471,14 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code);
  * delivered.
  */
 int signal_take_termination_wait_status(void);
+
+/* Linux wait(2) status for a vCPU that just left with @exit_code. Prefers a
+ * recorded signal-death status (low byte, optionally |0x80 for core) over the
+ * exit-style encoding (exit_code & 0xff) << 8. Park remount and the run-loop
+ * end both need this: signal_deliver records the real wait word on the TLS,
+ * then returns 128+signum as the host exit code.
+ */
+int signal_linux_wait_status_for_exit(int exit_code);
 
 /* Deliver a synchronous fault signal directly to the faulting (current) thread,
  * bypassing the process-wide pending set. The caller must have set the fault
@@ -514,6 +547,22 @@ void signal_repark_sigreturn_x8(hv_vcpu_t vcpu);
  * by PTRACE_SETREGSET would be reloaded away on the way out.
  */
 void signal_publish_live_x8(hv_vcpu_t vcpu, const guest_t *g);
+
+/* Read the architectural X8 out of the live shim frame at the HVC #5 drop-frame
+ * safepoint, where the register itself carries the host's marker. False when
+ * SP_EL1 names no live frame; the caller then has no guest value to substitute
+ * for the marker.
+ */
+bool signal_shim_frame_x8(hv_vcpu_t vcpu, const guest_t *g, uint64_t *out);
+
+/* Publish a complete architectural GPR set into the live shim frame, for a
+ * resume that must pass through a frame-restoring shim tail after the host
+ * applied a tracer's registers. Without it that tail reloads the pre-stop frame
+ * over them.
+ */
+void signal_publish_shim_frame_gprs(hv_vcpu_t vcpu,
+                                    const guest_t *g,
+                                    const uint64_t gprs[31]);
 
 /* Handle rt_sigaction (SYS 134). */
 int64_t signal_rt_sigaction(guest_t *g,
@@ -626,6 +675,12 @@ void signal_restore_saved_blocked(void);
 struct thread_entry;
 void signal_release_claims(struct thread_entry *t);
 
+/* Clear per-task signal records (fault info, termination status, sigreturn X8)
+ * on exec or slot reuse. Touches only @t's fields, whether or not it is the
+ * calling task.
+ */
+void signal_task_reset(struct thread_entry *t);
+
 /* Guest ITIMER_REAL emulation. These emulate the guest's setitimer(ITIMER_REAL)
  * internally rather than forwarding to the host, because macOS shares alarm()
  * and setitimer() as the same underlying timer, and elfuse needs alarm() for
@@ -658,11 +713,24 @@ void signal_get_itimer_virt(int which,
  */
 void signal_check_timer(void);
 
-/* ITIMER_REAL only. A blocking wait must not advance ITIMER_VIRTUAL or
- * ITIMER_PROF: those are charged to guest CPU time, and a thread parked in a
- * host call spends none.
+/* ITIMER_REAL only. A blocking wait cannot advance ITIMER_VIRTUAL or
+ * ITIMER_PROF either: those expiry instants are values of the scheduler's
+ * process CPU ledger, which is frozen while no task executes.
  */
 void signal_check_timer_real(void);
+
+/* Like signal_check_timer_real but does not attention_raise / kick vCPUs. For
+ * park deadline handlers that run on the slice-timer thread.
+ */
+void signal_check_timer_real_quiet(void);
+
+/* Absolute CLOCK_MONOTONIC ns of the next ITIMER_REAL / POSIX wall timer
+ * expiry, or 0 if none. Used by the slice wait timer and park arm clamping so
+ * select/nanosleep parks wake near the signal instead of on a 50/100ms quantum.
+ */
+uint64_t signal_next_wall_timer_deadline_ns(void);
+/* Quiet-check expired wall timers and wake parked tasks to claim them. */
+void signal_deliver_expired_wall_timers_quiet(void);
 
 /* Process-wide POSIX timers with REALTIME/MONOTONIC clocks and
  * SIGEV_SIGNAL/SIGEV_NONE notification. BOOTTIME uses monotonic time, as in
@@ -672,6 +740,7 @@ int signal_posix_timer_create(int clockid,
                               int notify,
                               int signum,
                               uint64_t value,
+                              int32_t notify_tid,
                               bool default_event);
 int signal_posix_timer_get(int id, linux_itimerspec_t *value);
 int signal_posix_timer_set(int id,

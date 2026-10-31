@@ -40,6 +40,9 @@
 #include "core/vdso.h"
 
 #include "runtime/futex.h"
+#include "runtime/sched/exec.h"
+#include "runtime/sched/sched.h"
+#include "runtime/sched/vcpu_pool.h"
 #include "runtime/thread.h"
 
 #include "syscall/abi.h"
@@ -53,6 +56,7 @@
 #include "syscall/proc-pidfd.h"
 #include "syscall/proc-state.h"
 #include "syscall/signal.h"
+#include "syscall/time.h"
 #include "syscall/wakeup-pipe.h"
 
 #include "debug/crashreport.h"
@@ -131,6 +135,12 @@ static _Atomic int exit_group_requested = 0;
 /* Exit code set by the thread that calls exit_group */
 static _Atomic int exit_group_code = 0;
 
+/* Linux wait(2) status matching exit_group_code. -1 means "derive from code"
+ * (normal exit: code<<8). Signal deaths from the pool stash the real status
+ * here so lifecycle does not see (128+sig)<<8.
+ */
+static _Atomic int exit_group_wait_status = -1;
+
 /* Public API. */
 
 static void proc_registry_publish(pid_t host_pid,
@@ -197,21 +207,32 @@ bool proc_rosetta_active(void)
     return atomic_load_explicit(&rosetta_active, memory_order_relaxed);
 }
 
-void proc_request_exit_group(int code)
+void proc_request_exit_group_status(int code, int wait_status)
 {
-    /* Release on the flag, relaxed on the payload: a vCPU that observes the
-     * request through proc_exit_group_requested must also see the code that
-     * goes with it. Publishing them in the other order hands a racing thread
+    /* Release on the flag, relaxed on the payloads: a vCPU that observes the
+     * request through proc_exit_group_requested must also see the code/status
+     * that go with it. Publishing them in the other order hands a racing thread
      * the previous exit code.
      */
     atomic_store_explicit(&exit_group_code, code, memory_order_relaxed);
+    atomic_store_explicit(&exit_group_wait_status, wait_status,
+                          memory_order_relaxed);
     atomic_store_explicit(&exit_group_requested, 1, memory_order_release);
+}
+
+void proc_request_exit_group(int code)
+{
+    /* Guest exit_group(code) and teardown helpers: wait status is a normal exit
+     * encoding. Signal deaths must use proc_request_exit_group_status.
+     */
+    proc_request_exit_group_status(code, (code & 0xff) << 8);
 }
 
 void proc_clear_exit_group(void)
 {
     atomic_store_explicit(&exit_group_requested, 0, memory_order_relaxed);
     atomic_store_explicit(&exit_group_code, 0, memory_order_relaxed);
+    atomic_store_explicit(&exit_group_wait_status, -1, memory_order_relaxed);
 }
 
 int proc_exit_group_requested(void)
@@ -219,9 +240,19 @@ int proc_exit_group_requested(void)
     return atomic_load_explicit(&exit_group_requested, memory_order_acquire);
 }
 
-static int proc_exit_group_code(void)
+int proc_exit_group_code(void)
 {
     return atomic_load_explicit(&exit_group_code, memory_order_relaxed);
+}
+
+int proc_exit_group_wait_status(void)
+{
+    int ws =
+        atomic_load_explicit(&exit_group_wait_status, memory_order_relaxed);
+    if (ws >= 0)
+        return ws;
+    int code = proc_exit_group_code();
+    return (code & 0xff) << 8;
 }
 
 static void proc_init_child_entry(proc_entry_t *entry,
@@ -245,6 +276,7 @@ static void proc_init_child_entry(proc_entry_t *entry,
     entry->rusage_valid = false;
     entry->rusage_accounted = false;
     entry->host_waitable = true;
+    entry->newpid_ns = false;
     memset(&entry->rusage, 0, sizeof(entry->rusage));
 }
 
@@ -400,6 +432,34 @@ int rseq_try_abort(guest_t *g,
     return result;
 }
 
+void rseq_set_cpu_ids(guest_t *g,
+                      thread_entry_t *t,
+                      uint32_t cpu,
+                      uint32_t node)
+{
+    if (!g || !t || t->rseq_gva == 0)
+        return;
+
+    uint64_t base = t->rseq_gva;
+    /* cpu_id_start @0, cpu_id @4, always present in the 32-byte minimum. */
+    if (guest_write_small(g, base + 0, &cpu, sizeof(cpu)) < 0 ||
+        guest_write_small(g, base + 4, &cpu, sizeof(cpu)) < 0)
+        return;
+
+    /* node_id @20 (feature size >= 24), mm_cid @24 (feature size >= 28). mm_cid
+     * mirrors the slot index so RSEQ_PERCPU_MM_CID builds also shard correctly
+     * under the M:N pool.
+     */
+    if (t->rseq_len >= 24) {
+        if (guest_write_small(g, base + 20, &node, sizeof(node)) < 0)
+            return;
+    }
+    if (t->rseq_len >= 28) {
+        uint32_t mm_cid = cpu;
+        (void) guest_write_small(g, base + 24, &mm_cid, sizeof(mm_cid));
+    }
+}
+
 /* Build "<dir>elfuse-<stem>-<id>" in the per-user private temp directory macOS
  * provisions (mode 0700, owned by the invoking uid) rather than world-writable
  * /tmp, so another local user cannot pre-plant a symlink or forge a file's
@@ -426,6 +486,195 @@ static bool private_tmp_path(char *out,
 static bool process_pid_sequence_path(char *out, size_t out_size)
 {
     return private_tmp_path(out, out_size, "pidseq", absock_get_namespace_id());
+}
+
+/* Cross-process CLONE_THREAD tid map (PIDFD_THREAD). Fixed-size records under
+ * flock EX. Stale rows whose host_pid is gone are ignored by resolve.
+ */
+#define THREADMAP_MAGIC 0x54485244u /* "THRD" */
+#define THREADMAP_VERSION 1
+#define THREADMAP_MAX 256
+
+typedef struct {
+    int64_t tid;
+    int64_t tgid;
+    pid_t host_pid;
+    bool active;
+    bool exited;
+    int exit_status;
+} threadmap_entry_t;
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    threadmap_entry_t entries[THREADMAP_MAX];
+} threadmap_t;
+
+static bool threadmap_path(char *out, size_t out_size)
+{
+    return private_tmp_path(out, out_size, "thr", absock_get_namespace_id());
+}
+
+static int threadmap_open_locked(void)
+{
+    char path[PATH_MAX];
+    if (!threadmap_path(path, sizeof(path)))
+        return -1;
+    int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0)
+        return -1;
+    if (flock_retry(fd, LOCK_EX) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static bool threadmap_load(int fd, threadmap_t *map)
+{
+    memset(map, 0, sizeof(*map));
+    struct stat st;
+    if (fstat(fd, &st) != 0)
+        return false;
+    if (st.st_size == 0) {
+        map->magic = THREADMAP_MAGIC;
+        map->version = THREADMAP_VERSION;
+        return true;
+    }
+    if (st.st_size != (off_t) sizeof(*map))
+        return false;
+    size_t done = 0;
+    while (done < sizeof(*map)) {
+        ssize_t n = pread(fd, (uint8_t *) map + done, sizeof(*map) - done,
+                          (off_t) done);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            return false;
+        done += (size_t) n;
+    }
+    return map->magic == THREADMAP_MAGIC && map->version == THREADMAP_VERSION;
+}
+
+static bool threadmap_store(int fd, const threadmap_t *map)
+{
+    size_t done = 0;
+    while (done < sizeof(*map)) {
+        ssize_t n = pwrite(fd, (const uint8_t *) map + done,
+                           sizeof(*map) - done, (off_t) done);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            return false;
+        done += (size_t) n;
+    }
+    return ftruncate(fd, (off_t) sizeof(*map)) == 0;
+}
+
+static bool threadmap_host_alive(pid_t host_pid)
+{
+    if (host_pid <= 0)
+        return false;
+    return kill(host_pid, 0) == 0 || errno != ESRCH;
+}
+
+void proc_thread_publish(int64_t tid, int64_t tgid)
+{
+    if (tid <= 0 || tgid <= 0)
+        return;
+    int fd = threadmap_open_locked();
+    if (fd < 0)
+        return;
+    threadmap_t map;
+    if (!threadmap_load(fd, &map)) {
+        flock_retry(fd, LOCK_UN);
+        close(fd);
+        return;
+    }
+    threadmap_entry_t *slot = NULL;
+    for (int i = 0; i < THREADMAP_MAX; i++) {
+        if (map.entries[i].active && map.entries[i].tid == tid) {
+            slot = &map.entries[i];
+            break;
+        }
+        if (!slot && !map.entries[i].active)
+            slot = &map.entries[i];
+    }
+    if (slot) {
+        *slot = (threadmap_entry_t) {
+            .tid = tid,
+            .tgid = tgid,
+            .host_pid = getpid(),
+            .active = true,
+            .exited = false,
+            .exit_status = 0,
+        };
+        (void) threadmap_store(fd, &map);
+    }
+    flock_retry(fd, LOCK_UN);
+    close(fd);
+}
+
+void proc_thread_exit(int64_t tid, int exit_status)
+{
+    if (tid <= 0)
+        return;
+    int fd = threadmap_open_locked();
+    if (fd < 0)
+        return;
+    threadmap_t map;
+    if (threadmap_load(fd, &map)) {
+        for (int i = 0; i < THREADMAP_MAX; i++) {
+            if (!map.entries[i].active || map.entries[i].tid != tid)
+                continue;
+            map.entries[i].exited = true;
+            map.entries[i].exit_status = exit_status;
+            (void) threadmap_store(fd, &map);
+            break;
+        }
+    }
+    flock_retry(fd, LOCK_UN);
+    close(fd);
+}
+
+bool proc_thread_resolve(int64_t tid,
+                         pid_t *host_out,
+                         int64_t *tgid_out,
+                         bool *exited_out,
+                         int *status_out)
+{
+    if (tid <= 0)
+        return false;
+    int fd = threadmap_open_locked();
+    if (fd < 0)
+        return false;
+    threadmap_t map;
+    bool found = false;
+    if (threadmap_load(fd, &map)) {
+        for (int i = 0; i < THREADMAP_MAX; i++) {
+            if (!map.entries[i].active || map.entries[i].tid != tid)
+                continue;
+            if (!map.entries[i].exited &&
+                !threadmap_host_alive(map.entries[i].host_pid)) {
+                map.entries[i].active = false;
+                (void) threadmap_store(fd, &map);
+                break;
+            }
+            if (host_out)
+                *host_out = map.entries[i].host_pid;
+            if (tgid_out)
+                *tgid_out = map.entries[i].tgid;
+            if (exited_out)
+                *exited_out = map.entries[i].exited;
+            if (status_out)
+                *status_out = map.entries[i].exit_status;
+            found = true;
+            break;
+        }
+    }
+    flock_retry(fd, LOCK_UN);
+    close(fd);
+    return found;
 }
 
 int64_t proc_alloc_pid(void)
@@ -530,6 +779,40 @@ int proc_reserve_child(int64_t guest_pid_val, int64_t pgid)
     return -LINUX_EAGAIN;
 }
 
+
+void proc_note_child_newpid(int64_t guest_pid)
+{
+    pthread_mutex_lock(&pid_lock);
+    proc_entry_t *entry = proc_find_guest_entry(guest_pid);
+    if (!entry)
+        entry = proc_find_reserved_guest_entry(guest_pid);
+    if (entry)
+        entry->newpid_ns = true;
+    pthread_mutex_unlock(&pid_lock);
+}
+
+int proc_child_exit_status(int64_t guest_pid)
+{
+    int st = 0;
+    pthread_mutex_lock(&pid_lock);
+    proc_entry_t *entry = proc_find_guest_entry(guest_pid);
+    if (entry && entry->exited)
+        st = entry->exit_status;
+    pthread_mutex_unlock(&pid_lock);
+    return st;
+}
+
+bool proc_child_in_newpid_ns(int64_t guest_pid)
+{
+    bool v = false;
+    pthread_mutex_lock(&pid_lock);
+    proc_entry_t *entry = proc_find_guest_entry(guest_pid);
+    if (entry)
+        v = entry->newpid_ns;
+    pthread_mutex_unlock(&pid_lock);
+    return v;
+}
+
 int proc_register_child(pid_t host_pid, int64_t guest_pid_val, int64_t pgid)
 {
     if (lifecycle_publish_child(host_pid, guest_pid_val, proc_get_pid(),
@@ -585,9 +868,21 @@ void proc_mark_child_exited(pid_t host_pid, int status)
         entry->exited = true;
         entry->exit_status = status;
         entry->rusage_accounted = true;
+
+        /* Host may already be a zombie (e.g. we SIGKILL'd it) while the guest
+         * status was published out-of-band. Flag deferred wait4 so SoftNS does
+         * not strand host zombies under rapid fork+kill (pidfd_poll_test).
+         */
+        if (entry->host_pid > 0)
+            entry->host_reap_pending = true;
         pthread_cond_broadcast(&pid_cond);
         pthread_mutex_unlock(&pid_lock);
         proc_pidfd_notify_exit(gpid);
+
+        /* A wait4/waitid parked on this child reissues and consumes the exit;
+         * the pid_cond broadcast only reaches the old host-blocking waiters.
+         */
+        proc_wait_wake_all();
         return;
     }
     pthread_mutex_unlock(&pid_lock);
@@ -623,7 +918,7 @@ static bool process_registry_path(char *out, size_t out_size)
  * protected by flock so unrelated signal/group readers stay simple.
  */
 #define LIFECYCLE_MAGIC 0x454C464CU /* "ELFL" */
-#define LIFECYCLE_VERSION 5
+#define LIFECYCLE_VERSION 6
 #define LIFECYCLE_INITIAL_CAPACITY 8U
 
 typedef struct {
@@ -635,6 +930,15 @@ typedef struct {
     bool exited;
     bool reparent_pending;
     bool rusage_valid;
+
+    /* Guest-internal job control. The child is still a live host process, so
+     * this is the only place a fork parent can observe its stop/continue. The
+     * two events are mutually exclusive; the parent consumes each once under
+     * the registry lock.
+     */
+    bool stopped;
+    bool continued;
+    int32_t stop_signal;
     int exit_status;
     struct rusage rusage;
 } lifecycle_entry_t;
@@ -952,6 +1256,11 @@ static int lifecycle_guest_terminal_status(int64_t guest_pid, int host_status)
     return host_status;
 }
 
+int proc_linux_wait_status(int64_t guest_pid, int host_status)
+{
+    return lifecycle_guest_terminal_status(guest_pid, host_status);
+}
+
 static void lifecycle_consume(int64_t guest_pid)
 {
     char path[PATH_MAX];
@@ -1041,9 +1350,18 @@ void proc_lifecycle_sync_self(guest_t *g)
         lifecycle_ack_reparent(proc_get_pid(), ppid);
 }
 
-static void proc_register_adopted_local(const lifecycle_entry_t *source)
+/* Copy one lifecycle registry row into the local process table.
+ *
+ * Returns true when the caller should invoke proc_pidfd_notify_exit on
+ * source->guest_pid AFTER releasing the lifecycle flock. notify_exit walks from
+ * proc_linux_wait_status to lifecycle_query_exit, which takes that same flock;
+ * calling it while import still holds LOCK_EX self-deadlocks the waiter (waitid
+ * after a Soft NS SIGKILL was the reproducing path).
+ */
+static bool proc_register_adopted_local(const lifecycle_entry_t *source)
 {
     bool registered = false;
+    bool notify_exit = false;
     pthread_mutex_lock(&pid_lock);
     proc_entry_t *entry = proc_find_guest_entry(source->guest_pid);
     if (entry && entry->host_waitable) {
@@ -1062,10 +1380,9 @@ static void proc_register_adopted_local(const lifecycle_entry_t *source)
             entry->host_reap_pending = true;
             pthread_cond_broadcast(&pid_cond);
         }
+        notify_exit = source->exited;
         pthread_mutex_unlock(&pid_lock);
-        if (source->exited)
-            proc_pidfd_notify_exit(source->guest_pid);
-        return;
+        return notify_exit;
     }
 
     /* A direct child is visible in the lifecycle registry before its local
@@ -1076,7 +1393,7 @@ static void proc_register_adopted_local(const lifecycle_entry_t *source)
      */
     if (proc_find_reserved_guest_entry(source->guest_pid)) {
         pthread_mutex_unlock(&pid_lock);
-        return;
+        return false;
     }
     if (!entry)
         entry = proc_find_free_entry();
@@ -1108,8 +1425,7 @@ static void proc_register_adopted_local(const lifecycle_entry_t *source)
             (long long) source->guest_pid);
     }
     pthread_mutex_unlock(&pid_lock);
-    if (registered && source->exited)
-        proc_pidfd_notify_exit(source->guest_pid);
+    return registered && source->exited;
 }
 
 static void lifecycle_import_children(void)
@@ -1118,9 +1434,19 @@ static void lifecycle_import_children(void)
     int fd = lifecycle_open_locked(path, sizeof(path));
     if (fd < 0)
         return;
+
+    /* Deferred pidfd exit notifies: must run after LOCK_UN. Bounded by the
+     * registry count; fall back to skipping the notify (a later import or the
+     * pidfd monitor still publishes) if the scratch alloc fails.
+     */
+    int64_t *notify_pids = NULL;
+    uint32_t notify_count = 0, notify_cap = 0;
     lifecycle_registry_t *registry = lifecycle_load_locked(fd);
     if (registry) {
         int64_t self = proc_get_pid();
+        notify_cap = registry->count;
+        if (notify_cap > 0)
+            notify_pids = calloc(notify_cap, sizeof(*notify_pids));
         for (uint32_t i = 0; i < registry->count; i++) {
             lifecycle_entry_t *entry = &registry->entries[i];
 
@@ -1130,12 +1456,186 @@ static void lifecycle_import_children(void)
              * lifecycle_publish_child() but before local admission commit.
              */
             if (entry->host_pid > 0 && entry->guest_pid != self &&
-                entry->ppid == self)
-                proc_register_adopted_local(entry);
+                entry->ppid == self) {
+                if (proc_register_adopted_local(entry) && notify_pids &&
+                    notify_count < notify_cap)
+                    notify_pids[notify_count++] = entry->guest_pid;
+            }
         }
         free(registry);
     }
     lifecycle_unlock_close(fd);
+
+    for (uint32_t i = 0; i < notify_count; i++) {
+        proc_pidfd_notify_exit(notify_pids[i]);
+    }
+    free(notify_pids);
+
+    /* An imported exit may satisfy a parked wait; the local pid_cond broadcast
+     * in proc_register_adopted_local only reaches old waiters.
+     */
+    proc_wait_wake_all();
+}
+
+/* Linux wait4/waitid option bits used by the event scan. */
+#define LINUX_WNOWAIT 0x01000000
+#define PROC_LINUX_WUNTRACED 2
+#define PROC_LINUX_WCONTINUED 8
+
+/* Linux wait status words for a non-terminal child state change. */
+#define PROC_WAIT_STOPPED_STATUS(sig) ((((sig) & 0xff) << 8) | 0x7f)
+#define PROC_WAIT_CONTINUED_STATUS 0xffff
+
+static bool proc_wait_event_filter(int pid,
+                                   int64_t child_pid,
+                                   int64_t child_pgid)
+{
+    if (pid > 0)
+        return child_pid == pid;
+    if (pid == -1)
+        return true;
+    if (pid == 0)
+        return child_pgid == proc_get_pgid();
+    return child_pgid == -(int64_t) pid;
+}
+
+/* Take one pending stop/continue event published by a direct child through the
+ * fork-family lifecycle registry. A SoftNS child is still a live host process
+ * while internally stopped, so host wait4 cannot report these. Consumes the
+ * event unless WNOWAIT; returns the child's guest pid and its Linux wait word.
+ */
+static bool proc_wait_take_lifecycle_event(int pid,
+                                           int options,
+                                           int64_t *guest_pid_out,
+                                           int *status_out)
+{
+    bool want_stop = (options & PROC_LINUX_WUNTRACED) != 0;
+    bool want_cont = (options & PROC_LINUX_WCONTINUED) != 0;
+    if (!want_stop && !want_cont)
+        return false;
+
+    bool consume = (options & LINUX_WNOWAIT) == 0;
+    int64_t self = proc_get_pid();
+    bool found = false;
+    char path[PATH_MAX];
+    int fd = lifecycle_open_locked(path, sizeof(path));
+    if (fd < 0)
+        return false;
+    lifecycle_registry_t *registry = lifecycle_load_locked(fd);
+    if (registry) {
+        for (uint32_t i = 0; i < registry->count; i++) {
+            lifecycle_entry_t *entry = &registry->entries[i];
+            if (entry->ppid != self || entry->exited || entry->host_pid <= 0)
+                continue;
+            if (!proc_wait_event_filter(pid, entry->guest_pid, entry->pgid))
+                continue;
+
+            int32_t signum = entry->stop_signal;
+            if (want_stop && entry->stopped) {
+                *guest_pid_out = entry->guest_pid;
+                *status_out = PROC_WAIT_STOPPED_STATUS(signum);
+                if (consume) {
+                    entry->stopped = false;
+                    entry->stop_signal = 0;
+                }
+                found = true;
+            } else if (want_cont && entry->continued) {
+                *guest_pid_out = entry->guest_pid;
+                *status_out = PROC_WAIT_CONTINUED_STATUS;
+                if (consume)
+                    entry->continued = false;
+                found = true;
+            }
+            if (found) {
+                if (consume)
+                    (void) lifecycle_save_locked(fd, registry);
+                break;
+            }
+        }
+        free(registry);
+    }
+    lifecycle_unlock_close(fd);
+    return found;
+}
+
+/* Publish a process-wide internal stop/continue and ring the fork parent. The
+ * host process keeps running, so this record is what wait4(WUNTRACED)/
+ * WCONTINUED reports; proc_send_guest_signal no longer host-stops a child.
+ */
+static void proc_publish_group_event(bool stopped, int signum)
+{
+    char path[PATH_MAX];
+    int fd = lifecycle_open_locked(path, sizeof(path));
+    if (fd < 0) {
+        /* Without the registry the parent cannot observe the event; still ring
+         * the direct parent so a blocked wait re-checks and any SIGCHLD handler
+         * runs. The status itself is unavailable.
+         */
+        int64_t parent_guest_pid = proc_get_ppid();
+        pid_t parent_host_pid = getppid();
+        if (parent_guest_pid > 0 && parent_host_pid > 1)
+            (void) proc_send_guest_signal(parent_host_pid, parent_guest_pid,
+                                          LINUX_SIGCHLD);
+        return;
+    }
+
+    lifecycle_registry_t *registry = lifecycle_load_locked(fd);
+    if (!registry) {
+        lifecycle_unlock_close(fd);
+        return;
+    }
+
+    int64_t self_pid = proc_get_pid();
+    lifecycle_entry_t *self = lifecycle_upsert(&registry, self_pid);
+    if (!self) {
+        free(registry);
+        lifecycle_unlock_close(fd);
+        return;
+    }
+    self->host_pid = getpid();
+    if (self->ppid <= 0)
+        self->ppid = proc_get_ppid();
+
+    if (stopped) {
+        self->stopped = true;
+        self->stop_signal = signum;
+        self->continued = false;
+    } else {
+        self->stopped = false;
+        self->stop_signal = 0;
+        self->continued = true;
+    }
+
+    int64_t parent_guest_pid = self->ppid;
+    pid_t parent_host_pid = -1;
+    lifecycle_entry_t *parent =
+        lifecycle_find_guest(registry, parent_guest_pid);
+    if (parent && !parent->exited)
+        parent_host_pid = parent->host_pid;
+    (void) lifecycle_save_locked(fd, registry);
+    free(registry);
+    lifecycle_unlock_close(fd);
+
+    if (parent_host_pid <= 0 && parent_guest_pid > 0) {
+        pid_t direct = getppid();
+        if (direct > 1)
+            parent_host_pid = direct;
+    }
+    if (parent_host_pid > 0 && parent_guest_pid > 0)
+        (void) proc_send_guest_signal(parent_host_pid, parent_guest_pid,
+                                      LINUX_SIGCHLD);
+}
+
+void proc_notify_group_stop(int signum)
+{
+    if (signum <= 0)
+        return;
+    proc_publish_group_event(true, signum);
+}
+
+void proc_notify_group_continue(void)
+{
+    proc_publish_group_event(false, 0);
 }
 
 static void proc_registry_reset_if_owner(const char *path)
@@ -1475,6 +1975,35 @@ static int proc_open_transport(pid_t host_pid)
 
 int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
 {
+    /* SIGKILL must terminate even a task the guest stopped internally. A
+     * guest-queued SIGKILL would wait for that process's run loop to drain the
+     * doorbell, which a fully stopped task set never reaches; deliver the real
+     * host signal so teardown cannot hang behind a guest park.
+     */
+    if (signum == LINUX_SIGKILL) {
+        if (kill(host_pid, SIGKILL) != 0)
+            return -1;
+
+        /* Host kill bypasses the SoftNS exit path, so publish locally:
+         * waitid/wait4 and pidfd POLLIN both need the exit notice.
+         */
+        proc_mark_child_exited(host_pid, LINUX_SIGKILL);
+
+        /* Drain the host zombie now. Deferred reap also runs from wait4, but
+         * under fork+kill storms (poll_test x 10k) zombies outpace that poll
+         * and hit macOS maxprocperuid.
+         */
+        int st;
+        if (wait4(host_pid, &st, WNOHANG, NULL) > 0) {
+            pthread_mutex_lock(&pid_lock);
+            proc_entry_t *e = proc_find_host_entry(host_pid);
+            if (e)
+                e->host_reap_pending = false;
+            pthread_mutex_unlock(&pid_lock);
+        }
+        return 0;
+    }
+
     int fd = proc_open_transport(host_pid);
     if (fd < 0)
         return -1;
@@ -1517,6 +2046,13 @@ int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
      * line waiting for some later unrelated signal.
      */
     close(fd);
+
+    /* Job control is internal to the guest: the receiver's signal machinery
+     * stops/resumes its own tasks and publishes the state on the lifecycle
+     * registry (proc_notify_group_stop/continue), so the parent's
+     * wait4(WUNTRACED/WCONTINUED) sees it without this host process ever being
+     * SIGSTOPped. The doorbell is always deliverable.
+     */
     return kill(host_pid, SIGUSR2);
 }
 
@@ -1557,6 +2093,9 @@ void proc_process_exit(int wait_status)
     self->pgid = proc_get_pgid();
     self->subreaper = proc_get_child_subreaper();
     self->exited = true;
+    self->stopped = false;
+    self->stop_signal = 0;
+    self->continued = false;
     self->exit_status = wait_status;
     self->rusage_valid = self_rusage_valid;
     if (self_rusage_valid)
@@ -1935,15 +2474,13 @@ int64_t sys_ptrace(guest_t *g,
     }
 
     case LINUX_PTRACE_INTERRUPT: {
-        /* Force a running tracee into ptrace-stop. Uses hv_vcpus_exit to break
-         * the tracee out of hv_vcpu_run; the tracee will then enter ptrace-stop
-         * in its HV_EXIT_REASON_CANCELED handler.
+        /* Force a running tracee into ptrace-stop. The stop is recorded as owed
+         * first; the pool kick then leaves hv_vcpu_run, and the HVC/cancel
+         * epilogue consumes the flag at an architectural safe point.
          *
-         * Kick the tracee under thread_lock, not after releasing it: the tracee
-         * destroys its own vCPU under the same lock on exit, so snapshotting
-         * the handle and calling hv_vcpus_exit outside the lock could hand HVF
-         * a freed vCPU. Holding the lock across the kick serializes it against
-         * destruction; the kick does not block, so this is safe.
+         * A task carries no HVF handle. The CPU lookup is scheduler-owned and
+         * the kick goes through the pool, which publishes and destroys handles
+         * under its own lock; no handle is dereferenced here.
          */
         pthread_mutex_t *tlock = thread_get_lock();
         pthread_mutex_lock(tlock);
@@ -1957,35 +2494,19 @@ int64_t sys_ptrace(guest_t *g,
             return 0; /* Already stopped */
         }
 
-        /* Record the stop as owed in every case, then kick. The flag used to
-         * mean only "the vCPU was still in bring-up, so hv_vcpus_exit could not
-         * reach it"; it now means "a stop is owed", because the kick alone was
-         * never sufficient. It can land while the tracee sits at EL1 in a shim
-         * fast path, and stopping there snapshots shim scratch as the guest's
-         * registers (thread_ptrace_stop reads the live set) and discards
-         * whatever the tracer writes back, since the shim restores its own
-         * frame over it. The HVC #5 epilogue consumes the flag and then either
-         * stops right there, on the tails whose live registers are already the
-         * final EL0 set bar the X8 the tail reloads from the frame, or asks the
-         * shim through X7 to restore the frame and come back at HVC #13. The
-         * canceled-exit handler consumes it once it has established the vCPU is
-         * at EL0.
-         *
-         * Attention goes up before the kick, the same order
+        /* Attention goes up before the kick, the same order
          * shim_globals_raise_attention uses and for the same reason: a fast
          * path that has already tested it must not be the one that decides. It
          * is what stops a tracee interrupted at EL1 from ERETing to EL0 and
          * computing indefinitely with the stop still owed.
-         *
-         * Bring-up keeps its own arm of this: a vCPU with no published handle
-         * cannot be kicked, and the worker self-kicks at publish. Both run
-         * under thread_lock, so exactly one of them delivers.
          */
         target->ptrace_interrupt_pending = true;
         shim_globals_ptrace_attention(g, true);
-        if (target->vcpu_valid)
-            hv_vcpus_exit(&target->vcpu, 1);
+        int target_cpu = vcpu_pool_cpu_of(target);
         pthread_mutex_unlock(tlock);
+
+        if (target_cpu >= 0)
+            vcpu_pool_kick_cpu(target_cpu);
         return 0;
     }
 
@@ -2200,7 +2721,8 @@ void proc_autoreap_exited_children(void)
         } while (ret < 0 && errno == EINTR);
         if (ret == host_pid) {
             proc_children_cpu_add(&ru);
-            proc_pidfd_notify_exit(guest_pid);
+            proc_pidfd_notify_exit_code(guest_pid, status);
+            proc_pidfd_notify_reaped(guest_pid, status);
             proc_deactivate_slot_if_matches(host_pid, guest_pid);
         } else if (ret < 0 && errno == ECHILD) {
             /* A concurrent consuming wait won the host reap. The disposition
@@ -2467,6 +2989,7 @@ static int64_t proc_reap_exited_and_unlock(guest_t *g,
     entry->active = false;
     pthread_mutex_unlock(&pid_lock);
     lifecycle_consume(gpid);
+    proc_pidfd_notify_reaped(gpid, linux_status);
     if (status_gva && guest_write_small(g, status_gva, &linux_status,
                                         sizeof(linux_status)) < 0)
         return -LINUX_EFAULT;
@@ -2476,6 +2999,99 @@ static int64_t proc_reap_exited_and_unlock(guest_t *g,
         return -LINUX_EFAULT;
     return gpid;
 }
+
+/* Wait poll quantum: a parked wait4/waitid re-scans at this cadence even when
+ * no doorbell or signal arrives, which also covers a host zombie that became
+ * reapable after the child's exit notification.
+ */
+#define PROC_WAIT_POLL_NS 100000000ULL
+
+static void proc_wait_wake_one(thread_entry_t *t, void *ctx)
+{
+    (void) ctx;
+    if (exec_park_active_load(t) && exec_park_kind_load(t) == PARK_KIND_WAIT)
+        (void) sched_park_try_complete_reissue(t);
+}
+
+void proc_wait_wake_all(void)
+{
+    thread_for_each(proc_wait_wake_one, NULL);
+}
+
+static void proc_wait_fire_one(thread_entry_t *t, void *ctx)
+{
+    uint64_t now = *(uint64_t *) ctx;
+    if (!exec_park_active_load(t) || exec_park_kind_load(t) != PARK_KIND_WAIT)
+        return;
+    uint64_t deadline = exec_park_deadline_ns_load(t);
+    if (deadline == 0 || deadline > now)
+        return;
+    (void) sched_park_try_complete_reissue(t);
+}
+
+void proc_wait_fire_expired(uint64_t now_ns)
+{
+    thread_for_each(proc_wait_fire_one, &now_ns);
+}
+
+/* A signal (or teardown) must re-run the wait so it can either report a child
+ * that changed state or take the EINTR path; Linux checks children first.
+ */
+void wait_park_on_interrupt(thread_entry_t *t)
+{
+    if (!t || !exec_park_active_load(t) ||
+        exec_park_kind_load(t) != PARK_KIND_WAIT)
+        return;
+    (void) sched_park_try_complete_reissue(t);
+}
+
+void wait_park_on_deadline(thread_entry_t *t)
+{
+    if (!t || !exec_park_active_load(t) ||
+        exec_park_kind_load(t) != PARK_KIND_WAIT)
+        return;
+    (void) sched_park_try_complete_reissue(t);
+}
+
+/* Hand a blocking wait to the pool. Returning SYSCALL_PARKED makes the HVC arm
+ * skip the return tail and the outer loop publish BLOCKED; a wake reissues the
+ * SVC, so the handler re-scans from its entry. The post-arm checks close the
+ * window where an event or signal landed between the last scan and the park: a
+ * waker that saw park_active also completes it, and these catch the rest.
+ */
+static int64_t proc_wait_park(int pid, int options)
+{
+    thread_entry_t *t = current_thread;
+    if (!t)
+        return -LINUX_EINTR;
+
+    exec_park_kind_store(t, PARK_KIND_WAIT);
+    exec_park_result_pending_store(t, false);
+    exec_park_reissue_store(t, false);
+    t->exec_resume = EXEC_RESUME_PLAIN;
+    sched_arm_wait_deadline(t, sched_now_ns() + PROC_WAIT_POLL_NS);
+
+    /* Publish the arm last: a waker that acquires park_active observes the kind
+     * and result direction above.
+     */
+    exec_park_active_store(t, true);
+
+    int64_t event_pid = 0;
+    int event_status = 0;
+    if (proc_wait_take_lifecycle_event(pid, options, &event_pid,
+                                       &event_status)) {
+        (void) sched_park_try_complete_reissue(t);
+    } else if (signal_pending_interruption(NULL) || thread_stop_requested()) {
+        /* The disposition filter matters here: signal_pending() would also
+         * complete the park for a signal delivery discards, handing the guest
+         * an EINTR Linux never returns for it. This runs after the lifecycle
+         * scan, so a child that changed state still wins.
+         */
+        (void) sched_park_try_complete(t, -LINUX_EINTR);
+    }
+    return SYSCALL_PARKED;
+}
+
 
 int64_t sys_wait4(guest_t *g,
                   int pid,
@@ -2495,6 +3111,13 @@ int64_t sys_wait4(guest_t *g,
         int ptrace_status = 0;
         int64_t ptrace_tid = thread_ptrace_wait(thread_tid(current_thread), pid,
                                                 &ptrace_status, options);
+
+        /* The tracer parked: no event was ready, so the caller must leave at
+         * this safepoint. Completion reissues this wait, which re-scans the
+         * thread table with the child's published stop/exit.
+         */
+        if (ptrace_tid == SYSCALL_PARKED)
+            return SYSCALL_PARKED;
         if (ptrace_tid > 0) {
             if (status_gva) {
                 int32_t ls = ptrace_status;
@@ -2507,6 +3130,30 @@ int64_t sys_wait4(guest_t *g,
         /* ptrace_tid == 0: no matching children or WNOHANG; fall through to the
          * process table for regular fork children.
          */
+    }
+
+    /* Guest-internal job control lives in the fork-family lifecycle registry: a
+     * stopped child is still a live host process, so host wait4 never reports
+     * WUNTRACED/WCONTINUED for it.
+     */
+    {
+        int64_t event_pid = 0;
+        int event_status = 0;
+        if (proc_wait_take_lifecycle_event(pid, options, &event_pid,
+                                           &event_status)) {
+            if (status_gva) {
+                int32_t ls = event_status;
+                if (guest_write_small(g, status_gva, &ls, sizeof(ls)) < 0)
+                    return -LINUX_EFAULT;
+            }
+            if (rusage_gva) {
+                struct rusage zero_ru;
+                memset(&zero_ru, 0, sizeof(zero_ru));
+                if (write_rusage_to_guest(g, rusage_gva, &zero_ru) < 0)
+                    return -LINUX_EFAULT;
+            }
+            return event_pid;
+        }
     }
 
     /* Translate Linux wait options */
@@ -2591,28 +3238,13 @@ int64_t sys_wait4(guest_t *g,
                 return 0;
             }
 
-            /* exit_group teardown: stop re-arming the wait. The 100ms quantum
-             * below bounds how stale this check can be, mirroring the futex
-             * wait quanta. The errno is never guest-visible: the run loop
-             * breaks on the exit-group flag before returning to the guest.
+            /* Blocking with no host-visible event: hand the worker back to the
+             * pool. A child state change, a signal, or the poll deadline
+             * completes the park; completion reissues this syscall, which
+             * re-scans from the top.
              */
-            if (thread_stop_requested()) {
-                pthread_mutex_unlock(&pid_lock);
-                return -LINUX_EINTR;
-            }
-
-            /* Blocking mode: no child exited yet. Wait on condvar for a child
-             * exit notification (signaled by proc_mark_child_exited). Use
-             * timedwait with 100ms timeout as a safety net; the condvar handles
-             * normal exits, the timeout catches edge cases where the host wait4
-             * detects exit before proc_mark_child_exited.
-             */
-            struct timespec ts;
-            timespec_deadline_in_ms(&ts, 100);
-            pthread_cond_timedwait(&pid_cond, &pid_lock, &ts);
             pthread_mutex_unlock(&pid_lock);
-            lifecycle_import_children();
-            pthread_mutex_lock(&pid_lock);
+            return proc_wait_park(pid, options);
         }
     }
 
@@ -2631,10 +3263,7 @@ int64_t sys_wait4(guest_t *g,
                     return sys_wait4(g, pid, status_gva, options, rusage_gva);
                 if (mac_options & WNOHANG)
                     return 0;
-                if (thread_stop_requested())
-                    return -LINUX_EINTR;
-                usleep(1000);
-                return sys_wait4(g, pid, status_gva, options, rusage_gva);
+                return proc_wait_park(pid, options);
             }
 
             pid_t host_pid = proc_table[i].host_pid;
@@ -2654,51 +3283,18 @@ int64_t sys_wait4(guest_t *g,
                  * guest_destroy may have unmapped it. Poll with WNOHANG under a
                  * bounded retry instead, mirroring the pid==-1 loop above;
                  * proc_mark_child_exited broadcasts pid_cond on every host
-                 * child exit.
+                 * child exit. The child's guest exit reaches the registry about
+                 * a millisecond before the host process is reapable; importing
+                 * it lets the next re-dispatch answer from the table without
+                 * waiting on the host process.
                  */
-                for (;;) {
-                    ret = wait4(host_pid, &status, mac_options | WNOHANG, &ru);
-                    if (ret != 0)
-                        break;
-                    if (thread_stop_requested())
-                        return -LINUX_EINTR;
-                    struct timespec ts;
-                    timespec_deadline_in_ms(&ts, 100);
-
-                    /* Import before the sleep as well as after it. The poll
-                     * above runs unlocked, so a broadcast landing between it
-                     * and the lock below finds nobody parked and evaporates:
-                     * pid_cond keeps no count. The doorbell sets entry->exited
-                     * under pid_lock before it broadcasts, so re-reading the
-                     * table inside the same critical section the sleep releases
-                     * is what closes that window. The import itself stays
-                     * outside the lock, like the poll: it touches the registry
-                     * file, and pid_lock holds only bounded table walks.
-                     */
-                    lifecycle_import_children();
-                    pthread_mutex_lock(&pid_lock);
-                    if (proc_guest_child_exited_locked(gpid)) {
-                        pthread_mutex_unlock(&pid_lock);
-                        return sys_wait4(g, pid, status_gva, options,
-                                         rusage_gva);
-                    }
-                    pthread_cond_timedwait(&pid_cond, &pid_lock, &ts);
-                    pthread_mutex_unlock(&pid_lock);
-
-                    /* The doorbell reports the guest exit about a millisecond
-                     * before the child's host process becomes reapable, so the
-                     * poll above still says "running" when the wakeup arrives.
-                     * The registry carries the exit by then, so importing it
-                     * copies the status across and flags the host reap for
-                     * proc_deferred_reap_poll(), after which the table lookup
-                     * at the top of sys_wait4 answers without waiting for the
-                     * host process at all. Without this the wakeup is wasted
-                     * and the wait costs the full 100 ms timeout.
-                     */
+                ret = wait4(host_pid, &status, mac_options | WNOHANG, &ru);
+                if (ret == 0) {
                     lifecycle_import_children();
                     if (proc_guest_child_exited(gpid))
                         return sys_wait4(g, pid, status_gva, options,
                                          rusage_gva);
+                    return proc_wait_park(pid, options);
                 }
             }
             if (ret > 0) {
@@ -2747,6 +3343,8 @@ int64_t sys_wait4(guest_t *g,
 #define CLD_EXITED 1
 #define CLD_KILLED 2
 #define CLD_DUMPED 3
+#define CLD_STOPPED 5
+#define CLD_CONTINUED 6
 
 /* waitid idtype values */
 #define P_ALL 0
@@ -2772,7 +3370,6 @@ int64_t sys_waitid(guest_t *g,
     /* Translate options: Linux WEXITED=4, WNOHANG=1, WSTOPPED=2, WCONTINUED=8,
      * WNOWAIT=0x01000000
      */
-#define LINUX_WNOWAIT 0x01000000
     int mac_options = 0;
     if (options & 1)
         mac_options |= WNOHANG;
@@ -2781,6 +3378,7 @@ int64_t sys_waitid(guest_t *g,
     if (options & 8)
         mac_options |= WCONTINUED;
     /* WEXITED (4) is implied by waitpid */
+    bool pidfd_nonblock = false;
 
     /* Convert idtype+id to a waitpid-compatible pid argument */
     pid_t wait_pid;
@@ -2803,6 +3401,19 @@ int64_t sys_waitid(guest_t *g,
         if (resolved < 0)
             return -LINUX_EBADF;
         wait_pid = (pid_t) resolved;
+
+        /* PIDFD_NONBLOCK: waitid does not block; empty ready-set is EAGAIN
+         * (unlike WNOHANG which returns 0). Mirror Linux's pidfd_wait path.
+         */
+        if (proc_pidfd_is_nonblock((int) id)) {
+            pidfd_nonblock = true;
+
+            /* Force WNOHANG only when the caller did not already ask for it.
+             * Explicit WNOHANG still returns 0; forced NONBLOCK returns EAGAIN.
+             */
+            if (!(options & 1))
+                mac_options |= WNOHANG;
+        }
         break;
     }
     default:
@@ -2815,6 +3426,42 @@ int64_t sys_waitid(guest_t *g,
         if (result == 0)
             return waitid_zero_siginfo(g, infop_gva);
         return result;
+    }
+
+    /* Guest-internal job control only exists in the fork-family lifecycle
+     * registry: the stopped child is still a live host process. Report it with
+     * the same siginfo shape the host-event path uses.
+     */
+    {
+        int64_t event_pid = 0;
+        int event_status = 0;
+        bool got_event = proc_wait_take_lifecycle_event(
+            (int) wait_pid, options, &event_pid, &event_status);
+        if (got_event && infop_gva) {
+            uint8_t si[SIGINFO_SIZE];
+            memset(si, 0, sizeof(si));
+            int32_t signo = LINUX_SIGCHLD;
+            int32_t si_code;
+            int32_t si_status;
+            if (WIFSTOPPED(event_status)) {
+                si_code = CLD_STOPPED;
+                si_status = WSTOPSIG(event_status);
+            } else {
+                si_code = CLD_CONTINUED;
+                si_status = LINUX_SIGCONT;
+            }
+            int32_t gpid32 = (int32_t) event_pid;
+            uint32_t uid = 0;
+            memcpy(si + SIGINFO_OFF_SIGNO, &signo, 4);
+            memcpy(si + SIGINFO_OFF_CODE, &si_code, 4);
+            memcpy(si + SIGINFO_OFF_PID, &gpid32, 4);
+            memcpy(si + SIGINFO_OFF_UID, &uid, 4);
+            memcpy(si + SIGINFO_OFF_STATUS, &si_status, 4);
+            if (guest_write_small(g, infop_gva, si, SIGINFO_SIZE) < 0)
+                return -LINUX_EFAULT;
+        }
+        if (got_event)
+            return 0;
     }
 
     /* Search process table for matching entry. P_ALL must scan all children
@@ -2843,6 +3490,11 @@ int64_t sys_waitid(guest_t *g,
             int64_t entry_gpid = proc_table[i].guest_pid;
             int32_t gpid32 = (int32_t) entry_gpid;
 
+            /* Exited children are invisible to WSTOPPED/WCONTINUED-only waits.
+             */
+            if (proc_table[i].exited && !(options & 4 /* WEXITED */))
+                continue;
+
             if (proc_table[i].exited) {
                 /* Already reaped (from CLONE_VFORK wait) */
                 status = proc_table[i].exit_status;
@@ -2863,25 +3515,51 @@ int64_t sys_waitid(guest_t *g,
                 pid_t host_pid = proc_table[i].host_pid;
                 pthread_mutex_unlock(&pid_lock);
                 struct rusage ru;
-                ret = wait4(host_pid, &status, WNOHANG, &ru);
+
+                /* Include WUNTRACED/WCONTINUED from the caller's options so
+                 * waitid(WSTOPPED)/WCONTINUED observe SoftNS job-control stops.
+                 */
+                ret = wait4(host_pid, &status, mac_options | WNOHANG, &ru);
                 if (ret == 0) {
-                    /* This child hasn't exited yet; continue checking others
-                     * (P_ALL must scan all children).
+                    /* Doorbell / lifecycle can publish exit ~1ms before the
+                     * host process is reapable. Import so the next scan can
+                     * take the exited branch without waiting on wait4.
                      */
+                    lifecycle_import_children();
                     pthread_mutex_lock(&pid_lock);
+                    if (proc_guest_child_exited_locked(entry_gpid)) {
+                        i = (size_t) -1;
+                        continue;
+                    }
                     continue;
                 }
                 if (ret < 0) {
+                    /* Same ECHILD race sys_wait4 documents: deferred_reap or a
+                     * concurrent waiter may have collected the host zombie
+                     * after the guest status was already copied into the table.
+                     * Prefer that status over spinning forever.
+                     */
+                    int wait_errno = errno;
+                    if (wait_errno == ECHILD) {
+                        lifecycle_import_children();
+                        pthread_mutex_lock(&pid_lock);
+                        if (proc_guest_child_exited_locked(entry_gpid)) {
+                            i = (size_t) -1;
+                            continue;
+                        }
+                        pthread_mutex_unlock(&pid_lock);
+                    }
                     pthread_mutex_lock(&pid_lock);
-                    continue; /* Child may have been reaped concurrently */
+                    continue;
                 }
-                status = lifecycle_guest_terminal_status(entry_gpid, status);
+                bool terminal = WIFEXITED(status) || WIFSIGNALED(status);
+                if (terminal)
+                    status =
+                        lifecycle_guest_terminal_status(entry_gpid, status);
                 pthread_mutex_lock(&pid_lock);
 
-                /* Host wait4 necessarily consumes the host zombie. Preserve the
-                 * status/rusage in the guest process table so Linux WNOWAIT
-                 * remains repeatable and a later consuming wait can account and
-                 * remove it exactly once.
+                /* Host wait4 consumes a zombie only on terminal reports. Stop
+                 * and continue leave the child live; do not mark exited.
                  *
                  * Looked up by host_pid rather than indexed by the stale i:
                  * pid_lock was released across the wait4 above, during which
@@ -2896,14 +3574,34 @@ int64_t sys_waitid(guest_t *g,
                  * admitted on another thread during this unlocked window can
                  * land an unrelated child under this exact host_pid.
                  */
-                proc_entry_t *reaped =
-                    proc_find_host_guest_entry(host_pid, entry_gpid);
-                if (reaped) {
-                    reaped->exited = true;
-                    reaped->exit_status = status;
-                    reaped->rusage = ru;
-                    reaped->rusage_valid = true;
+                if (terminal) {
+                    proc_entry_t *reaped =
+                        proc_find_host_guest_entry(host_pid, entry_gpid);
+                    if (reaped) {
+                        reaped->exited = true;
+                        reaped->exit_status = status;
+                        reaped->rusage = ru;
+                        reaped->rusage_valid = true;
+                    }
                 }
+            }
+
+            /* waitid requires an explicit event class. Skip reports the caller
+             * did not ask for (e.g. WSTOPPED-only must not return an exit, and
+             * WEXITED-only must not return a stop).
+             */
+            bool want_exit = (options & 4) != 0; /* WEXITED */
+            bool want_stop = (options & 2) != 0; /* WSTOPPED */
+            bool want_cont = (options & 8) != 0; /* WCONTINUED */
+            if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                if (!want_exit)
+                    continue;
+            } else if (WIFSTOPPED(status)) {
+                if (!want_stop)
+                    continue;
+            } else if (WIFCONTINUED(status)) {
+                if (!want_cont)
+                    continue;
             }
 
             /* Fill siginfo_t in guest memory */
@@ -2920,6 +3618,12 @@ int64_t sys_waitid(guest_t *g,
                 } else if (WIFSIGNALED(status)) {
                     si_code = WCOREDUMP(status) ? CLD_DUMPED : CLD_KILLED;
                     si_status = WTERMSIG(status);
+                } else if (WIFSTOPPED(status)) {
+                    si_code = CLD_STOPPED;
+                    si_status = WSTOPSIG(status);
+                } else if (WIFCONTINUED(status)) {
+                    si_code = CLD_CONTINUED;
+                    si_status = LINUX_SIGCONT;
                 } else {
                     si_code = CLD_EXITED;
                     si_status = 0;
@@ -2938,8 +3642,9 @@ int64_t sys_waitid(guest_t *g,
                 }
             }
 
-            /* Keep the table entry when WNOWAIT is set. Looked up by host_pid
-             * (ret) rather than indexed by i for the same reason as the
+            /* Keep the table entry when WNOWAIT is set, and always for
+             * stop/continue (child still live). Looked up by host_pid (ret)
+             * rather than indexed by i for the same reason as the
              * reap-preservation block above: this path is reachable after the
              * else-arm's unlock/relock around wait4, where a stale index can be
              * out of bounds for a proc_table shrunk in the interim. The
@@ -2949,20 +3654,32 @@ int64_t sys_waitid(guest_t *g,
              * guards the same host_pid-reuse hazard as the reap-preservation
              * block above.
              */
+            bool terminal = WIFEXITED(status) || WIFSIGNALED(status);
             int64_t consumed_gpid = -1;
-            if (!(options & LINUX_WNOWAIT)) {
+            int consumed_status = status;
+            if (terminal && !(options & LINUX_WNOWAIT)) {
                 proc_entry_t *consumed =
                     proc_find_host_guest_entry(ret, entry_gpid);
                 if (consumed) {
                     consumed_gpid = consumed->guest_pid;
+                    consumed_status = consumed->exit_status;
                     proc_account_entry_locked(consumed);
                     consumed->active = false;
                 }
             }
 
             pthread_mutex_unlock(&pid_lock);
-            if (consumed_gpid > 0)
+            if (consumed_gpid > 0) {
                 lifecycle_consume(consumed_gpid);
+                proc_pidfd_notify_reaped(consumed_gpid, consumed_status);
+            } else if (terminal && idtype == 3 /* P_PIDFD */ && wait_pid > 0 &&
+                       !(options & LINUX_WNOWAIT)) {
+                /* waitid succeeded without a table consume (host_pid mismatch /
+                 * already-inactive). Still mark the pidfd reaped so GET_INFO
+                 * flips CREDS to EXIT.
+                 */
+                proc_pidfd_notify_reaped(wait_pid, status);
+            }
             return 0; /* waitid returns 0 on success */
         }
 
@@ -2989,7 +3706,15 @@ int64_t sys_waitid(guest_t *g,
         }
 
         if (mac_options & WNOHANG) {
+            bool had_match = found_any;
             pthread_mutex_unlock(&pid_lock);
+
+            /* Nonblocking pidfd without an explicit WNOHANG: children exist but
+             * none are waitable yet, so EAGAIN. Explicit WNOHANG (even on a
+             * nonblocking pidfd) still returns 0 with a cleared siginfo.
+             */
+            if (pidfd_nonblock && !(options & 1) && had_match)
+                return -LINUX_EAGAIN;
 
             /* Per POSIX/Linux: zero siginfo when WNOHANG returns with no
              * waitable children, so callers can distinguish via si_pid.
@@ -3010,13 +3735,12 @@ int64_t sys_waitid(guest_t *g,
             return -LINUX_EINTR;
         }
 
-        /* Blocking: wait on condvar (100ms timeout as safety net) */
-        struct timespec ts;
-        timespec_deadline_in_ms(&ts, 100);
-        pthread_cond_timedwait(&pid_cond, &pid_lock, &ts);
+        /* Blocking with no host-visible event: park instead of holding the
+         * worker on pid_cond. A lifecycle stop/continue, a child exit, a
+         * signal, or the poll deadline reissues this wait.
+         */
         pthread_mutex_unlock(&pid_lock);
-        lifecycle_import_children();
-        pthread_mutex_lock(&pid_lock);
+        return proc_wait_park((int) wait_pid, options);
     }
 }
 
@@ -3048,29 +3772,9 @@ void proc_request_hvc6_yield(void)
  */
 static _Atomic int g_timed_out, g_external_guest_signal;
 
-/* Watchdog progress word, written by the guest main thread's run loop and read
- * by preempt_thread_main. A Linux-style seqlock counter, the same shape the
- * vvar uses in core/vdso.c: odd means the loop is inside hv_vcpu_run, even
- * means it is not, and the value changes on every entry and every return.
- *
- * The loop used to arm and disarm alarm() around every hv_vcpu_run. On macOS
- * alarm() is setitimer(ITIMER_REAL), so that was two real syscalls per guest
- * syscall: measured 693 ns for the pair, against a 1226 ns bare HVF round trip.
- * It made every host-served syscall on the main thread about 38 percent slower
- * than the same syscall on a worker, which passes timeout_sec == 0 and skipped
- * the alarm entirely. Single-threaded guests run wholly on the main thread, so
- * that was most of the emulator's syscall cost.
- *
- * The timer is now a repeating one, armed once with an it_interval, and a tick
- * that finds this word odd and unchanged since the previous tick has seen no
- * progress for a whole period. One word rather than a flag beside a counter is
- * what keeps that decision free of any ordering argument: a single atomic
- * object has one modification order, so relaxed access is enough and there is
- * no pairing to get wrong. An earlier revision split the state in two and got
- * the pairing wrong twice.
- *
- * Detection therefore takes one to two periods rather than exactly one, which
- * for a ten-second backstop is not a property anything depends on.
+/* Odd means the CPU-0 owner is inside hv_vcpu_run. The SIGALRM consumer detects
+ * a stuck HVF call from an unchanged odd value. Scheduler cancellations also
+ * use task-owned watchdog_progress_ns so preemption cannot hide a spin.
  */
 static _Atomic uint64_t g_vcpu_progress;
 
@@ -3122,6 +3826,7 @@ static void *preempt_thread_main(void *arg)
             pthread_mutex_lock(&pid_lock);
             pthread_cond_broadcast(&pid_cond);
             pthread_mutex_unlock(&pid_lock);
+            proc_wait_wake_all();
             wakeup_pipe_signal();
         } else if (sig == SIGALRM) {
             /* sys_wait4's entry is the only other caller, so a guest that takes
@@ -3214,8 +3919,17 @@ static void unlink_own_transport(void)
  * call site is single-threaded process bring-up.
  *
  * Returns 0 on success, -1 if the sigwait thread cannot be started (fatal for
- * this process).
+ * this process). After fork(2) the child inherits g_preempt_started=true and a
+ * dead pthread_t for the sigwait thread (threads do not survive fork). Clear
+ * the guard and start a fresh consumer so cross-process doorbells (guest
+ * signals, pidfd_getfd) work in the child.
  */
+int proc_preempt_reinit_after_fork(void)
+{
+    g_preempt_started = false;
+    return proc_preempt_init();
+}
+
 int proc_preempt_init(void)
 {
     if (g_preempt_started)
@@ -3328,6 +4042,12 @@ static void drain_external_guest_signal(void)
     if (!atomic_exchange_explicit(&g_external_guest_signal, 0,
                                   memory_order_acquire))
         return;
+
+    /* pidfd_getfd rings the same doorbell; serve its inbox even when no signal
+     * transport file exists yet (a getfd-only wake creates only the getfd
+     * inbox).
+     */
+    pidfd_getfd_drain();
 
     char path[PATH_MAX];
     if (!signal_transport_path(path, sizeof(path), getpid()))
@@ -3720,10 +4440,22 @@ static bool vcpu_handle_brk(guest_t *g,
     }
 
     if (current_thread->ptraced) {
-        /* Ptrace-stop: suspend vCPU, notify tracer. thread_ptrace_stop blocks
-         * until tracer CONT's.
+        /* Ptrace-stop: publish the stop without occupying this CPU worker.
+         * thread_ptrace_stop snapshots the registers, requests a park, and
+         * returns; the outer loop saves the context and picks another task.
          */
         int cont_sig = thread_ptrace_stop(current_thread, 5);
+        if (current_thread->ptrace_stopped ||
+            exec_park_active_load(current_thread)) {
+            /* The remount resumes the shim just after HVC #10, where handle_brk
+             * reloads X8 from the saved frame. The park itself carries the
+             * generic PLAIN kind because thread_ptrace_stop does not know which
+             * HVC took the stop; mark the resume here so it republishes the
+             * architectural X8 before the tail reloads it.
+             */
+            current_thread->exec_resume = EXEC_RESUME_HVC10_TAIL;
+            return false;
+        }
 
         /* handle_brk reloads X8 from its frame, which still holds the value the
          * BRK was taken with. Publish the live one, so an X8 the tracer wrote
@@ -4085,16 +4817,38 @@ static bool ptrace_consume_owed_stop(guest_t *g)
  * the flag has to survive that, which is why it is not cleared per exit; the
  * canceled handler sees EL1 in CPSR and resumes into the same window. No other
  * HVC is reachable from the SVC tail, and EL0 cannot issue one at all, so an
- * unarmed HVC #13 means the shim and this file disagree.
+ * unarmed HVC #13 means the shim and this file disagree. What a run-loop exit
+ * handler tells the loop to do next. VCPU_RESUME means the exit was handled and
+ * the vCPU should re-enter the guest; VCPU_STOP leaves the loop with *exit_code
+ * (already set); VCPU_PARK leaves at a legal safepoint for the outer loop to
+ * save and unmount; VCPU_RESCHED asks for a scheduling point after the handler
+ * completed.
  */
-static _Thread_local bool cpu_ptrace_stop_armed;
+typedef enum {
+    VCPU_RESUME,
+    VCPU_STOP,
+    VCPU_PARK,
+    VCPU_RESCHED,
+} vcpu_action_t;
 
-/* Take a consumed ptrace-stop and inject the tracer's resume signal. Every
- * caller has already consumed the stop, which establishes current_thread.
+/* Take a ptrace stop owed to this task. thread_ptrace_stop publishes the
+ * stopped state and requests a park instead of blocking the worker, so a
+ * stopped tracee consumes no CPU. If the stop was published, return PARK and
+ * let the outer loop save the context; the resume tail applies the tracer's
+ * registers and any CONT signal.
  */
-static bool ptrace_take_stop(guest_t *g, hv_vcpu_t vcpu, int *exit_code)
+static vcpu_action_t ptrace_take_stop(guest_t *g,
+                                      hv_vcpu_t vcpu,
+                                      int park_resume,
+                                      int *exit_code)
 {
     int cont_sig = thread_ptrace_stop(current_thread, SIGTRAP);
+
+    if (current_thread->ptrace_stopped) {
+        current_thread->exec_resume = park_resume;
+        return VCPU_PARK;
+    }
+
     if (cont_sig > 0)
         signal_queue(cont_sig);
 
@@ -4108,17 +4862,16 @@ static bool ptrace_take_stop(guest_t *g, hv_vcpu_t vcpu, int *exit_code)
     /* One delivery covers both the injected resume signal and anything that
      * arrived while the tracee was stopped, so neither caller repeats it.
      */
-    return !signal_pending() || signal_deliver(vcpu, g, exit_code) >= 0;
+    if (!signal_pending())
+        return VCPU_RESUME;
+    return signal_deliver(vcpu, g, exit_code) >= 0 ? VCPU_RESUME : VCPU_STOP;
 }
 
-/* What a run-loop exit handler tells the loop to do next. VCPU_RESUME means the
- * exit was handled and the vCPU should re-enter the guest; VCPU_STOP means
- * leave the loop with *exit_code, which the handler has already set.
- */
-typedef enum {
-    VCPU_RESUME,
-    VCPU_STOP,
-} vcpu_action_t;
+
+static vcpu_action_t syscall_return_epilogue(guest_t *g,
+                                             hv_vcpu_t vcpu,
+                                             int ret,
+                                             int *exit_code);
 
 /* Guest exception handling, lifted out of vcpu_run_loop_with_hooks alongside
  * the canceled-exit arm.
@@ -4135,16 +4888,127 @@ typedef enum {
  * flag would not be visible to them.
  */
 
+/* Shared post-dispatch protocol for an HVC #5 syscall and for an SVC reissued
+ * after a park. Runs the syscall return, signal/ptrace, temporary-mask and
+ * register-tail protocol exactly once, then reports whether the outer loop may
+ * enter the guest, must park, or must reschedule.
+ */
+static vcpu_action_t finish_syscall_dispatch(guest_t *g,
+                                             hv_vcpu_t vcpu,
+                                             int ret,
+                                             bool verbose,
+                                             const char *prefix,
+                                             int *exit_code)
+{
+    if (ret == SYSCALL_PARKED) {
+        /* Park: skip the return tail. X7 must be clear so a later remount that
+         * resumes the shim tail does not enter HVC #13 with no armed stop.
+         */
+        hv_vcpu_set_reg(vcpu, HV_REG_X7, 0);
+        current_thread->ptrace_stop_armed = false;
+        return VCPU_PARK;
+    }
+    if (ret == 1)
+        return VCPU_STOP;
+
+    /* de_thread: a syscall that returned (including -EINTR from an
+     * interruptible mmap_lock wait) must not resume the guest. The compute/mmap
+     * workers retry forever on EINTR; returning to them spins the host while
+     * the exec'ing thread waits for an exit that never comes.
+     */
+    if (!thread_current_is_leader() && thread_exec_stop_requested()) {
+        *exit_code = 0;
+        return VCPU_STOP;
+    }
+
+
+    /* A task-owned restart classification can be left behind when a handler
+     * forbade the restart and then failed to park; the parked result path
+     * consumed the one that belongs to it in proc_resume_task. Consume any
+     * remainder here, explicitly, so it cannot suppress a later resume.
+     */
+    if (current_thread)
+        (void) exec_restart_forbid_take(current_thread);
+    /* Check guest ITIMER_REAL expiry (queues SIGALRM if due). */
+    signal_check_timer();
+
+    /* Recompute the shim-globals attention flag now that signal_check_timer has
+     * had a chance to drain pending work. If nothing is pending and no itimer
+     * is armed, drop the flag back to zero so the identity fast path re-engages
+     * for the next getpid loop. Without this clear, the attention flag set by
+     * signal_queue (e.g. on a subprocess's SIGCHLD) would stick forever and
+     * permanently disable the fast path.
+     *
+     * Before the signal delivery below, not after, which costs one wasted round
+     * trip per delivered signal: the recompute still sees the signal queued, so
+     * the flag stays up until the next syscall's epilogue clears it. Moving it
+     * after the delivery recovers that (ATTN_BAIL fell 9.6 percent on a
+     * signal-storm workload) and crashes tests/test-mmap-sigbus-efault, because
+     * the fast paths it re-engages have no answer for a stage-2 fault on a
+     * truncated MAP_SHARED overlay: EC=0x24 reaches EL2 and no arm handles it.
+     * The clear stays here until that gap is closed.
+     */
+    shim_globals_recompute_attention(g);
+
+    if (ret == SYSCALL_EXEC_HAPPENED && verbose) {
+        uint64_t tblocked =
+            current_thread ? thread_blocked_load(current_thread) : 0xDEAD;
+        log_debug(
+            "%s: post-sigreturn state: "
+            "pending=0x%llx global_blocked=0x%llx "
+            "thread_blocked=0x%llx signal_pending=%d",
+            prefix, (unsigned long long) signal_shared_pending_load(),
+            (unsigned long long) signal_blocked_load(),
+            (unsigned long long) tblocked, signal_pending());
+    }
+
+    vcpu_action_t action = syscall_return_epilogue(g, vcpu, ret, exit_code);
+    if (action != VCPU_RESUME)
+        return action;
+
+    /* After exec, verify critical registers before resuming vCPU. This closes
+     * any gap where signal delivery or other code between sys_execve's sync
+     * flush and hv_vcpu_run could have modified ELR_EL1.
+     */
+    if (ret == SYSCALL_EXEC_HAPPENED) {
+        uint64_t verify_elr;
+        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &verify_elr);
+        if (verify_elr == 0) {
+            log_fatal("%s: ELR_EL1=0 after exec, register sync failed", prefix);
+            crash_report(vcpu, g, CRASH_ELR_ZERO, "ELR_EL1=0 after exec");
+            *exit_code = 128;
+            return VCPU_STOP;
+        }
+    }
+
+    /* A stop requested while running the tail (for example a new
+     * PTRACE_INTERRUPT consumed by signal delivery) leaves the task parked.
+     */
+    if (current_thread && exec_park_active_load(current_thread))
+        return VCPU_PARK;
+
+    /* sched_yield / affinity / wake-before-unmount: switch only here, after the
+     * calling task's own return path has completed.
+     */
+    if (sched_resched_requested())
+        return VCPU_RESCHED;
+
+    return VCPU_RESUME;
+}
+
 /* Finish an HVC #5 return: take or defer any owed ptrace-stop, deliver pending
  * signals, and place the shim's X7 detour request.
  *
- * Returns whether the guest keeps running.
+ * Returns VCPU_RESUME when the guest may be entered, VCPU_STOP when the tail
+ * terminated the task, or VCPU_PARK when the task was published stopped and
+ * must leave at this safepoint. Exactly one path runs the per-task return
+ * protocol: the immediate HVC #5 arm, a parked-result resume, an SVC reissue,
+ * and a stopped syscall tail all call here once.
  */
-static bool syscall_return_epilogue(guest_t *g,
-                                    hv_vcpu_t vcpu,
-                                    int ret,
-                                    bool running,
-                                    int *exit_code)
+static vcpu_action_t syscall_return_epilogue(guest_t *g,
+                                             hv_vcpu_t vcpu,
+                                             int ret,
+                                             int *exit_code)
 {
     /* Whether the shim's tail restores the saved frame is what decides if X7 is
      * host-only. The vector entry clobbers no GPR below X9, so the live set at
@@ -4172,20 +5036,33 @@ static bool syscall_return_epilogue(guest_t *g,
      * first syscall takes it.
      */
     bool defer_stop = false, stop_taken = false;
-    if (running && (frame_restored || regs_final) &&
-        ptrace_consume_owed_stop(g)) {
-        if (regs_final) {
-            /* Live registers are already the architectural EL0 set, which is
-             * what the detour exists to produce. Stop here instead. One
-             * register is not the guest's: X8 still holds the drop-frame
-             * marker, which the tail reloads from the frame after this stop, so
-             * PTRACE_GETREGSET here reports 2 where the guest's X8 belongs.
-             * Pre-existing and unchanged; docs/internals.md measures it.
-             */
-            running = ptrace_take_stop(g, vcpu, exit_code);
-            stop_taken = true;
-        } else {
-            defer_stop = true;
+    if (frame_restored || regs_final) {
+        if (ptrace_consume_owed_stop(g)) {
+            if (regs_final) {
+                /* Live registers are already the architectural EL0 set, which
+                 * is what the detour exists to produce. Stop here instead. X8
+                 * still holds the drop-frame marker; the guest's own value is
+                 * in the frame slot, and that is what the tracer must see and
+                 * what the resumed tail must reload, so snapshot the stop on it
+                 * and put the marker back before the shim continues. The
+                 * continuation is the drop-frame tail, not the HVC #13 detour,
+                 * so no arm may survive this stop.
+                 */
+                uint64_t frame_x8 = 0;
+                bool have_frame_x8 = signal_shim_frame_x8(vcpu, g, &frame_x8);
+                if (have_frame_x8)
+                    hv_vcpu_set_reg(vcpu, HV_REG_X8, frame_x8);
+                current_thread->ptrace_stop_armed = false;
+                vcpu_action_t a = ptrace_take_stop(
+                    g, vcpu, EXEC_PARK_RESUME_SYSCALL_TAIL, exit_code);
+                if (have_frame_x8)
+                    hv_vcpu_set_reg(vcpu, HV_REG_X8, 2);
+                if (a != VCPU_RESUME)
+                    return a;
+                stop_taken = true;
+            } else {
+                defer_stop = true;
+            }
         }
     }
 
@@ -4196,11 +5073,11 @@ static bool syscall_return_epilogue(guest_t *g,
      * here would stack a frame on the handler the first one just installed.
      * ptrace_take_stop has already made that call on the inline path.
      */
-    if (running && !defer_stop && !stop_taken && signal_pending()) {
+    if (!defer_stop && !stop_taken && signal_pending()) {
         int sig_ret = signal_deliver(vcpu, g, exit_code);
         if (sig_ret < 0)
-            running = false; /* Default TERM/CORE disposition */
-        else if (sig_ret > 0)
+            return VCPU_STOP; /* Default TERM/CORE disposition */
+        if (sig_ret > 0)
             frame_restored = false; /* committed to a handler frame: X8 = 2 */
     }
 
@@ -4217,10 +5094,272 @@ static bool syscall_return_epilogue(guest_t *g,
      */
     if (frame_restored) {
         hv_vcpu_set_reg(vcpu, HV_REG_X7, defer_stop);
-        cpu_ptrace_stop_armed = defer_stop;
+        current_thread->ptrace_stop_armed = defer_stop;
     }
 
-    return running;
+    return VCPU_RESUME;
+}
+
+
+/* Park-result injection: the task was parked without writing X0. Publish the
+ * completion result in the live registers and in the saved context so a later
+ * save cannot resurrect stale arguments. X7 stays clear because the shim tests
+ * it for a ptrace detour after HVC #5 and this path does not arm one.
+ */
+static void inject_park_result(thread_entry_t *t, hv_vcpu_t vcpu)
+{
+    int64_t result = exec_park_result_load(t);
+    hv_vcpu_set_reg(vcpu, HV_REG_X0, (uint64_t) result);
+    t->guest_ctx.gprs[0] = (uint64_t) result;
+    hv_vcpu_set_reg(vcpu, HV_REG_X7, 0);
+    t->guest_ctx.gprs[7] = 0;
+    exec_park_result_pending_store(t, false);
+}
+
+/* Return tail shared by immediate completion, parked-result resume and a
+ * stopped syscall tail. No dispatch runs here; the SVC result is already in X0
+ * (or was never consumed, in which case the caller reissued first).
+ */
+static proc_leave_t finish_return_tail(guest_t *g,
+                                       hv_vcpu_t vcpu,
+                                       bool verbose,
+                                       int *exit_code)
+{
+    (void) verbose;
+    signal_check_timer();
+    shim_globals_recompute_attention(g);
+
+    vcpu_action_t action = syscall_return_epilogue(g, vcpu, 0, exit_code);
+    if (action == VCPU_STOP)
+        return PROC_LEAVE_EXIT;
+    if (action == VCPU_PARK)
+        return PROC_LEAVE_PARK;
+
+    if (current_thread && exec_park_active_load(current_thread))
+        return PROC_LEAVE_PARK;
+    if (sched_resched_requested())
+        return PROC_LEAVE_RESCHED;
+    return PROC_LEAVE_CONTINUE;
+}
+
+/* Request that the current task leave the CPU after the handler returns. Called
+ * from stop/wait drivers, often with thread_lock held; it takes no scheduler or
+ * thread lock.
+ */
+void exec_park_current(int park_kind, int park_resume)
+{
+    thread_entry_t *t = current_thread;
+    if (!t || exec_park_active_load(t))
+        return;
+    exec_park_kind_store(t, park_kind);
+    exec_park_result_pending_store(t, false);
+    exec_park_reissue_store(t, false);
+    exec_park_deadline_ns_store(t, 0);
+    exec_park_requeue_pi_set(t, false);
+    t->exec_resume = park_resume;
+
+    /* Publish the arm last: a waker that acquires park_active observes the kind
+     * and result direction above.
+     */
+    exec_park_active_store(t, true);
+}
+
+/* Resume work after the pool restored guest_ctx and applied tracer register
+ * changes. This is the only place a parked continuation is resolved:
+ *
+ *   RESULT   either arm a Linux restart (the wait consumed nothing and an
+ *            interruptible signal completed it; the return tail lets
+ *            signal_deliver decide by SA_RESTART), or inject the published
+ *            result, then the shared return tail.
+ *   REISSUE  re-dispatch the SVC (the handler committed no result), then the
+ *            shared dispatch tail exactly as HVC #5 does.
+ *   TAIL     a syscall result was already written before the stop; finish its
+ *            return protocol once.
+ *   PLAIN    no syscall work: deliver a signal queued while stopped when the
+ *            saved state is EL0, then enter.
+ */
+proc_leave_t proc_resume_task(hv_vcpu_t vcpu,
+                              guest_t *g,
+                              bool verbose,
+                              int *exit_code)
+{
+    thread_entry_t *t = current_thread;
+    if (!t)
+        return PROC_LEAVE_CONTINUE;
+
+    int resume = t->exec_resume;
+    thread_fork_barrier_check();
+    t->exec_resume = EXEC_RESUME_PLAIN;
+
+    /* Consume the task-owned restart classification. A parked wait publishes
+     * "do not restart" either before arming the park (a handler that already
+     * spent a deadline or moved bytes called syscall_restart_forbid), or from
+     * its waker (exec_restart_forbid_set in runtime/futex.c). It belongs to
+     * this result and must never outlive it.
+     */
+    bool restart_forbid =
+        exec_restart_forbid_take(t) || t->syscall_restart.forbidden;
+    t->syscall_restart.forbidden = restart_forbid;
+
+    /* WAIT_REQUEUE_PI before CMP_REQUEUE_PI: a signal must re-enter the wait by
+     * undoing the SVC completion point once, the Linux ERESTARTNOINTR shape.
+     * Forced, not an ERESTARTSYS: the rewind is not armed on the task record,
+     * so signal_deliver cannot cancel it for a handler without SA_RESTART. The
+     * handler's rt_sigreturn re-enters the wait; do not inject EINTR.
+     */
+    bool requeue_pi_restart = exec_park_requeue_pi_take(t);
+    if (exec_park_result_pending_load(t) && requeue_pi_restart &&
+        exec_park_result_load(t) == -LINUX_EINTR) {
+        exec_park_result_pending_store(t, false);
+        if (t->guest_ctx.elr_el1 >= 4) {
+            t->guest_ctx.elr_el1 -= 4;
+            hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, t->guest_ctx.elr_el1);
+        }
+        return finish_return_tail(g, vcpu, verbose, exit_code);
+    }
+
+    if (exec_park_reissue_load(t) || resume == EXEC_RESUME_REISSUE) {
+        exec_park_reissue_store(t, false);
+        exec_park_result_pending_store(t, false);
+        int ret = syscall_dispatch(vcpu, g, exit_code, verbose);
+        vcpu_action_t action =
+            finish_syscall_dispatch(g, vcpu, ret, verbose, "elfuse", exit_code);
+        if (action == VCPU_STOP)
+            return PROC_LEAVE_EXIT;
+        if (action == VCPU_PARK)
+            return PROC_LEAVE_PARK;
+        if (action == VCPU_RESCHED)
+            return PROC_LEAVE_RESCHED;
+        return PROC_LEAVE_CONTINUE;
+    }
+
+    if (exec_park_result_pending_load(t) || resume == EXEC_RESUME_RESULT) {
+        /* A RESULT classification without a pending result should not happen;
+         * treat it as a plain entry rather than fabricating a return value.
+         */
+        if (exec_park_result_pending_load(t)) {
+            int64_t result = exec_park_result_load(t);
+
+            /* The common Linux restart applies here exactly as it does to a
+             * synchronous EINTR. The wait already stated whether it consumed
+             * anything (restart_forbid); the only remaining question is whether
+             * a signal the guest can observe is what completed it. The rewind
+             * leaves X0 and the shim's frame (X1-X30, X8) exactly as the guest
+             * passed them, and the dispatcher's ELR/X8 witness marks the
+             * re-executed SVC restarted.
+             */
+            bool restarts = result == -LINUX_EINTR && !restart_forbid &&
+                            !thread_stop_requested_for(t) &&
+                            signal_pending_interruption(NULL) &&
+                            t->guest_ctx.elr_el1 >= 4;
+            if (restarts) {
+                uint64_t elr_after_svc = t->guest_ctx.elr_el1;
+                syscall_restart_arm(vcpu, elr_after_svc, t->guest_ctx.gprs[8],
+                                    result);
+                t->guest_ctx.elr_el1 = elr_after_svc - 4;
+                exec_park_result_pending_store(t, false);
+            } else {
+                /* A park that owed a guest write (interrupted nanosleep's
+                 * remaining timespec) could not perform it on the waker thread;
+                 * apply it here, on the owner and after the fork freeze gate,
+                 * so it cannot land in a snapshot or in guest memory the task
+                 * no longer owns. A write failure replaces the injected result.
+                 */
+                thread_fork_barrier_check();
+                int rem_rc = sleep_park_apply_pending(t, g);
+                if (rem_rc < 0)
+                    exec_park_result_store(t, rem_rc);
+                inject_park_result(t, vcpu);
+            }
+        }
+        tlbi_request_emit_to_vcpu(vcpu);
+        return finish_return_tail(g, vcpu, verbose, exit_code);
+    }
+
+    if (resume == EXEC_RESUME_HVC10_TAIL) {
+        /* The task stopped inside handle_brk, whose tail reloads X8 from the
+         * SAVE_GPRS frame still live on the EL1 stack. The tracer's register
+         * set is live now, but that reload would put the pre-stop X8 back over
+         * it. Publish the architectural X8 -- the one the tracer left when it
+         * wrote one -- into the frame slot and let the tail load it.
+         *
+         * Signals queued while stopped (a PTRACE_CONT injection among them) go
+         * first, on the same architectural state. Delivery overwrites X8 with
+         * the frame-drop marker, hence the publish after it; handle_brk
+         * consumes no marker and reloads X8 unconditionally.
+         */
+        uint64_t x8_arch;
+        pthread_mutex_t *tlock = thread_get_lock();
+        pthread_mutex_lock(tlock);
+        x8_arch = t->ptrace_regs.regs[8];
+        pthread_mutex_unlock(tlock);
+
+        if (signal_pending()) {
+            if (signal_deliver(vcpu, g, exit_code) < 0)
+                return PROC_LEAVE_EXIT;
+        }
+        hv_vcpu_set_reg(vcpu, HV_REG_X8, x8_arch);
+        signal_publish_live_x8(vcpu, g);
+        if (sched_resched_requested())
+            return PROC_LEAVE_RESCHED;
+        return PROC_LEAVE_CONTINUE;
+    }
+
+    if (resume == EXEC_RESUME_SYSCALL_TAIL) {
+        /* The task stopped at the HVC #5 drop-frame safepoint: the live set is
+         * the rebuilt EL0 context except X8, which carries the host's marker.
+         * The shim re-runs its post-HVC dispatch on resume, so the marker has
+         * to come back afterwards; leaving the tracer's X8 there would send the
+         * dispatch down a TLBI tail and restore the stale frame (or its X9-X13
+         * shadow) over the rebuilt set.
+         */
+        uint64_t x8_arch, x7_arch;
+        pthread_mutex_t *tlock = thread_get_lock();
+        pthread_mutex_lock(tlock);
+        x8_arch = t->ptrace_regs.regs[8];
+        x7_arch = t->ptrace_regs.regs[7];
+        pthread_mutex_unlock(tlock);
+
+        /* A pending delivery must record the architectural X8, not the marker.
+         */
+        hv_vcpu_set_reg(vcpu, HV_REG_X8, x8_arch);
+        proc_leave_t leave = finish_return_tail(g, vcpu, verbose, exit_code);
+        if (leave == PROC_LEAVE_CONTINUE || leave == PROC_LEAVE_RESCHED) {
+            if (current_thread->ptrace_stop_armed) {
+                /* A stop was consumed in this epilogue and X7 arms the HVC #13
+                 * detour, which runs after svc_hvc_restore_eret reloads the
+                 * frame. Publish the whole architectural set first: the frame
+                 * still holds the values the interrupted syscall entered with,
+                 * and that reload would otherwise discard what the tracer wrote
+                 * at this stop.
+                 */
+                signal_publish_shim_frame_gprs(vcpu, g, t->ptrace_regs.regs);
+                hv_vcpu_set_reg(vcpu, HV_REG_X8, 0);
+            } else {
+                /* This tail drops the frame, so X7 is guest state, but the
+                 * epilogue wrote it for a restoring return. Only X8 is
+                 * reloaded, so publishing it alone is enough.
+                 */
+                hv_vcpu_set_reg(vcpu, HV_REG_X8, x8_arch);
+                signal_publish_live_x8(vcpu, g);
+                hv_vcpu_set_reg(vcpu, HV_REG_X7, x7_arch);
+                hv_vcpu_set_reg(vcpu, HV_REG_X8, 2);
+            }
+        }
+        return leave;
+    }
+
+    /* PLAIN: a stopped EL0 task may have signals queued while it was not
+     * running. Deliver before guest entry; the EL1 (shim tail) case resumes the
+     * tail and delivers at its next HVC.
+     */
+    if ((t->guest_ctx.cpsr & 0xfULL) == 0 && signal_pending()) {
+        if (signal_deliver(vcpu, g, exit_code) < 0)
+            return PROC_LEAVE_EXIT;
+    }
+    if (sched_resched_requested())
+        return PROC_LEAVE_RESCHED;
+    return PROC_LEAVE_CONTINUE;
 }
 
 static vcpu_action_t vcpu_handle_exception_exit(guest_t *g,
@@ -4243,75 +5382,16 @@ static vcpu_action_t vcpu_handle_exception_exit(guest_t *g,
 
         switch (imm) {
         case 5: {
-            /* HVC #5: Linux syscall forwarding */
+            /* HVC #5: Linux syscall forwarding. The handler returns a result, a
+             * park, an exec result or an exit; this arm runs the one return
+             * protocol and reports a scheduling disposition. It never changes
+             * context.
+             */
             int ret = syscall_dispatch(vcpu, g, exit_code, verbose);
-            if (ret == 1)
-                running = false;
-
-            /* execve replaced the process image; sys_execve already installed
-             * the new X0/syscall-return state.
-             */
-
-            /* Check guest ITIMER_REAL expiry (queues SIGALRM if due) */
-            signal_check_timer();
-
-            /* Recompute the shim-globals attention flag now that
-             * signal_check_timer has had a chance to drain pending work. If
-             * nothing is pending and no itimer is armed, drop the flag back to
-             * zero so the identity fast path re-engages for the next getpid
-             * loop. Without this clear, the attention flag set by signal_queue
-             * (e.g., on a subprocess's SIGCHLD) would stick forever and
-             * permanently disable the fast path.
-             *
-             * Before the signal delivery below, not after, which costs one
-             * wasted round trip per delivered signal: the recompute still sees
-             * the signal queued, so the flag stays up until the next syscall's
-             * epilogue clears it. Moving it after the delivery recovers that
-             * (ATTN_BAIL fell 9.6 percent on a signal-storm workload) and
-             * crashes tests/test-mmap-sigbus-efault, because the fast paths it
-             * re-engages have no answer for a stage-2 fault on a truncated
-             * MAP_SHARED overlay: EC=0x24 reaches EL2 and no arm handles it.
-             * The clear stays here until that gap is closed.
-             */
-            shim_globals_recompute_attention(g);
-
-            /* Diagnostic: log signal state after exec/sigreturn to help debug
-             * signal delivery issues.
-             */
-            if (ret == SYSCALL_EXEC_HAPPENED && verbose) {
-                uint64_t tblocked = current_thread
-                                        ? thread_blocked_load(current_thread)
-                                        : 0xDEAD;
-                log_debug(
-                    "%s: post-sigreturn state: "
-                    "pending=0x%llx global_blocked=0x%llx "
-                    "thread_blocked=0x%llx signal_pending=%d",
-                    prefix, (unsigned long long) signal_shared_pending_load(),
-                    (unsigned long long) signal_blocked_load(),
-                    (unsigned long long) tblocked, signal_pending());
-            }
-
-            running = syscall_return_epilogue(g, vcpu, ret, running, exit_code);
-
-            /* After exec, verify critical registers before resuming vCPU. This
-             * closes any gap where signal delivery or other code between
-             * sys_execve's sync flush and hv_vcpu_run could have modified
-             * ELR_EL1.
-             */
-            if (running && ret == SYSCALL_EXEC_HAPPENED) {
-                uint64_t verify_elr;
-                hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &verify_elr);
-                if (verify_elr == 0) {
-                    log_fatal(
-                        "%s: ELR_EL1=0 after exec, register sync "
-                        "failed",
-                        prefix);
-                    crash_report(vcpu, g, CRASH_ELR_ZERO,
-                                 "ELR_EL1=0 after exec");
-                    *exit_code = 128;
-                    running = false;
-                }
-            }
+            vcpu_action_t action = finish_syscall_dispatch(
+                g, vcpu, ret, verbose, prefix, exit_code);
+            if (action != VCPU_RESUME)
+                return action;
             break;
         }
 
@@ -4362,6 +5442,9 @@ static vcpu_action_t vcpu_handle_exception_exit(guest_t *g,
 
         case 10: {
             running = vcpu_handle_brk(g, vcpu, verbose, prefix, exit_code);
+            if (!running && current_thread &&
+                exec_park_active_load(current_thread))
+                return VCPU_PARK;
             break;
         }
 
@@ -4381,7 +5464,7 @@ static vcpu_action_t vcpu_handle_exception_exit(guest_t *g,
              * waiting on a tracer that will never CONT it: a silent hang
              * instead of a report.
              */
-            if (!cpu_ptrace_stop_armed) {
+            if (!current_thread->ptrace_stop_armed) {
                 log_fatal("%s: HVC #13 with no ptrace stop armed", prefix);
                 crash_report(vcpu, g, CRASH_UNEXPECTED_HVC,
                              "HVC #13 without an armed ptrace stop");
@@ -4389,9 +5472,31 @@ static vcpu_action_t vcpu_handle_exception_exit(guest_t *g,
                 running = false;
                 break;
             }
-            cpu_ptrace_stop_armed = false;
-            running = ptrace_take_stop(g, vcpu, exit_code);
-            signal_restore_saved_blocked();
+            current_thread->ptrace_stop_armed = false;
+            vcpu_action_t stop_action =
+                ptrace_take_stop(g, vcpu, EXEC_PARK_RESUME_PLAIN, exit_code);
+            if (stop_action == VCPU_PARK)
+                return VCPU_PARK;
+            if (stop_action == VCPU_STOP)
+                running = false;
+            else
+                signal_restore_saved_blocked();
+            break;
+
+        case 14:
+            /* Guest-side SYNC_CORE trampoline. The shim has already executed IC
+             * IALLU/DSB ISH/ISB on this vCPU and saved ELR/SPSR; the pool
+             * publishes the generation ack and returns, leaving every guest
+             * register untouched so the shim can ERET to the interrupted
+             * PC/CPSR.
+             */
+            if (!vcpu_pool_barrier_ack_current()) {
+                log_fatal("%s: HVC #14 with no SYNC_CORE in flight", prefix);
+                crash_report(vcpu, g, CRASH_UNEXPECTED_HVC,
+                             "HVC #14 without a barrier request");
+                *exit_code = 128;
+                running = false;
+            }
             break;
 
         case 2: {
@@ -4559,9 +5664,11 @@ static vcpu_action_t vcpu_handle_canceled_exit(guest_t *g,
      * stop parks on an unbounded condvar with no teardown predicate, and the
      * ptrace stop and signal delivery both touch guest memory the exec is about
      * to reset. Reaching any of them here would outlive the join cap in
-     * thread_exec_de_thread.
+     * thread_exec_de_thread. The leader owns process teardown and is the thread
+     * running execve, so de_thread never stops it. With main on the pool, the
+     * leader may run with timeout_sec==0.
      */
-    if (!is_main && thread_exec_stop_requested()) {
+    if (!thread_current_is_leader() && thread_exec_stop_requested()) {
         *exit_code = 0;
         return VCPU_STOP;
     }
@@ -4607,8 +5714,12 @@ static vcpu_action_t vcpu_handle_canceled_exit(guest_t *g,
      * brought the vCPU here may not be the one that owes it, and the flag is
      * what says whether anything is owed at all.
      */
-    if (ptrace_consume_owed_stop(g) && !ptrace_take_stop(g, vcpu, exit_code))
-        return VCPU_STOP;
+    if (ptrace_consume_owed_stop(g)) {
+        vcpu_action_t stop_action =
+            ptrace_take_stop(g, vcpu, EXEC_PARK_RESUME_PLAIN, exit_code);
+        if (stop_action != VCPU_RESUME)
+            return stop_action;
+    }
 
     /* rseq preemption abort: mirrors Linux rseq_ip_fixup() on context switch.
      */
@@ -4678,51 +5789,45 @@ static vcpu_action_t vcpu_handle_canceled_exit(guest_t *g,
  * stopped. Each reason's handling lives in its own function above, which is
  * what took this from 610 lines and a size-lint suppression down to under 200,
  * and what gave the two handlers that rebuild guest register state one place to
- * state the precondition they share.
+ * state the precondition they share. Unified guest execution for one mounted
+ * task.
+ *
+ * Returns only when the task must leave the CPU: guest exit, park safepoint, or
+ * a completed reschedule request. It never switches tasks; that is the pool's
+ * outer loop.
+ *
+ * When timeout_sec > 0 (main thread): arms the repeating watchdog timer and
+ * publishes progress to it. When timeout_sec == 0 (worker thread): no watchdog
+ * (SIGALRM is process-wide). Both modes check proc_exit_group_requested.
  */
-int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
-                             hv_vcpu_exit_t *vexit,
-                             guest_t *g,
-                             bool verbose,
-                             int timeout_sec,
-                             int *wait_status_out,
-                             const vcpu_run_hooks_t *hooks)
+static proc_leave_t run_loop_core(hv_vcpu_t vcpu,
+                                  hv_vcpu_exit_t *vexit,
+                                  guest_t *g,
+                                  bool verbose,
+                                  int timeout_sec,
+                                  const vcpu_run_hooks_t *hooks,
+                                  int *exit_code_out,
+                                  int *wait_status_out)
 {
     int exit_code = 0;
     (void) signal_take_termination_wait_status();
-    bool running = true;
-
-    /* Unsigned, and 64-bit, because the watchdog derives a parity from it
-     * below: signed overflow is undefined, and this increments once per guest
-     * exit, so a guest making a million syscalls a second reaches 2^31 in about
-     * half an hour. Unsigned wrap is defined and preserves the parity, 2^64
-     * being even.
-     */
+    proc_leave_t leave = PROC_LEAVE_EXIT;
     uint64_t iter = 0;
     const int is_main = (timeout_sec > 0);
     const char *prefix = is_main ? "elfuse" : "elfuse: worker";
+    if (current_thread && current_thread->watchdog_progress_ns == 0)
+        current_thread->watchdog_progress_ns = sched_now_ns();
 
-    /* Pin vCPU thread to a performance core via QoS class. On Apple Silicon,
-     * USER_INTERACTIVE maps to P-cores, avoiding E-core migration that causes
-     * measurable jank in HVF workloads.
-     */
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 
-    /* Main thread: arm the watchdog timer. SIGALRM is blocked here and consumed
-     * by the preemption thread (proc_preempt_init), which sets g_timed_out and
-     * kicks the vCPU via hv_vcpus_exit. Guest ITIMER_REAL is emulated
-     * internally by signal_check_timer() rather than using host setitimer,
-     * because macOS shares alarm() and setitimer(ITIMER_REAL) as the same
-     * underlying timer.
-     *
-     * Repeating rather than one-shot: it_interval is what lets the watchdog
-     * tick on its own forever instead of re-arming itself from the signal
-     * handler. Re-arming would need the period published across threads and
-     * would race the loop's own disarm.
+    /* Main thread: arm the repeating watchdog timer. SIGALRM is blocked here
+     * and consumed by the preemption thread (proc_preempt_init), which sets
+     * g_timed_out and kicks the vCPU via hv_vcpus_exit. Guest ITIMER_REAL is
+     * emulated internally by signal_check_timer() rather than using host
+     * setitimer, because macOS shares alarm() and setitimer(ITIMER_REAL).
      */
     if (is_main) {
         atomic_store_explicit(&g_timed_out, 0, memory_order_relaxed);
-
         struct itimerval every = {
             .it_interval = {.tv_sec = timeout_sec, .tv_usec = 0},
             .it_value = {.tv_sec = timeout_sec, .tv_usec = 0},
@@ -4730,46 +5835,51 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
         setitimer(ITIMER_REAL, &every, NULL);
     }
 
-    while (running) {
-        /* Check if another thread called exit_group */
+    for (;;) {
         if (proc_exit_group_requested()) {
             exit_code = proc_exit_group_code();
+            leave = PROC_LEAVE_EXIT;
             break;
         }
 
         /* An execve on a sibling thread is tearing this one down. Leaving the
-         * loop takes it through the normal worker exit path (robust list,
-         * CLEARTID, own-vCPU destroy) against the still-intact old image; the
-         * exec'ing thread waits for that before guest_reset. The main thread is
-         * exempt because it owns process teardown: returning from its run loop
-         * destroys the guest, which is exactly what the exec'ing thread still
-         * needs. This gates re-entry into hv_vcpu_run, so one check per
-         * iteration is enough; every path back here is non-blocking for a
-         * stopping worker, whose waits now return EINTR.
+         * loop takes it through the normal exit path against the still-intact
+         * old image. The leader owns process teardown and is exempt.
          */
-        if (!is_main && thread_exec_stop_requested()) {
+        if (!thread_current_is_leader() && thread_exec_stop_requested()) {
             exit_code = 0;
+            leave = PROC_LEAVE_EXIT;
             break;
         }
 
-        /* A non-leader execve is handed here: the leader owns process teardown,
-         * so it is the only thread that can survive one. Running it at the top
-         * of the loop puts the rebuilt EL0 state in place before the vCPU is
-         * resumed, whether this thread was preempted in guest code or is
-         * returning from its own syscall (sys_execve writes no frame-drop
-         * marker either way: its MMU-off _start re-entry never pops a frame).
-         */
-        if (thread_current_is_leader() && thread_leader_work_pending())
-            exec_run_handoff(vcpu, g, verbose);
-
         if (hooks && hooks->tick) {
             int tick_ret = hooks->tick(g, hooks->opaque);
-            if (tick_ret != 0) {
+            if (tick_ret == VCPU_TICK_RESCHED) {
+                leave = PROC_LEAVE_RESCHED;
+                break;
+            }
+            if (tick_ret == VCPU_TICK_PARK) {
+                leave = PROC_LEAVE_PARK;
+                break;
+            }
+            if (tick_ret == VCPU_TICK_EXIT_ZERO) {
+                exit_code = 0;
+                leave = PROC_LEAVE_EXIT;
+                break;
+            }
+            if (tick_ret != VCPU_TICK_CONTINUE) {
                 exit_code = tick_ret;
+                leave = PROC_LEAVE_EXIT;
                 break;
             }
             if (proc_exit_group_requested()) {
                 exit_code = proc_exit_group_code();
+                leave = PROC_LEAVE_EXIT;
+                break;
+            }
+            if (!thread_current_is_leader() && thread_exec_stop_requested()) {
+                exit_code = 0;
+                leave = PROC_LEAVE_EXIT;
                 break;
             }
         }
@@ -4782,9 +5892,6 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
         }
         iter++;
 
-        /* Main: publish progress to the watchdog. Odd while inside the guest,
-         * even outside; see g_vcpu_progress.
-         */
         if (is_main)
             atomic_store_explicit(&g_vcpu_progress, iter * 2 + 1,
                                   memory_order_relaxed);
@@ -4795,7 +5902,9 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
          */
         signal_forget_sigreturn_x8();
 
+        vcpu_pool_account_phase(true);
         HV_CHECK_CTX(hv_vcpu_run(vcpu), vcpu, g);
+        vcpu_pool_account_phase(false);
 
         if (is_main)
             atomic_store_explicit(&g_vcpu_progress, iter * 2 + 2,
@@ -4803,13 +5912,20 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
 
         drain_external_guest_signal();
 
-        /* Re-check exit_group after waking from hv_vcpu_run */
         if (proc_exit_group_requested()) {
             exit_code = proc_exit_group_code();
+            leave = PROC_LEAVE_EXIT;
             break;
         }
+        if (is_main && current_thread) {
+            uint64_t now = sched_now_ns();
+            if (vexit->reason == HV_EXIT_REASON_EXCEPTION)
+                current_thread->watchdog_progress_ns = now;
+            else if (now - current_thread->watchdog_progress_ns >=
+                     (uint64_t) timeout_sec * 2000000000ULL)
+                atomic_store_explicit(&g_timed_out, 1, memory_order_release);
+        }
 
-        /* Main: check for alarm timeout */
         if (is_main &&
             atomic_load_explicit(&g_timed_out, memory_order_acquire)) {
             log_error("%s: vCPU execution timed out after %ds", prefix,
@@ -4834,23 +5950,44 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
 
             crash_report(vcpu, g, CRASH_TIMEOUT, NULL);
             exit_code = 124;
+            leave = PROC_LEAVE_EXIT;
             break;
         }
 
         if (vexit->reason == HV_EXIT_REASON_EXCEPTION) {
-            if (vcpu_handle_exception_exit(g, vcpu, vexit, verbose, prefix,
-                                           &exit_code) == VCPU_STOP) {
+            vcpu_action_t action = vcpu_handle_exception_exit(
+                g, vcpu, vexit, verbose, prefix, &exit_code);
+            if (action == VCPU_STOP) {
+                leave = PROC_LEAVE_EXIT;
+                break;
+            }
+            if (action == VCPU_PARK) {
+                leave = PROC_LEAVE_PARK;
+                break;
+            }
+            if (action == VCPU_RESCHED) {
+                leave = PROC_LEAVE_RESCHED;
                 break;
             }
         } else if (vexit->reason == HV_EXIT_REASON_CANCELED) {
-            if (vcpu_handle_canceled_exit(g, vcpu, is_main, verbose, prefix,
-                                          &exit_code) == VCPU_STOP) {
+            vcpu_action_t action = vcpu_handle_canceled_exit(
+                g, vcpu, is_main, verbose, prefix, &exit_code);
+            if (action == VCPU_STOP) {
+                leave = PROC_LEAVE_EXIT;
+                break;
+            }
+            if (action == VCPU_PARK) {
+                leave = PROC_LEAVE_PARK;
+                break;
+            }
+            if (action == VCPU_RESCHED) {
+                leave = PROC_LEAVE_RESCHED;
                 break;
             }
         } else if (vexit->reason == HV_EXIT_REASON_VTIMER_ACTIVATED) {
-            /* Virtual timer fired. The emulator emulates timers host-side, so
-             * mask the vtimer and continue. Without this, a pending vtimer
-             * would cause an "unexpected exit reason" crash.
+            /* The emulator emulates timers host-side, so mask the vtimer and
+             * continue. Without this, a pending vtimer would cause an
+             * "unexpected exit reason" crash.
              */
             hv_vcpu_set_vtimer_mask(vcpu, true);
         } else {
@@ -4862,11 +5999,12 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
                 crash_report(vcpu, g, CRASH_UNEXPECTED_EXIT, detail);
             }
             exit_code = 128;
-            running = false;
+            leave = PROC_LEAVE_EXIT;
+            break;
         }
     }
 
-    /* Clean up the timeout the run loop armed. Clearing it_interval as well as
+    /* Clean up the watchdog the run loop armed. Clearing it_interval as well as
      * it_value is what makes the disarm final: the timer repeats on its own
      * interval, so zeroing only the pending shot would leave it ticking for the
      * life of the process with nothing watching it.
@@ -4876,11 +6014,43 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
         setitimer(ITIMER_REAL, &off, NULL);
     }
 
-    if (wait_status_out) {
-        int signal_status = signal_take_termination_wait_status();
-        *wait_status_out =
-            signal_status != 0 ? signal_status : (exit_code & 0xff) << 8;
-    }
+    if (exit_code_out)
+        *exit_code_out = exit_code;
+    if (wait_status_out)
+        *wait_status_out = signal_linux_wait_status_for_exit(exit_code);
+    return leave;
+}
+
+proc_leave_t proc_run_task(hv_vcpu_t vcpu,
+                           hv_vcpu_exit_t *vexit,
+                           guest_t *g,
+                           bool verbose,
+                           int timeout_sec,
+                           const vcpu_run_hooks_t *hooks,
+                           int *exit_code,
+                           int *wait_status_out)
+{
+    return run_loop_core(vcpu, vexit, g, verbose, timeout_sec, hooks, exit_code,
+                         wait_status_out);
+}
+
+/* Compatibility wrapper for embedders and the host signature test. It stops
+ * when the guest stops; a park or reschedule with no scheduler behind it is
+ * reported as exit code 0 rather than re-entering a guest nobody can resume.
+ */
+int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
+                             hv_vcpu_exit_t *vexit,
+                             guest_t *g,
+                             bool verbose,
+                             int timeout_sec,
+                             int *wait_status_out,
+                             const vcpu_run_hooks_t *hooks)
+{
+    int exit_code = 0;
+    proc_leave_t leave = run_loop_core(vcpu, vexit, g, verbose, timeout_sec,
+                                       hooks, &exit_code, wait_status_out);
+    if (leave != PROC_LEAVE_EXIT)
+        return 0;
     return exit_code;
 }
 

@@ -202,6 +202,15 @@ int64_t net_wait_or_interrupted(const fd_block_state_t *st,
                                 short events,
                                 int msg_flags);
 
+/* Preserve transferred bytes while a readiness wait parks. SYSCALL_PARKED
+ * propagates to dispatch; interruption returns the partial count at the caller.
+ */
+int64_t net_wait_progress(const fd_block_state_t *st,
+                          int host_fd,
+                          short events,
+                          int msg_flags,
+                          uint64_t total);
+
 /* Readiness gate for a zero-payload recv/recvfrom/recvmsg: Linux clamps the
  * receive low-water target to one byte, so an empty socket blocks (EINTR on
  * guest signal) or fails EAGAIN when nonblocking, rather than returning 0 like

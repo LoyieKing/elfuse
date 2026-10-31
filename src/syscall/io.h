@@ -136,7 +136,36 @@ int64_t io_xfer(int fd,
                 struct iovec *iov,
                 int iovcnt,
                 ssize_t *out,
-                const fd_block_state_t *pinned);
+                const fd_block_state_t *pinned,
+                bool park_ok,
+                const uint64_t *continuation);
+
+/* park_ok is false only for a transfer that must not unmount. When it is true
+ * and continuation is NULL, the caller owns the wait decision and gets
+ * IO_XFER_NEED_WAIT back with whatever the attempt moved in *out, so it can
+ * record the progress before arming the park itself. Splice uses that form: its
+ * pending chunk and pinned ends live in the task's stream continuation, which
+ * no re-dispatched SVC could rebuild. continuation, when non-NULL, is the bytes
+ * an earlier attempt of the same SVC already moved, taken with io_cont_take()
+ * semantics from io_continue_bytes; io_xfer records it and parks on its own.
+ */
+
+/* io_xfer returns this when a caller that owns the wait decision must park the
+ * task itself. A readiness probe runs before it is returned, so a descriptor
+ * that is already usable is transferred in the same call (the re-dispatch would
+ * otherwise reach this decision again without ever moving a byte); the bytes
+ * moved by the attempt are in *out for the caller to record. It is returned
+ * only by callers passing park_ok with a NULL continuation.
+ */
+#define IO_XFER_NEED_WAIT (-0x10002)
+
+/* Release every wait the task owns at exit: retract its descriptor pump
+ * registration (closing the dup'ed descriptors and dropping the pump's task
+ * reference), free a stream-copy continuation, and clear the partial-IO
+ * continuation. Safe after the task completed a park and safe under
+ * thread_lock; it never waits for a timer.
+ */
+void io_task_cancel_wait(struct thread_entry *t);
 
 /* pinned is required, not optional: it is dereferenced unconditionally. Making
  * it nullable would put this function one step from the failure that already
@@ -250,3 +279,56 @@ int64_t sys_vmsplice(guest_t *g,
                      unsigned long nr_segs,
                      unsigned int flags);
 int64_t sys_tee(int fd_in, int fd_out, size_t len, unsigned int flags);
+
+struct thread_entry;
+
+/* One host descriptor a parked wait must watch. events uses the guest's poll(2)
+ * bits, as the host wrappers here already pass them.
+ */
+typedef struct io_wait_source {
+    int fd;
+    short events;
+} io_wait_source_t;
+
+/* Bound on one parked wait's descriptor set, matching the poll/select array
+ * bound so a park never truncates a set the caller already built.
+ */
+#define IO_WAIT_MAX_SOURCES 256
+
+/* Async park for descriptor waits. Completers remount with park_reissue so the
+ * SVC is dispatched again; a guest deadline or a fallback recheck does the
+ * same, and a signal completes the park in place (see io_park_on_interrupt).
+ * Every park carries a generation: a registration and each asynchronous
+ * completion remember the generation they were armed for, so a wakeup that lost
+ * a race to a signal, or to a later park on the same task, only releases its
+ * reference and never completes the next wait.
+ */
+
+/* Arm PARK_KIND_IO over @a sources and return SYSCALL_PARKED. The watcher owns
+ * dup'ed descriptors, so the caller may close its references after this
+ * returns. timeout_ms matches io_wait_fd_timed_or_interrupted (<0 infinite, 0
+ * already expired): it is the whole guest timeout, not a slice.
+ *
+ * Returns 1 if timeout_ms==0, -EINTR, a negative Linux errno, or
+ * SYSCALL_PARKED. sources may be NULL or nsrc 0 for a wait whose wakeups arrive
+ * through the caller's own park callbacks.
+ */
+int64_t io_park_unmount_multi(const io_wait_source_t *sources,
+                              uint32_t nsrc,
+                              int timeout_ms);
+int64_t io_park_unmount(int host_fd, short events, int timeout_ms);
+void io_park_on_deadline(struct thread_entry *t);
+void io_park_on_interrupt(struct thread_entry *t);
+
+/* True when the current task can park instead of pinning a worker. The
+ * execution backend owns whether and how the task unmounts.
+ */
+bool io_park_can_unmount(void);
+
+/* io_continue_bytes carries a parked read/write continuation: bits below the
+ * flag are bytes already transferred, so the re-dispatched SVC resumes after
+ * them instead of moving the same guest bytes twice.
+ */
+#define IO_CONT_VALID (UINT64_C(1) << 63)
+
+uint64_t io_continue_take(void);

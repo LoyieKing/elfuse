@@ -343,6 +343,12 @@ uint64_t build_linux_stack(guest_t *g,
     AUX(AT_RANDOM, random_ptr);
     AUX(AT_EXECFN, execfn_ptr);
     AUX(AT_PLATFORM, platform_ptr);
+
+    /* rseq: advertise node_id+mm_cid (feature size 28) and 32-byte align so
+     * kselftests see rseq_node_id_available() / rseq_mm_cid_available().
+     */
+    AUX(AT_RSEQ_FEATURE_SIZE, 28);
+    AUX(AT_RSEQ_ALIGN, 32);
     AUX(AT_NULL, 0);
 #undef AUX
 

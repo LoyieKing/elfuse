@@ -13,10 +13,13 @@
 
 #include "debug/gdbstub-reg.h"
 #include "debug/gdbstub-rsp.h"
+#include "runtime/sched/vcpu_pool.h"
 
 void gdb_snap_vcpu(thread_entry_t *t)
 {
-    hv_vcpu_t vcpu = t->vcpu;
+    hv_vcpu_t vcpu;
+    if (!vcpu_pool_current_vcpu(&vcpu))
+        return;
     uint8_t *s = t->gdb_reg_snapshot;
     memset(s, 0, GDBREGSNAPSIZE);
 
@@ -55,7 +58,9 @@ void gdb_snap_vcpu(thread_entry_t *t)
 
 void gdb_restore_vcpu(thread_entry_t *t, int tde_stop)
 {
-    hv_vcpu_t vcpu = t->vcpu;
+    hv_vcpu_t vcpu;
+    if (!vcpu_pool_current_vcpu(&vcpu))
+        return;
     const uint8_t *s = t->gdb_reg_snapshot;
 
     for (int i = 0; i < 31; i++) {

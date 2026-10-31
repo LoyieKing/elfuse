@@ -46,6 +46,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -66,10 +67,158 @@
 #include "proved/fuse.h"
 #include "syscall/fuse.h"
 #include "syscall/internal.h"
+#include "syscall/io.h"
+#include "syscall/fs.h"
 #include "syscall/path.h"
 #include "runtime/thread.h" /* thread_stop_requested */
 #include "syscall/proc.h"
 #include "syscall/signal.h"
+#include "runtime/sched/exec.h"
+
+enum fuse_service_op {
+    FUSE_SERVICE_STAT,
+    FUSE_SERVICE_FSTAT,
+    FUSE_SERVICE_OPEN,
+    FUSE_SERVICE_MATERIALIZE,
+    FUSE_SERVICE_MATERIALIZE_FD,
+    FUSE_SERVICE_INIT,
+    FUSE_SERVICE_READ,
+    FUSE_SERVICE_PREAD,
+    FUSE_SERVICE_READDIR,
+};
+
+typedef struct fuse_service {
+    thread_entry_t *task;
+    uint64_t generation;
+    uint64_t sequence;
+    enum fuse_service_op op;
+    pthread_t worker;
+    _Atomic bool cancelled;
+    int fd, flags, mode;
+    int64_t result;
+    char path[LINUX_PATH_MAX];
+    char output[LINUX_PATH_MAX];
+    struct stat stat;
+    void *session;
+    void *snapshot;
+    uint8_t *bytes;
+    uint64_t count, offset;
+    uint64_t cpu_ns;
+} fuse_service_t;
+
+static _Thread_local fuse_service_t *fuse_service_current;
+
+static void *fuse_service_run(void *arg);
+static void fuse_service_release_read(fuse_service_t *job);
+static int64_t fuse_service_read(guest_t *g,
+                                 int fd,
+                                 uint64_t buf_gva,
+                                 uint64_t count,
+                                 uint64_t offset,
+                                 enum fuse_service_op op);
+
+typedef struct {
+    uint64_t count, offset;
+} fuse_service_read_args_t;
+
+static fuse_service_t *fuse_service_take(enum fuse_service_op op)
+{
+    thread_entry_t *t = current_thread;
+    fuse_service_t *job = t ? t->fuse_service : NULL;
+    if (!job || job->op != op)
+        return NULL;
+    (void) pthread_join(job->worker, NULL);
+    sched_account_service_ns(t, job->cpu_ns);
+    pthread_mutex_t *lock = thread_get_lock();
+    pthread_mutex_lock(lock);
+    t->fuse_service = NULL;
+    pthread_mutex_unlock(lock);
+    thread_release(job->task);
+    return job;
+}
+
+static int64_t fuse_service_start(enum fuse_service_op op,
+                                  const char *path,
+                                  int fd,
+                                  int flags,
+                                  int mode,
+                                  void *session)
+{
+    thread_entry_t *t = current_thread;
+    fuse_service_t *job = calloc(1, sizeof(*job));
+    if (!job)
+        return -LINUX_ENOMEM;
+    job->task = thread_acquire_tid(thread_tid(t));
+    if (!job->task) {
+        free(job);
+        return -LINUX_ESRCH;
+    }
+    job->generation = t->generation;
+    job->op = op;
+    job->fd = fd;
+    job->flags = flags;
+    job->mode = mode;
+    job->session = session;
+    if (op == FUSE_SERVICE_READ || op == FUSE_SERVICE_PREAD ||
+        op == FUSE_SERVICE_READDIR) {
+        const fuse_service_read_args_t *args = session;
+        job->count = args->count;
+        job->offset = args->offset;
+        job->session = NULL;
+    }
+    if (path)
+        str_copy_trunc(job->path, path, sizeof(job->path));
+    exec_park_kind_store(t, PARK_KIND_SERVICE);
+    exec_park_result_pending_store(t, false);
+    exec_park_reissue_store(t, false);
+    exec_park_deadline_ns_store(t, 0);
+    job->sequence = sched_park_seq_next(t);
+    pthread_mutex_t *lock = thread_get_lock();
+    pthread_mutex_lock(lock);
+    if (sched_domain_frozen()) {
+        pthread_mutex_unlock(lock);
+        thread_release(job->task);
+        free(job);
+        return -LINUX_EAGAIN;
+    }
+    t->fuse_service = job;
+    pthread_mutex_unlock(lock);
+    exec_park_active_store(t, true);
+    int err = pthread_create(&job->worker, NULL, fuse_service_run, job);
+    if (err) {
+        exec_park_active_store(t, false);
+        exec_park_kind_store(t, PARK_KIND_NONE);
+        pthread_mutex_lock(lock);
+        t->fuse_service = NULL;
+        pthread_mutex_unlock(lock);
+        thread_release(job->task);
+        free(job);
+        return -LINUX_EAGAIN;
+    }
+    return SYSCALL_PARKED;
+}
+
+void fuse_task_cancel_wait(thread_entry_t *t)
+{
+    fuse_service_t *job = t ? t->fuse_service : NULL;
+    if (!job)
+        return;
+    atomic_store_explicit(&job->cancelled, true, memory_order_release);
+    (void) pthread_join(job->worker, NULL);
+    pthread_mutex_t *lock = thread_get_lock();
+    pthread_mutex_lock(lock);
+    t->fuse_service = NULL;
+    pthread_mutex_unlock(lock);
+    if (job->op == FUSE_SERVICE_OPEN && job->result >= 0)
+        (void) sys_close((int) job->result);
+    if ((job->op == FUSE_SERVICE_MATERIALIZE ||
+         job->op == FUSE_SERVICE_MATERIALIZE_FD) &&
+        job->result == 0)
+        unlink(job->output);
+    fuse_service_release_read(job);
+    thread_release(job->task);
+    free(job);
+}
 
 #define FUSE_KERNEL_VERSION 7
 #define FUSE_KERNEL_MINOR_VERSION 45
@@ -969,8 +1118,15 @@ static void fuse_free_request_locked(fuse_request_t *req)
 
 static int fuse_wait_for_init_locked(fuse_session_t *session)
 {
-    while (!session->closed && !session->daemon_dead && !session->init_done)
-        pthread_cond_wait(&session->init_cond, &session->lock);
+    while (!session->closed && !session->daemon_dead && !session->init_done) {
+        if (fuse_service_current &&
+            atomic_load_explicit(&fuse_service_current->cancelled,
+                                 memory_order_acquire))
+            return -LINUX_EINTR;
+        struct timespec deadline;
+        timespec_deadline_in_ms(&deadline, 20);
+        pthread_cond_timedwait(&session->init_cond, &session->lock, &deadline);
+    }
     if (session->closed || session->daemon_dead)
         return -LINUX_ENOTCONN;
     return 0;
@@ -1049,7 +1205,15 @@ static int fuse_request_locked(fuse_session_t *session,
              * FUSE_INTERRUPT to the daemon for work the guest still wants.
              */
             bool restart = false;
-            if (signal_pending_interruption(&restart) && !restart) {
+            fuse_service_t *job = fuse_service_current;
+            bool cancelled =
+                job &&
+                (atomic_load_explicit(&job->cancelled, memory_order_acquire) ||
+                 thread_stop_requested_for(job->task));
+            bool interrupted =
+                job ? signal_pending_interruption_for(job->task, &restart)
+                    : signal_pending_interruption(&restart);
+            if (cancelled || (interrupted && !restart)) {
                 if (!req->interrupt_sent) {
                     fuse_interrupt_in_t in = {.unique = req->unique};
                     (void) fuse_queue_noreply_locked(session, FUSE_INTERRUPT, 0,
@@ -1063,7 +1227,10 @@ static int fuse_request_locked(fuse_session_t *session,
                  * fresh unique: a duplicate write or unlink rather than a
                  * resumed wait.
                  */
-                syscall_restart_forbid();
+                if (job)
+                    exec_restart_forbid_set(job->task, true);
+                else
+                    syscall_restart_forbid();
                 return -LINUX_EINTR;
             }
         }
@@ -1371,8 +1538,12 @@ static int fuse_release_common_locked(fuse_session_t *session,
         .fh = fh,
         .flags = (uint32_t) linux_flags,
     };
-    int rc = fuse_request_locked(session, dir ? FUSE_RELEASEDIR : FUSE_RELEASE,
-                                 nodeid, &in, sizeof(in), NULL, NULL);
+    fuse_request_t *request = NULL;
+    int rc =
+        fuse_queue_request_locked(session, dir ? FUSE_RELEASEDIR : FUSE_RELEASE,
+                                  nodeid, &in, sizeof(in), false, &request);
+    if (rc == 0)
+        request->detached = true;
     int forget_rc = fuse_node_ref_drop_locked(session, nodeid, 1);
     if (rc < 0)
         return rc;
@@ -1647,17 +1818,56 @@ int64_t sys_mount(guest_t *g,
                   unsigned long flags,
                   uint64_t data_gva)
 {
-    (void) source_gva;
-    (void) flags;
-
+    if (current_thread && !fuse_service_current) {
+        fuse_service_t *job = fuse_service_take(FUSE_SERVICE_INIT);
+        if (job) {
+            int64_t result = job->result;
+            if (result < 0) {
+                pthread_mutex_lock(&fuse_lock);
+                for (int i = 0; i < FUSE_MAX_MOUNTS; i++) {
+                    if (fuse_mounts[i].used &&
+                        fuse_mounts[i].session == job->session)
+                        fuse_uninstall_mount_locked(&fuse_mounts[i]);
+                }
+                pthread_mutex_unlock(&fuse_lock);
+            }
+            free(job);
+            return result;
+        }
+    }
     char target[LINUX_PATH_MAX];
     char source[256];
     char fstype[64];
     char data[LINUX_PATH_MAX];
+
+    /* Propagation / remount with a NULL fstype: SoftNS has no real mount
+     * namespaces, so treat propagation flags (with optional MS_REC /
+     * MS_REMOUNT) as a successful no-op. Unblocks pidfd fdinfo kselftests that
+     * remount "/" private before remounting /proc.
+     */
+    const unsigned long prop_mask = LINUX_MS_UNBINDABLE | LINUX_MS_PRIVATE |
+                                    LINUX_MS_SLAVE | LINUX_MS_SHARED;
+    if (fstype_gva == 0 && (flags & prop_mask) != 0 &&
+        (flags &
+         ~(prop_mask | LINUX_MS_REC | LINUX_MS_REMOUNT | LINUX_MS_SILENT)) == 0)
+        return 0;
+
     if (target_gva == 0 ||
-        guest_read_str(g, target_gva, target, sizeof(target)) < 0 ||
-        guest_read_str(g, fstype_gva, fstype, sizeof(fstype)) < 0)
+        guest_read_str(g, target_gva, target, sizeof(target)) < 0)
         return -LINUX_EFAULT;
+    if (fstype_gva == 0)
+        fstype[0] = '\0';
+    else if (guest_read_str(g, fstype_gva, fstype, sizeof(fstype)) < 0)
+        return -LINUX_EFAULT;
+
+    /* Soft /proc: already served by procemu. Accept a fresh "proc" mount as a
+     * no-op so NEWPID children that umount+remount /proc keep working.
+     */
+    if (!strcmp(fstype, "proc")) {
+        if (strcmp(target, "/proc") == 0 || strcmp(target, "/proc/") == 0)
+            return 0;
+        return -LINUX_EINVAL;
+    }
     if (source_gva) {
         if (guest_read_str(g, source_gva, source, sizeof(source)) < 0)
             return -LINUX_EFAULT;
@@ -1740,6 +1950,8 @@ int64_t sys_mount(guest_t *g,
     if (!mount)
         return -LINUX_ENOMEM;
 
+    if (current_thread && !fuse_service_current)
+        return fuse_service_start(FUSE_SERVICE_INIT, NULL, 0, 0, 0, session);
     pthread_mutex_lock(&session->lock);
     int init_rc = fuse_send_init_locked(session);
     pthread_mutex_unlock(&session->lock);
@@ -1860,6 +2072,17 @@ static int fuse_path_lookup(const char *path,
  */
 int fuse_stat_path(const char *path, struct stat *st, int at_flags)
 {
+    if (current_thread && !fuse_service_current) {
+        fuse_service_t *job = fuse_service_take(FUSE_SERVICE_STAT);
+        if (!job)
+            return (int) fuse_service_start(FUSE_SERVICE_STAT, path, 0,
+                                            at_flags, 0, NULL);
+        int result = (int) job->result;
+        if (result == 0)
+            *st = job->stat;
+        free(job);
+        return result;
+    }
     fuse_attr_t attr;
     uint64_t nodeid = 0;
     int rc = fuse_path_lookup(path, false, NULL, NULL, &nodeid, &attr);
@@ -1986,6 +2209,20 @@ static bool fuse_exec_denied(int mount_id, const struct stat *st)
 
 int fuse_materialize_path(const char *path, char *out_path, size_t outsz)
 {
+    if (current_thread && !fuse_service_current) {
+        fuse_service_t *job = fuse_service_take(FUSE_SERVICE_MATERIALIZE);
+        if (!job)
+            return (int) fuse_service_start(FUSE_SERVICE_MATERIALIZE, path, 0,
+                                            0, 0, NULL);
+        int result = (int) job->result;
+        if (result == 0 &&
+            str_copy_trunc(out_path, job->output, outsz) >= outsz) {
+            unlink(job->output);
+            result = -LINUX_ENAMETOOLONG;
+        }
+        free(job);
+        return result;
+    }
     fuse_session_t *session = NULL;
     int mount_id = 0;
     uint64_t nodeid = 0;
@@ -2042,6 +2279,18 @@ int fuse_fstat_fd(int fd, struct stat *st)
     fd_entry_t snap;
     if (fd_snapshot(fd, &snap) && snap.type == FD_FUSE_DEV)
         return fuse_proc_stat(st);
+    if (current_thread && !fuse_service_current &&
+        (fuse_is_file_fd(fd) || fuse_is_dir_fd(fd))) {
+        fuse_service_t *job = fuse_service_take(FUSE_SERVICE_FSTAT);
+        if (!job)
+            return (int) fuse_service_start(FUSE_SERVICE_FSTAT, NULL, fd, 0, 0,
+                                            NULL);
+        int result = (int) job->result;
+        if (result == 0)
+            *st = job->stat;
+        free(job);
+        return result;
+    }
 
     pthread_mutex_lock(&fuse_lock);
     fuse_file_t *file = fuse_file_by_fd_locked(fd);
@@ -2079,6 +2328,16 @@ int fuse_fstat_fd(int fd, struct stat *st)
 
 int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
 {
+    if (current_thread && !fuse_service_current &&
+        fuse_path_matches_mount(path)) {
+        fuse_service_t *job = fuse_service_take(FUSE_SERVICE_OPEN);
+        if (!job)
+            return fuse_service_start(FUSE_SERVICE_OPEN, path, 0, linux_flags,
+                                      mode, NULL);
+        int64_t result = job->result;
+        free(job);
+        return result;
+    }
     (void) g;
     (void) mode;
     if (!path || path[0] != '/')
@@ -2269,8 +2528,16 @@ static int fuse_file_acquire(int guest_fd,
         if (serialize && file->io_in_progress) {
             /* Bump file ref so the slot (and io_cond) survive the wait. */
             fuse_file_get_locked(file);
-            pthread_cond_wait(&file->io_cond, &fuse_lock);
+            struct timespec deadline;
+            timespec_deadline_in_ms(&deadline, 20);
+            pthread_cond_timedwait(&file->io_cond, &fuse_lock, &deadline);
             fuse_file_put_locked(file);
+            if (fuse_service_current &&
+                atomic_load_explicit(&fuse_service_current->cancelled,
+                                     memory_order_acquire)) {
+                pthread_mutex_unlock(&fuse_lock);
+                return -LINUX_EINTR;
+            }
             /* Re-look-up: the slot may have been closed or replaced. */
             continue;
         }
@@ -2308,8 +2575,61 @@ static void fuse_file_release(fuse_file_snap_t *snap)
     pthread_mutex_unlock(&fuse_lock);
 }
 
+static void fuse_service_release_read(fuse_service_t *job)
+{
+    if (job->snapshot) {
+        fuse_file_release(job->snapshot);
+        free(job->snapshot);
+        job->snapshot = NULL;
+    }
+    free(job->bytes);
+    job->bytes = NULL;
+}
+
+static int64_t fuse_service_read(guest_t *g,
+                                 int fd,
+                                 uint64_t buf_gva,
+                                 uint64_t count,
+                                 uint64_t offset,
+                                 enum fuse_service_op op)
+{
+    fuse_service_t *job = fuse_service_take(op);
+    if (!job) {
+        fuse_service_read_args_t args = {.count = count, .offset = offset};
+        return fuse_service_start(op, NULL, fd, 0, 0, &args);
+    }
+    int64_t result = job->result;
+    if (result > 0) {
+        if (guest_write(g, buf_gva, job->bytes, (size_t) result) < 0)
+            result = -LINUX_EFAULT;
+        else if (op == FUSE_SERVICE_READ) {
+            fuse_file_snap_t *snap = job->snapshot;
+            pthread_mutex_lock(&fuse_lock);
+            snap->file->offset = job->offset + (uint64_t) result;
+            pthread_mutex_unlock(&fuse_lock);
+        }
+    }
+    fuse_service_release_read(job);
+    free(job);
+    return result;
+}
+
 int fuse_materialize_fd(int fd, char *out_path, size_t outsz)
 {
+    if (current_thread && !fuse_service_current) {
+        fuse_service_t *job = fuse_service_take(FUSE_SERVICE_MATERIALIZE_FD);
+        if (!job)
+            return (int) fuse_service_start(FUSE_SERVICE_MATERIALIZE_FD, NULL,
+                                            fd, 0, 0, NULL);
+        int result = (int) job->result;
+        if (result == 0 &&
+            str_copy_trunc(out_path, job->output, outsz) >= outsz) {
+            unlink(job->output);
+            result = -LINUX_ENAMETOOLONG;
+        }
+        free(job);
+        return result;
+    }
     fuse_file_snap_t snap;
     int rc = fuse_file_acquire(fd, false, false, &snap);
     if (rc < 0)
@@ -2381,6 +2701,10 @@ static int64_t fuse_read_common(guest_t *g,
      */
     if (reply_len > size)
         reply_len = size;
+    if (fuse_service_current) {
+        fuse_service_current->bytes = reply;
+        return (int64_t) reply_len;
+    }
 
     if (guest_write(g, buf_gva, reply, reply_len) < 0) {
         free(reply);
@@ -2400,6 +2724,8 @@ static int64_t fuse_read_common(guest_t *g,
 
 int64_t fuse_read_fd(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
 {
+    if (current_thread && !fuse_service_current)
+        return fuse_service_read(g, fd, buf_gva, count, 0, FUSE_SERVICE_READ);
     fuse_file_snap_t snap;
     int err = fuse_file_acquire(fd, false, true, &snap);
     if (err < 0)
@@ -2419,6 +2745,9 @@ int64_t fuse_pread_fd(guest_t *g,
 {
     if (offset < 0)
         return -LINUX_EINVAL;
+    if (current_thread && !fuse_service_current)
+        return fuse_service_read(g, fd, buf_gva, count, (uint64_t) offset,
+                                 FUSE_SERVICE_PREAD);
     fuse_file_snap_t snap;
     int err = fuse_file_acquire(fd, false, false, &snap);
     if (err < 0)
@@ -2431,30 +2760,23 @@ int64_t fuse_pread_fd(guest_t *g,
 
 int64_t fuse_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
 {
-    fuse_file_snap_t snap;
-    int err = fuse_file_acquire(fd, true, true, &snap);
-    if (err < 0)
-        return err;
-
-    uint64_t dir_off = snap.file->offset;
-
-    int64_t raw =
-        fuse_read_common(g, fd, &snap, buf_gva, count, dir_off, false);
+    fuse_service_t *job = fuse_service_take(FUSE_SERVICE_READDIR);
+    if (!job) {
+        fuse_service_read_args_t args = {.count = count, .offset = 0};
+        return fuse_service_start(FUSE_SERVICE_READDIR, NULL, fd, 0, 0, &args);
+    }
+    int64_t raw = job->result;
     if (raw <= 0) {
-        fuse_file_release(&snap);
+        fuse_service_release_read(job);
+        free(job);
         return raw;
     }
-
-    uint8_t *tmp = malloc((size_t) raw);
-    if (!tmp) {
-        fuse_file_release(&snap);
-        return -LINUX_ENOMEM;
-    }
-    if (guest_read(g, buf_gva, tmp, (size_t) raw) < 0) {
-        free(tmp);
-        fuse_file_release(&snap);
-        return -LINUX_EFAULT;
-    }
+    fuse_file_snap_t snap = *(fuse_file_snap_t *) job->snapshot;
+    uint8_t *tmp = job->bytes;
+    free(job->snapshot);
+    job->snapshot = NULL;
+    job->bytes = NULL;
+    free(job);
 
     size_t src = 0;
     size_t dst = 0;
@@ -2579,25 +2901,16 @@ int64_t fuse_dev_read(int guest_fd,
             return -LINUX_EAGAIN;
         }
 
-        /* An untimed cond_wait has no re-check point: a FUSE daemon thread
-         * parked here with no requests queued is invisible to
-         * thread_join_workers' poll cap and touches guest memory (the reply
-         * frame write below) on an eventual delayed wake, well after
-         * guest_destroy may have unmapped it. Poll in bounded quanta and bail
-         * out once the thread is told to leave the guest, which is exit_group
-         * or an execve tearing this thread down.
-         */
-        if (thread_stop_requested()) {
-            pthread_mutex_unlock(&session->lock);
+        pthread_mutex_unlock(&session->lock);
+        int64_t waited = io_wait_fd_or_interrupted(notify_ref.fd, POLLIN);
+        if (waited < 0) {
             pthread_mutex_lock(&fuse_lock);
             fuse_session_put_locked(session);
             pthread_mutex_unlock(&fuse_lock);
             host_fd_ref_close(&notify_ref);
-            return -LINUX_EINTR;
+            return waited;
         }
-        struct timespec ts;
-        timespec_deadline_in_ms(&ts, 200);
-        pthread_cond_timedwait(&session->queue_cond, &session->lock, &ts);
+        pthread_mutex_lock(&session->lock);
     }
     if (session->closed || session->daemon_dead) {
         pthread_mutex_unlock(&session->lock);
@@ -2889,9 +3202,8 @@ int64_t fuse_lseek_fd(int fd, int64_t offset, int whence)
         }
         if (!waiter->io_in_progress)
             break;
-        fuse_file_get_locked(waiter);
-        pthread_cond_wait(&waiter->io_cond, &fuse_lock);
-        fuse_file_put_locked(waiter);
+        pthread_mutex_unlock(&fuse_lock);
+        return io_park_unmount(-1, 0, 1);
     }
     fuse_file_t *file = fuse_file_by_fd_locked(fd);
     if (!file || !file->session) {
@@ -3212,4 +3524,71 @@ int fuse_append_mounts(char *buf, size_t bufsz, size_t *off)
     }
     pthread_mutex_unlock(&fuse_lock);
     return 0;
+}
+
+static void *fuse_service_run(void *arg)
+{
+    fuse_service_t *job = arg;
+    fuse_service_current = job;
+    struct timespec start, end;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &start);
+    switch (job->op) {
+    case FUSE_SERVICE_STAT:
+        job->result = fuse_stat_path(job->path, &job->stat, job->flags);
+        break;
+    case FUSE_SERVICE_FSTAT:
+        job->result = fuse_fstat_fd(job->fd, &job->stat);
+        break;
+    case FUSE_SERVICE_OPEN:
+        job->result = fuse_open_path(NULL, job->path, job->flags, job->mode);
+        break;
+    case FUSE_SERVICE_MATERIALIZE:
+        job->result =
+            fuse_materialize_path(job->path, job->output, sizeof(job->output));
+        break;
+    case FUSE_SERVICE_MATERIALIZE_FD:
+        job->result =
+            fuse_materialize_fd(job->fd, job->output, sizeof(job->output));
+        break;
+    case FUSE_SERVICE_INIT: {
+        fuse_session_t *session = job->session;
+        pthread_mutex_lock(&session->lock);
+        job->result = fuse_send_init_locked(session);
+        pthread_mutex_unlock(&session->lock);
+        break;
+    }
+    case FUSE_SERVICE_READ:
+    case FUSE_SERVICE_PREAD:
+    case FUSE_SERVICE_READDIR: {
+        fuse_file_snap_t *snap = calloc(1, sizeof(*snap));
+        if (!snap) {
+            job->result = -LINUX_ENOMEM;
+            break;
+        }
+        int rc = fuse_file_acquire(job->fd, job->op == FUSE_SERVICE_READDIR,
+                                   job->op != FUSE_SERVICE_PREAD, snap);
+        if (rc < 0) {
+            free(snap);
+            job->result = rc;
+            break;
+        }
+        job->snapshot = snap;
+        if (job->op != FUSE_SERVICE_PREAD)
+            job->offset = snap->file->offset;
+        job->result = fuse_read_common(NULL, job->fd, snap, 0, job->count,
+                                       job->offset, false);
+        break;
+    }
+    }
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &end);
+    uint64_t elapsed = (uint64_t) (end.tv_sec - start.tv_sec) * 1000000000ULL;
+    elapsed += (uint64_t) end.tv_nsec;
+    elapsed -= (uint64_t) start.tv_nsec;
+    job->cpu_ns = elapsed;
+    if (!atomic_load_explicit(&job->cancelled, memory_order_acquire) &&
+        job->task->generation == job->generation)
+        (void) sched_park_try_complete_reissue_seq(job->task, PARK_KIND_SERVICE,
+                                                   job->sequence);
+    fuse_service_current = NULL;
+    return NULL;
 }

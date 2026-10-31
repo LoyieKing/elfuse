@@ -16,11 +16,14 @@
 #include "syscall/linux-wire.h"
 #include "syscall/proc-pidfd.h"
 #include "syscall/signal.h"
+#include "runtime/sched/sched.h"
 
 /* Fork IPC protocol identity. Bump this whenever the header layout or ordered
  * fork payload changes incompatibly.
  */
-#define FORK_IPC_PROTOCOL_MAGIC 0x454C4653U /* "ELFS" */
+#define FORK_IPC_PROTOCOL_MAGIC 0x454C4654U /* "ELFT" */
+
+#define IPC_HDR_SOFT_NEWPID 0x1u
 
 #define IPC_MAGIC_HEADER FORK_IPC_PROTOCOL_MAGIC
 #define IPC_MAGIC_SENTINEL 0x454C4F4BU /* "ELOK" */
@@ -40,8 +43,10 @@ typedef struct {
     uint64_t mmap_rx_next;
     uint64_t mmap_rx_end;
     uint32_t uid, euid, suid, gid, egid, sgid;
-    int32_t nice;
-    uint32_t _pad;
+    sched_task_attrs_t sched_attr;
+    uint8_t cpu_affinity[SCHED_CPUSET_BYTES];
+    /* Bit 0: child is soft CLONE_NEWPID init (see IPC_HDR_SOFT_NEWPID). */
+    uint32_t flags;
     uint64_t absock_namespace_id;
     int64_t sid, pgid;
 
@@ -122,6 +127,13 @@ typedef struct {
      * parent classified it from.
      */
     int32_t foreign_description, nonblock_owned, path_poll_capable;
+
+    /* Cached SO_TYPE for FD_SOCKET (-1 otherwise). Needed so the
+     * SEQPACKET-over-DGRAM ECONNRESET to EOF fold survives fork: without it the
+     * child treats peer-close as ECONNRESET and kselftests that share a
+     * SEQPACKET socketpair with the parent fail teardown.
+     */
+    int32_t sock_type;
     char proc_path[FD_VIRTUAL_PATH_MAX];
 
     /* FD_PIDFD only: the target a pidfd names lives in the parent's registry,
@@ -160,7 +172,8 @@ int fork_ipc_recv_pty_keepalives(int ipc_fd);
 int fork_ipc_send_process_state(int ipc_sock,
                                 const guest_region_t *regions_snapshot,
                                 uint32_t num_guest_regions,
-                                bool regions_tracker_stale_snapshot);
+                                bool regions_tracker_stale_snapshot,
+                                bool clear_sighand);
 int fork_ipc_recv_process_state(int ipc_fd,
                                 guest_t *g,
                                 signal_state_snapshot_t *sig);

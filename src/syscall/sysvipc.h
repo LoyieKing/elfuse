@@ -44,3 +44,18 @@ int64_t sys_msgrcv(guest_t *g,
                    int64_t msgtyp,
                    int msgflg);
 int64_t sys_msgctl(guest_t *g, int msqid, int cmd, uint64_t buf_gva);
+
+/* Drop guest SysV SHM shadows and IPC_RMID host segments we tracked. */
+
+struct thread_entry;
+
+/* Park callbacks for PARK_KIND_IPC. A local mutation reissues the parked probe
+ * immediately; the deadline callback reissues a periodic re-check for a sibling
+ * host process, and a signal completes -EINTR (semop/msgsnd/msgrcv are not
+ * restartable).
+ */
+void sysvipc_park_on_deadline(struct thread_entry *t);
+void sysvipc_park_on_interrupt(struct thread_entry *t);
+/* Task-exit teardown: retire a PARK_KIND_IPC park and its waiter count. */
+void sysvipc_task_cancel_wait(struct thread_entry *t);
+void sysvipc_reset(void);

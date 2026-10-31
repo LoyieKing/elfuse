@@ -26,6 +26,7 @@
 #include "syscall/linux-wire.h"
 #include "syscall/asyncio.h"
 #include "syscall/internal.h"
+#include "syscall/net-sockopt.h"
 #include "syscall/io.h"
 #include "syscall/mem.h"
 #include "syscall/proc.h"
@@ -331,6 +332,12 @@ int fork_ipc_send_fd_table(int ipc_sock)
         fd_entries[num_fds].nonblock_owned = fd_table[i].nonblock_owned;
         fd_entries[num_fds].path_poll_capable = fd_table[i].path_poll_capable;
         fd_entries[num_fds].seals = fd_table[i].seals;
+        {
+            int st = -1;
+            if (t == FD_SOCKET)
+                (void) sock_opt_get(&fd_table[i], SOCK_OPT_TYPE, &st);
+            fd_entries[num_fds].sock_type = st;
+        }
         fd_entries[num_fds].ofd_id = fd_table[i].ofd_id;
         fd_entries[num_fds].fasync_owner_type = fd_table[i].fasync_owner_type;
         fd_entries[num_fds].fasync_owner = fd_table[i].fasync_owner;
@@ -589,6 +596,9 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
             fd_alloc_alias_at(&spec, gfd, fd_entries[i].type, host_fd, cleanup,
                               NULL);
             fd_table[gfd].linux_flags = fd_entries[i].linux_flags;
+            if (fd_entries[i].type == FD_SOCKET && fd_entries[i].sock_type >= 0)
+                net_socket_cache_set_index(gfd, SOCK_OPT_TYPE,
+                                           fd_entries[i].sock_type);
             fd_refresh_urandom_bitmap(gfd);
             memcpy(fd_table[gfd].proc_path, fd_entries[i].proc_path,
                    sizeof(fd_table[gfd].proc_path));
@@ -855,7 +865,8 @@ static int fork_ipc_send_backing_fds(int ipc_sock,
 int fork_ipc_send_process_state(int ipc_sock,
                                 const guest_region_t *regions_snapshot,
                                 uint32_t num_guest_regions,
-                                bool regions_tracker_stale_snapshot)
+                                bool regions_tracker_stale_snapshot,
+                                bool clear_sighand)
 {
     char cwd[LINUX_PATH_MAX] = {0};
     getcwd(cwd, sizeof(cwd));
@@ -922,6 +933,15 @@ int fork_ipc_send_process_state(int ipc_sock,
 
     signal_state_snapshot_t sig;
     signal_get_state(&sig);
+    /* CLONE_CLEAR_SIGHAND: child starts with every handler at SIG_DFL. */
+    if (clear_sighand) {
+        for (int i = 0; i < LINUX_NSIG; i++) {
+            sig.actions[i].sa_handler = LINUX_SIG_DFL;
+            sig.actions[i].sa_flags = 0;
+            sig.actions[i].sa_restorer = 0;
+            sig.actions[i].sa_mask = 0;
+        }
+    }
     if (fork_ipc_write_all(ipc_sock, &sig, sizeof(sig)) < 0)
         return -1;
 

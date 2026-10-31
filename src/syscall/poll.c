@@ -48,6 +48,7 @@
 #include "syscall/time.h" /* linux_timespec_valid */
 #include "syscall/usbdev.h"
 #include "syscall/wakeup-pipe.h"
+#include "syscall/io.h"
 
 /* The proof in proved/fdset.h bounds nfds by FDSET_MAX_FDS and sizes the
  * bitmask buffers below from FDSET_MAX_WORDS. That is only the right bound if
@@ -76,8 +77,8 @@ typedef struct {
 
 /* Longest a host wait may run before its caller re-checks the interrupt
  * conditions. A wait armed with the guest's whole timeout does not watch the
- * wakeup pipe and cannot be woken by thread_wake_all_blocked, so a teardown or
- * an execve handoff would wait out the guest's timeout instead of the slice.
+ * wakeup pipe and cannot be woken by thread_wake_all_blocked, so a teardown
+ * would wait out the guest's timeout instead of the slice.
  */
 #define POLL_WAKE_SLICE_MS 200
 
@@ -89,8 +90,21 @@ static int64_t poll_now_ms(void)
 }
 
 /* Milliseconds left of a finite wait, never negative. deadline_ms is -1 for a
- * wait with no deadline, which reports the full slice every time.
+ * wait with no deadline, which reports the full slice every time. Remaining
+ * guest wait in ms for io_park_unmount (-1 = infinite).
  */
+static int poll_park_remaining_ms(int64_t deadline_ms)
+{
+    if (deadline_ms < 0)
+        return -1;
+    int64_t left = deadline_ms - poll_now_ms();
+    if (left <= 0)
+        return 0;
+    if (left > INT_MAX)
+        return INT_MAX;
+    return (int) left;
+}
+
 static int poll_slice_ms(int64_t deadline_ms)
 {
     if (deadline_ms < 0)
@@ -101,6 +115,37 @@ static int poll_slice_ms(int64_t deadline_ms)
         return 0;
     return remaining < POLL_WAKE_SLICE_MS ? (int) remaining
                                           : POLL_WAKE_SLICE_MS;
+}
+
+/* Drop the sticky absolute deadline once ppoll/pselect/epoll returns a
+ * guest-visible result. park_reissue leaves it set so remounts keep the
+ * original end time (ba97884 quantum remounts would otherwise reset deadline_ms
+ * = now + guest_timeout forever).
+ */
+static void poll_sticky_deadline_clear(void)
+{
+    if (current_thread)
+        current_thread->io_syscall_deadline_ms = 0;
+}
+
+/* Absolute deadline_ms for a finite wait, sticky across park_reissue.
+ * timeout_ms < 0 is infinite (-1); timeout_ms == 0 is not used by callers that
+ * park (they force a non-blocking slice instead).
+ */
+static int64_t poll_sticky_deadline_ms(int timeout_ms)
+{
+    thread_entry_t *self = current_thread;
+    if (timeout_ms < 0) {
+        if (self)
+            self->io_syscall_deadline_ms = 0;
+        return -1;
+    }
+    if (self && self->io_syscall_deadline_ms != 0)
+        return self->io_syscall_deadline_ms;
+    int64_t dl = poll_now_ms() + timeout_ms;
+    if (self)
+        self->io_syscall_deadline_ms = dl;
+    return dl;
 }
 
 
@@ -128,6 +173,51 @@ typedef struct {
     short events;
     short revents;
 } poll_unpollable_t;
+
+/* The descriptor set a parked ppoll/pselect watches. Descriptors host poll()
+ * refused are added from the select-only list; the wakeup pipe is not, because
+ * a signal completes the park through sched_park_on_signal.
+ */
+static int poll_park_sources(const struct pollfd *host_fds,
+                             const bool *need_pollnval,
+                             const poll_unpollable_t *unpollable,
+                             uint32_t nfds,
+                             io_wait_source_t *out)
+{
+    int n = 0;
+    for (uint32_t i = 0; i < nfds && n < IO_WAIT_MAX_SOURCES; i++) {
+        if (need_pollnval[i] || host_fds[i].fd < 0)
+            continue;
+        out[n].fd = host_fds[i].fd;
+        out[n].events = host_fds[i].events;
+        n++;
+    }
+    if (unpollable) {
+        for (uint32_t i = 0; i < nfds && n < IO_WAIT_MAX_SOURCES; i++) {
+            if (unpollable[i].fd < 0)
+                continue;
+            out[n].fd = unpollable[i].fd;
+            out[n].events = unpollable[i].events;
+            n++;
+        }
+    }
+    return n;
+}
+
+static int pselect_park_sources(const pselect_req_t *reqs,
+                                int req_count,
+                                io_wait_source_t *out)
+{
+    int n = 0;
+    for (int i = 0; i < req_count && n < IO_WAIT_MAX_SOURCES; i++) {
+        if (reqs[i].disarmed || reqs[i].host_fd < 0)
+            continue;
+        out[n].fd = reqs[i].host_fd;
+        out[n].events = reqs[i].events;
+        n++;
+    }
+    return n;
+}
 
 /* Evaluate the entries host poll() refused. macOS poll() answers POLLNVAL for
  * any descriptor it will not put on a kqueue: /dev/null, /dev/zero,
@@ -215,9 +305,8 @@ static uint32_t poll_eval_unpollable(poll_unpollable_t *entries, uint32_t n)
  * left its Wayland socket readable and undelivered, and it spun at 100% CPU
  * without ever drawing a window.
  *
- * @stopped is the caller's own thread-stop answer, because the callers do not
- * agree on it: sys_epoll_pwait lets dequeued events outrank a leader-work-only
- * stop, while an exit_group stop wins outright everywhere.
+ * @stopped is the caller's own thread-stop answer: a stop wins outright, while
+ * ready events outrank a signal interruption.
  */
 static bool poll_wait_interrupted(bool stopped, bool events, bool *claimed_out)
 {
@@ -426,7 +515,10 @@ int64_t sys_ppoll(guest_t *g,
             host_fd_refs_close(host_refs, nfds);
             return -LINUX_EFAULT;
         }
-        saved_mask = signal_save_blocked();
+        saved_mask = current_thread && current_thread->saved_blocked_valid
+                         ? current_thread->saved_blocked
+                         : signal_save_blocked();
+        signal_defer_restore_blocked(saved_mask);
         signal_set_blocked(new_mask);
         mask_installed = true;
     }
@@ -460,10 +552,11 @@ int64_t sys_ppoll(guest_t *g,
 
     /* A finite wait runs to this deadline in slices; an unbounded one has none
      * and re-arms forever. A zero timeout is a poll, not a wait, and keeps its
-     * single non-blocking call.
+     * single non-blocking call. The absolute end is sticky across park_reissue
+     * remounts so a quantum cannot stretch the guest timeout.
      */
     int64_t deadline_ms =
-        poll_timeout_ms > 0 ? poll_now_ms() + poll_timeout_ms : -1;
+        poll_sticky_deadline_ms(poll_timeout_ms > 0 ? poll_timeout_ms : -1);
 
     /* Entries whose usbfs completion pipe woke the wait with nothing the guest
      * asked to see. Their host interest is withdrawn (the unreaped completion
@@ -490,7 +583,56 @@ ppoll_retry:
                      signal_pending_interruption(NULL))
                         ? 0
                         : poll_slice_ms(deadline_ms);
-        ret = poll(host_fds, nfds + added_wakeup, slice);
+
+        /* A parked wait never holds the worker in a blocking host poll: probe
+         * non-blocking, register the descriptors with the wait pump, and let
+         * the SVC be re-dispatched when one is ready.
+         */
+        if (slice > 0 && io_park_can_unmount()) {
+            ret = poll(host_fds, nfds + added_wakeup, 0);
+            int wake_ready0 =
+                added_wakeup && ret > 0 && (host_fds[nfds].revents & POLLIN)
+                    ? 1
+                    : 0;
+            bool events0 =
+                ret > wake_ready0 || unpollable_ready > 0 || invalid_count > 0;
+            if (!events0 && ret >= 0 &&
+                !ppoll_break_pending(nfds, guest_fds, need_pollnval, guest_gen,
+                                     usb_disarmed)) {
+                if (poll_wait_interrupted(thread_stop_requested(), false,
+                                          &signal_interrupted)) {
+                    /* Linux never restarts poll/ppoll/select/pselect, finite
+                     * timeout or not (signal(7)); the EINTR is the answer to
+                     * every signal, so even an indefinite wait forbids.
+                     */
+                    syscall_restart_forbid();
+                    ret = -1;
+                    errno = EINTR;
+                    break;
+                }
+                int rem = poll_park_remaining_ms(deadline_ms);
+                if (rem == 0) {
+                    ret = 0;
+                } else {
+                    io_wait_source_t src[IO_WAIT_MAX_SOURCES];
+                    int nsrc = poll_park_sources(host_fds, need_pollnval,
+                                                 unpollable, nfds, src);
+
+                    /* The park's own completion on a signal is EINTR too; this
+                     * family never restarts, so publish the forbid on the task
+                     * before the waker can complete it.
+                     */
+                    syscall_restart_forbid();
+                    int64_t parked =
+                        io_park_unmount_multi(src, (uint32_t) nsrc, rem);
+                    host_fd_refs_close(host_refs, nfds);
+                    return parked;
+                }
+            }
+            /* Fall through with the non-blocking ready result. */
+        } else {
+            ret = poll(host_fds, nfds + added_wakeup, slice);
+        }
 
         /* Take the descriptors macOS refuses out of the set once and evaluate
          * them through select() from here on. A refused entry makes poll()
@@ -518,9 +660,8 @@ ppoll_retry:
             ret > wake_ready || unpollable_ready > 0 || invalid_count > 0;
         if (poll_wait_interrupted(thread_stop_requested(), events,
                                   &signal_interrupted)) {
-            /* Finite wait: part of the guest's timeout is already spent. */
-            if (deadline_ms >= 0)
-                syscall_restart_forbid();
+            /* Same rule as above: no timeout makes this restartable. */
+            syscall_restart_forbid();
             ret = -1;
             errno = EINTR;
             break;
@@ -656,6 +797,7 @@ ppoll_retry:
     }
 
     host_fd_refs_close(host_refs, nfds);
+    poll_sticky_deadline_clear();
 
     if (ret < 0) {
         errno = saved_errno;
@@ -1006,7 +1148,10 @@ static int pselect_install_mask(guest_t *g,
     uint64_t new_mask;
     if (guest_read_small(g, ssarg.ss, &new_mask, sizeof(new_mask)) < 0)
         return -LINUX_EFAULT;
-    *saved_out = signal_save_blocked();
+    *saved_out = current_thread && current_thread->saved_blocked_valid
+                     ? current_thread->saved_blocked
+                     : signal_save_blocked();
+    signal_defer_restore_blocked(*saved_out);
     signal_set_blocked(new_mask);
     *applied_out = true;
     return 0;
@@ -1160,11 +1305,13 @@ int64_t sys_pselect6(guest_t *g,
     /* Finite waits run to this deadline in POLL_WAKE_SLICE_MS slices, like
      * ppoll: the slice boundaries are where interrupt requests and -- once a
      * usbfs entry has been disarmed below -- the disconnect map get re-checked.
-     * -1 = no deadline.
+     * -1 = no deadline. Sticky across park_reissue (see
+     * poll_sticky_deadline_ms).
      */
-    int64_t deadline_ms =
-        has_timeout ? poll_now_ms() + timespec_to_poll_ms(ts.tv_sec, ts.tv_nsec)
-                    : -1;
+    int64_t deadline_ms = has_timeout
+                              ? poll_sticky_deadline_ms(
+                                    timespec_to_poll_ms(ts.tv_sec, ts.tv_nsec))
+                              : poll_sticky_deadline_ms(-1);
 
     /* The mask is installed atomically around the select and put back after it;
      * see pselect_install_mask.
@@ -1244,23 +1391,78 @@ pselect_retry:
          */
         int slice_ms =
             signal_pending_interruption(NULL) ? 0 : poll_slice_ms(deadline_ms);
-        struct timespec slice_ts = {.tv_sec = slice_ms / 1000,
-                                    .tv_nsec = (slice_ms % 1000) * 1000000L};
+        bool probed = false;
+        if (slice_ms > 0 && io_park_can_unmount()) {
+            struct timespec zero_ts = {0, 0};
+            if (use_poll_fallback) {
+                bool restart;
+                ret = pselect_fallback_pass(&fb, &zero_ts, &restart);
+                if (ret < 0 && errno == ENOMEM)
+                    break;
+                if (restart)
+                    goto pselect_retry;
+            } else {
+                ret = pselect(max_host_fd + 1, read_setp, write_setp,
+                              except_setp, &zero_ts, NULL);
+            }
+            bool wake_hit0 = added_wakeup && ret > 0 &&
+                             (use_poll_fallback ? fb.wakeup_fired
+                                                : FD_ISSET(wake_fd, &read_set));
+            bool events0 = ret > (wake_hit0 ? 1 : 0) || fb.ready > 0;
+            if (!events0 && ret >= 0 &&
+                !pselect_usb_wake_pending(reqs, req_count)) {
+                if (poll_wait_interrupted(thread_stop_requested(), false,
+                                          &signal_interrupted)) {
+                    /* pselect is in the never-restarted family whatever the
+                     * timeout; the remaining time is the guest's to re-supply.
+                     */
+                    syscall_restart_forbid();
+                    ret = -1;
+                    errno = EINTR;
+                    break;
+                }
+                int rem = poll_park_remaining_ms(deadline_ms);
+                if (rem == 0) {
+                    ret = 0;
+                } else {
+                    io_wait_source_t src[IO_WAIT_MAX_SOURCES];
+                    int nsrc = pselect_park_sources(reqs, req_count, src);
 
-        if (use_poll_fallback) {
-            bool restart;
-            ret = pselect_fallback_pass(&fb, &slice_ts, &restart);
+                    /* Same parked rule as ppoll: no timeout makes it
+                     * restartable.
+                     */
+                    syscall_restart_forbid();
+                    int64_t parked =
+                        io_park_unmount_multi(src, (uint32_t) nsrc, rem);
+                    for (int i = 0; i < req_count; i++)
+                        host_fd_ref_close(&reqs[i].ref);
+                    free(reqs_heap);
+                    return parked;
+                }
+            }
+            probed = true;
+        }
+        if (!probed) {
+            struct timespec slice_ts = {
+                .tv_sec = slice_ms / 1000,
+                .tv_nsec = (slice_ms % 1000) * 1000000L};
 
-            /* The interrupt predicates below call into the runtime and can
-             * overwrite errno, so an allocation failure leaves the loop here.
-             */
-            if (ret < 0 && errno == ENOMEM)
-                break;
-            if (restart)
-                goto pselect_retry;
-        } else {
-            ret = pselect(max_host_fd + 1, read_setp, write_setp, except_setp,
-                          &slice_ts, NULL);
+            if (use_poll_fallback) {
+                bool restart;
+                ret = pselect_fallback_pass(&fb, &slice_ts, &restart);
+
+                /* The interrupt predicates below call into the runtime and can
+                 * overwrite errno, so an allocation failure leaves the loop
+                 * here.
+                 */
+                if (ret < 0 && errno == ENOMEM)
+                    break;
+                if (restart)
+                    goto pselect_retry;
+            } else {
+                ret = pselect(max_host_fd + 1, read_setp, write_setp,
+                              except_setp, &slice_ts, NULL);
+            }
         }
 
         /* Ready descriptors outrank the signal; see poll_wait_interrupted. */
@@ -1270,9 +1472,8 @@ pselect_retry:
         bool events = ret > (wake_hit ? 1 : 0) || fb.ready > 0;
         if (poll_wait_interrupted(thread_stop_requested(), events,
                                   &signal_interrupted)) {
-            /* Finite wait: part of the guest's timeout is already spent. */
-            if (has_timeout)
-                syscall_restart_forbid();
+            /* Same rule as above: no timeout makes this restartable. */
+            syscall_restart_forbid();
             ret = -1;
             errno = EINTR;
             break;
@@ -1399,6 +1600,7 @@ pselect_retry:
     }
 
     free(reqs_heap);
+    poll_sticky_deadline_clear();
     return ret;
 
     int64_t err;
@@ -1417,6 +1619,7 @@ pselect_cleanup:
     for (int i = 0; i < req_count; i++)
         host_fd_ref_close(&reqs[i].ref);
     free(reqs_heap);
+    poll_sticky_deadline_clear();
     return err;
 }
 
@@ -2714,7 +2917,10 @@ int64_t sys_epoll_pwait(guest_t *g,
         uint64_t new_mask;
         if (guest_read_small(g, sigmask_gva, &new_mask, sizeof(new_mask)) ==
             0) {
-            saved_mask = signal_save_blocked();
+            saved_mask = current_thread && current_thread->saved_blocked_valid
+                             ? current_thread->saved_blocked
+                             : signal_save_blocked();
+            signal_defer_restore_blocked(saved_mask);
             signal_set_blocked(new_mask);
             mask_installed = true;
         }
@@ -2723,10 +2929,11 @@ int64_t sys_epoll_pwait(guest_t *g,
     /* Convert timeout. Finite waits run to a deadline in POLL_WAKE_SLICE_MS
      * slices like ppoll's, so interrupt requests, pending pty hangups, and
      * muted usbfs registrations (below) are re-checked on slice boundaries. -1
-     * = no deadline.
+     * = no deadline. Sticky across park_reissue (see poll_sticky_deadline_ms).
      */
     bool has_timeout = (timeout_ms >= 0);
-    int64_t deadline_ms = has_timeout ? poll_now_ms() + timeout_ms : -1;
+    int64_t deadline_ms = has_timeout ? poll_sticky_deadline_ms(timeout_ms)
+                                      : poll_sticky_deadline_ms(-1);
 
     /* A hangup that is already pending must not wait out the caller's timeout.
      * kqueue will never report it, so a finite epoll_wait would otherwise block
@@ -2771,24 +2978,51 @@ epoll_rewait:
         int slice_ms = (hup_ready || signal_pending_interruption(NULL))
                            ? 0
                            : poll_slice_ms(deadline_ms);
-        nready = epoll_wait_slice(epoll_ref.fd, kevents, cap, slice_ms);
+        if (slice_ms > 0 && io_park_can_unmount()) {
+            nready = epoll_wait_slice(epoll_ref.fd, kevents, cap, 0);
+            if (nready == 0 && !epoll_mute_wake_pending(&muted)) {
+                hup_ready = epoll_collect_hung_up(inst, &hup_probe,
+                                                  &hup_probe_gen, 1) > 0;
+                if (!hup_ready) {
+                    bool stopped = thread_stop_requested();
+                    if (poll_wait_interrupted(stopped, false,
+                                              &signal_interrupted)) {
+                        /* epoll_wait/epoll_pwait never restart either. */
+                        syscall_restart_forbid();
+                        nready = -1;
+                        errno = EINTR;
+                        break;
+                    } else {
+                        int rem = poll_park_remaining_ms(deadline_ms);
+                        if (rem == 0) {
+                            nready = 0;
+                        } else {
+                            epoll_unmute(epoll_ref.fd, inst, &muted);
+                            /* Same parked rule for epoll_wait. */
+                            syscall_restart_forbid();
+                            int64_t parked =
+                                io_park_unmount(epoll_ref.fd, POLLIN, rem);
+                            host_fd_ref_close(&epoll_ref);
+                            epoll_instance_release(inst);
+                            return parked;
+                        }
+                    }
+                }
+            }
+        } else {
+            nready = epoll_wait_slice(epoll_ref.fd, kevents, cap, slice_ms);
+        }
 
-        /* Ready events outrank an interruption; see poll_wait_interrupted.
-         *
-         * exit_group still wins outright: the process is going away and there
-         * is nothing to deliver events to. An execve handed to this leader does
-         * not: the thread keeps running, and dropping what kqueue already
-         * dequeued would be worse here than for a signal, because EV_CLEAR and
-         * EV_ONESHOT registrations consume the edge and nothing re-reports it.
-         * The handoff runs at the top of the run loop whether this returns
-         * events or EINTR, so letting the events win costs it nothing.
+        /* Ready events outrank an interruption; see poll_wait_interrupted. A
+         * stop request wins outright: the process is going away and there is
+         * nothing to deliver events to.
          */
-        bool stopped = thread_stop_requested() &&
-                       !(nready > 0 && thread_stop_is_leader_work_only());
+        bool stopped = thread_stop_requested();
         if (poll_wait_interrupted(stopped, nready > 0, &signal_interrupted)) {
-            /* Finite wait: part of the guest's timeout is already spent. */
-            if (has_timeout)
-                syscall_restart_forbid();
+            /* Same never-restarted family; has_timeout only decides how the
+             * guest measures the retry.
+             */
+            syscall_restart_forbid();
             nready = -1;
             errno = EINTR;
             break;
@@ -2822,6 +3056,7 @@ epoll_rewait:
         epoll_unmute(epoll_ref.fd, inst, &muted);
         host_fd_ref_close(&epoll_ref);
         epoll_instance_release(inst);
+        poll_sticky_deadline_clear();
         return ret;
     }
 
@@ -3073,11 +3308,13 @@ epoll_rewait:
                                   nout * sizeof(linux_epoll_event_t)) < 0) {
                 host_fd_ref_close(&epoll_ref);
                 epoll_instance_release(inst);
+                poll_sticky_deadline_clear();
                 return -LINUX_EFAULT;
             }
     }
 
     host_fd_ref_close(&epoll_ref);
     epoll_instance_release(inst);
+    poll_sticky_deadline_clear();
     return nout;
 }

@@ -184,6 +184,7 @@ static int fd_type_accmode(int type)
     case FD_EVENTFD:  /* anon_inode_getfd(O_RDWR), fs/eventfd.c */
     case FD_SIGNALFD: /* fs/signalfd.c */
     case FD_TIMERFD:  /* fs/timerfd.c */
+    case FD_MQUEUE:   /* mq_open anon inode */
     case FD_EPOLL:    /* fs/eventpoll.c */
     case FD_PIDFD:    /* kernel/pid.c */
     case FD_NETLINK:  /* a socket: O_RDWR */

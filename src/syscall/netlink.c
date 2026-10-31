@@ -48,8 +48,8 @@
 #include "syscall/internal.h"
 #include "syscall/io.h" /* io_wait_fd_timed_or_interrupted */
 #include "syscall/net.h"
-#include "syscall/proc.h"   /* syscall_restart_forbid, syscall_is_restarted */
-#include "runtime/thread.h" /* thread_stop_is_leader_work_only */
+#include "syscall/proc.h"   /* syscall_restart_forbid */
+#include "runtime/thread.h" /* current_thread, task restart/deadline fields */
 #include "proved/netlink.h"
 #include "utils.h"
 #include <poll.h>
@@ -1655,23 +1655,19 @@ static int64_t nl_deadline_add(int64_t now_ms, int64_t timeout_ms)
     return now_ms + timeout_ms;
 }
 
-/* restart_block for a netlink receive: the deadline an interrupted wait had
- * left, carried across the SVC restart the dispatcher may perform.
+/* restart_block for a netlink receive: the absolute deadline a parked wait had
+ * left.
  *
- * Linux restarts an interrupted recvmsg with the timeout it had *remaining*,
- * not with a fresh copy of SO_RCVTIMEO. elfuse's restart re-executes the SVC,
- * so nl_wait_readable_locked() is re-entered from the top and would compute a
- * new deadline from the option -- handing the guest its whole timeout again,
- * once per restart. Stashing the absolute deadline here and adopting it when
- * syscall_is_restarted() says this call is the re-execution keeps the budget
- * the guest was given.
+ * Linux gives a restarted receive the timeout it had *remaining*, not a fresh
+ * copy of SO_RCVTIMEO. A park re-dispatches this SVC from the top, so
+ * nl_wait_readable_locked() would compute a new deadline from the option and
+ * hand the guest its whole timeout again, once per park. Stashing the absolute
+ * deadline before returning SYSCALL_PARKED and adopting it on the next dispatch
+ * keeps the budget. The fd prevents a later receive from adopting an unrelated
+ * operation's budget.
  *
- * Thread-local, and only read when the restart flag is set, so a stash left
- * behind by a wait whose restart never happened cannot be picked up by an
- * unrelated later receive. The fd is part of the match for the same reason.
+ * The task retains its deadline across worker migration.
  */
-static _Thread_local int64_t nl_restart_deadline_ms;
-static _Thread_local int nl_restart_fd = -1;
 
 /* Block until the netlink receive buffer has data, for at most SO_RCVTIMEO.
  * Called with nl_lock held.
@@ -1684,6 +1680,8 @@ static int64_t nl_wait_readable_locked(netlink_state_t *ns,
                                        int guest_fd,
                                        bool nonblock)
 {
+    thread_entry_t *task = current_thread;
+
     /* Three states, from sock_rcvtimeo(): a negative stored timeout is Linux's
      * 0 jiffies, which means do not wait at all and is the nonblocking answer
      * even on a socket the guest never marked nonblocking.
@@ -1693,20 +1691,20 @@ static int64_t nl_wait_readable_locked(netlink_state_t *ns,
     /* The SO_RCVTIMEO deadline is taken once, here, and not refreshed by the
      * waits below. That is skb_recv_datagram()'s shape: sock_rcvtimeo() is read
      * at the top and every wait inside shares the one budget, so a wakeup that
-     * finds nothing does not buy the caller another full timeout. A restarted
-     * SVC continues the deadline the interrupted attempt was using, for the
-     * same reason at a larger scale.
+     * finds nothing does not buy the caller another full timeout.
      */
     int64_t deadline_ms = 0;
     if (!no_wait && ns->opt_rcvtimeo_ms > 0) {
-        bool resumed = syscall_is_restarted() && nl_restart_fd == guest_fd &&
-                       nl_restart_deadline_ms != 0;
+        bool resumed = task && task->nl_restart_fd == guest_fd &&
+                       task->nl_restart_deadline_ms != 0;
         deadline_ms = resumed
-                          ? nl_restart_deadline_ms
+                          ? task->nl_restart_deadline_ms
                           : nl_deadline_add(nl_now_ms(), ns->opt_rcvtimeo_ms);
     }
-    nl_restart_deadline_ms = 0;
-    nl_restart_fd = -1;
+    if (task) {
+        task->nl_restart_deadline_ms = 0;
+        task->nl_restart_fd = -1;
+    }
 
     while (ns->buf_pos >= ns->buf_len) {
         if (no_wait) {
@@ -1738,36 +1736,25 @@ static int64_t nl_wait_readable_locked(netlink_state_t *ns,
          */
         int64_t wait_rc =
             io_wait_fd_timed_or_interrupted(rd_fd, POLLIN, timeout_ms);
+        if (wait_rc == SYSCALL_PARKED) {
+            /* The SVC is re-dispatched from the top after the wake; carry the
+             * one budget across that dispatch.
+             */
+            if (task && deadline_ms) {
+                task->nl_restart_deadline_ms = deadline_ms;
+                task->nl_restart_fd = guest_fd;
+            }
+            return wait_rc;
+        }
         if (wait_rc < 0) {
             /* sock_intr_errno(): an interrupted receive reports ERESTARTSYS
              * when the timeout is MAX_SCHEDULE_TIMEOUT and EINTR when it is
              * finite, precisely so a restart cannot hand the caller its whole
-             * SO_RCVTIMEO a second time. Same split -- but only over the half
-             * of the EINTR the guest can see.
-             *
-             * io_wait_fd_timed_or_interrupted() reports EINTR for two unrelated
-             * reasons. One is a guest-visible signal, and forbidding the
-             * restart there is right. The other is the dispatcher's own execve
-             * handoff (io.c: the leader leaves the wait so the run loop can
-             * reach the handoff), which is invisible to the guest and which
-             * syscall.c only restarts while thread_stop_is_leader_work_only()
-             * holds. Forbidding unconditionally turned a sibling's execve into
-             * an EINTR on a recvmsg with no signal in sight -- an errno Linux
-             * cannot produce there. Gate on the same predicate the dispatcher
-             * arms on, so only the guest-visible half forbids.
-             *
-             * The restarted attempt continues this deadline rather than taking
-             * a fresh one, which is what Linux's restart_block carries, so the
-             * handoff cannot stretch a finite timeout either.
+             * SO_RCVTIMEO a second time. Only the finite case forbids a restart
+             * here; the infinite one is restartable and has no budget to carry.
              */
-            if (deadline_ms && wait_rc == -LINUX_EINTR) {
-                if (thread_stop_is_leader_work_only()) {
-                    nl_restart_deadline_ms = deadline_ms;
-                    nl_restart_fd = guest_fd;
-                } else {
-                    syscall_restart_forbid();
-                }
-            }
+            if (deadline_ms && wait_rc == -LINUX_EINTR)
+                syscall_restart_forbid();
             return wait_rc;
         }
 

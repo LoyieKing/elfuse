@@ -18,6 +18,7 @@
 
 #include "core/guest.h"
 #include "syscall/linux-wire.h"
+#include "runtime/sched/sched.h"
 
 /* Guest-visible kernel identity for uname(2) and /proc/version;
  * tests/test-proc.c pins the two surfaces to each other. The release names the
@@ -53,6 +54,19 @@ int64_t sys_sched_setscheduler(guest_t *g,
 int64_t sys_sched_setparam(guest_t *g, int pid, uint64_t param_gva);
 int64_t sys_sched_get_priority_min(int policy);
 int64_t sys_sched_get_priority_max(int policy);
+int64_t sys_sched_setattr(guest_t *g,
+                          int pid,
+                          uint64_t attr_gva,
+                          unsigned int flags);
+int64_t sys_sched_getattr(guest_t *g,
+                          int pid,
+                          uint64_t attr_gva,
+                          unsigned int size,
+                          unsigned int flags);
+int64_t sys_sched_setaffinity(guest_t *g,
+                              int pid,
+                              uint64_t size,
+                              uint64_t mask_gva);
 int64_t sys_sched_rr_get_interval(guest_t *g, int pid, uint64_t ts_gva);
 int64_t sys_getgroups(guest_t *g, int size, uint64_t list_gva);
 int64_t sys_setgroups(guest_t *g, int size, uint64_t list_gva);
@@ -114,3 +128,27 @@ void sys_rlimit_send_xfsz(void);
  * Returns bytes written (excluding NUL) or -1 on error.
  */
 int sys_format_limits(char *buf, size_t bufsz);
+
+/* Server side of the cross-backend scheduler control RPC (proc-pidfd.c). These
+ * run in the target host process and act on one of its local tasks. @tid is a
+ * guest TID; @requester_euid is the caller's modeled euid (0 = CAP_SYS_NICE).
+ * Errors are negative Linux errno values.
+ */
+int64_t sys_sched_remote_query(int64_t tid,
+                               sched_task_attrs_t *attrs,
+                               uint32_t *uid,
+                               uint32_t *euid,
+                               uint64_t *rr_interval_ns,
+                               uint64_t *rlimit_nice,
+                               uint64_t *rlimit_rtprio);
+int64_t sys_sched_remote_set_attr(int64_t tid,
+                                  const sched_task_attrs_t *req,
+                                  uint32_t requester_euid);
+int64_t sys_sched_remote_set_nice(int64_t tid,
+                                  int nice,
+                                  uint32_t requester_euid);
+int64_t sys_sched_remote_get_affinity(int64_t tid, uint8_t *buf, size_t len);
+int64_t sys_sched_remote_set_affinity(int64_t tid,
+                                      const uint8_t *mask,
+                                      size_t len,
+                                      uint32_t requester_euid);

@@ -1,18 +1,22 @@
 /*
- * Per-thread state for Linux threading support
+ * Guest kernel-task table (Linux threading support)
  *
  * Copyright 2026 elfuse contributors
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Maintains a table of guest threads. Each thread has its own HVF vCPU running
- * on a dedicated host pthread. The main thread is registered at startup; worker
- * threads are added via clone(CLONE_THREAD). A _Thread_local pointer provides
- * O(1) access to the current thread's entry from any syscall handler.
+ * Each guest user thread (main, CLONE_THREAD, CLONE_VM) is a schedulable kernel
+ * task (`thread_entry` / `kernel_task_t`). Tasks are NOT HVF vCPUs: the fair
+ * scheduler mounts READY tasks onto a fixed ncpu-sized vCPU worker pool
+ * (runtime/sched/vcpu_pool.h) with register save/restore (`guest_ctx`).
+ * Blocking parks unmount so another READY task can run on that slot. A
+ * _Thread_local pointer provides O(1) access from any syscall handler.
  *
- * SP_EL1 allocation: each thread gets a 4KiB EL1 exception stack carved from
- * the shim data region (g->shim_data_base + 2MiB). Thread 0 (main) gets the
- * top, thread N gets offset -(N * 4096).
+ * SP_EL1 allocation: each task gets a 4KiB EL1 exception stack carved from the
+ * shim data region (g->shim_data_base + 2MiB). Task 0 (main) gets the top, task
+ * N gets offset -(N * 4096). Slot count is bounded only by the residual IPA
+ * above the shim-globals cache (see thread.c), not by a uint64_t bitset or a
+ * fixed MAX_THREADS.
  */
 
 #pragma once
@@ -26,9 +30,21 @@
 #include "core/guest.h"         /* guest_t (for thread_alloc_sp_el1) */
 #include "syscall/linux-wire.h" /* linux_user_pt_regs_t */
 #include "syscall/signal.h" /* signal_pending_t (per-thread directed signals) */
+#include "runtime/sched/guest_ctx.h"
+#include "runtime/futex.h"
+#include "runtime/sched/sched.h"
 
-/* Maximum number of concurrent guest threads in one VM. */
-#define MAX_THREADS 64
+/* Concurrent kernel tasks are not hard-capped at a fixed 64.
+ *
+ * The table grows with host memory (calloc failure -> clone EAGAIN). Each task
+ * still needs a 4KiB SP_EL1 slot carved from the shim_data IPA block above the
+ * shim-globals cache; exhausting that pool returns ENOMEM. Physical HVF vCPUs
+ * stay bound to sched_host_ncpu() worker slots; creating many CLONE_THREAD
+ * tasks does not create one vCPU each.
+ *
+ * Callers that need a snapshot buffer size should use thread_table_capacity()
+ * (or thread_active_count()) rather than a compile-time MAX_THREADS.
+ */
 
 /* One EL1 exception stack per thread. Named because the region these slots
  * occupy is a bound as well as an allocation: the host writes into a live shim
@@ -38,7 +54,19 @@
 #define SP_EL1_SLOT_BYTES 4096
 #define MAX_DEFERRED_STACK_UNMAPS 8
 
-/* Per-thread state. One entry per guest thread (main + workers). Tagged (struct
+/* Restart witnesses span guest entries and follow the migrating task. */
+typedef struct task_syscall_restart {
+    bool armed;
+    bool restarted;
+    bool forbidden;
+    uint64_t elr_rewound;
+    uint64_t elr_after_svc;
+    uint64_t nr;
+    int64_t result;
+} task_syscall_restart_t;
+
+/* Per-task state. One entry per guest user thread (main + clones). This is
+ * elfuse's kernel task: the fair scheduler's schedulable entity. Tagged (struct
  * thread_entry) so signal.h can forward-declare it for the thread-directed
  * signal API without an include cycle.
  */
@@ -74,14 +102,7 @@ typedef struct thread_entry {
      */
     _Atomic int32_t in_syscall;
 
-    /* Where this thread is parked in a futex wait, for futex_kick, which loads
-     * these with no lock (runtime/futex.c states the protocol). Not cleared on
-     * recycle: a thread leaves its wait before it exits, and a kick left set
-     * costs the next owner one early pass of its wait loop.
-     */
-    pthread_mutex_t *_Atomic futex_park_lock; /* Mutex of a condvar park */
-    pthread_cond_t *_Atomic futex_park_cond;  /* Valid under that mutex */
-    _Atomic uint32_t futex_kick;              /* A kick not answered yet */
+    _Atomic uint32_t futex_kick; /* A kick not answered yet */
 
     /* Thread-directed pending signals (Linux task->pending). tgkill/tkill and
      * pthread_kill queue here so only this thread consumes them. Written and
@@ -91,48 +112,18 @@ typedef struct thread_entry {
      */
     signal_pending_t tpending;
 
-    /* First fully lock-private field. thread_alloc memsets from here on. */
-    hv_vcpu_t vcpu;              /* HVF vCPU handle for this thread */
-    bool vcpu_valid;             /* Handle has been published and not destroyed.
-                                  * hv_vcpu_t value 0 is valid, so the handle
-                                  * itself cannot be used as a sentinel.
-                                  */
-    hv_vcpu_exit_t *vexit;       /* vCPU exit info pointer */
-    pthread_t host_thread;       /* macOS host thread running this vCPU */
-    bool host_thread_needs_join; /* host_thread was created joinable and nobody
-                                  * has joined it yet. Exactly one claimer
-                                  * clears the flag under thread_lock before
-                                  * joining: slot reuse in thread_alloc,
-                                  * teardown in thread_join_workers, or the
-                                  * clone startup-failure rollback. Never set
-                                  * for the main thread or vm-clone children
-                                  * (the latter are created detached).
-                                  */
-    uint64_t clear_child_tid;    /* GVA for CLONE_CHILD_CLEARTID (0=none) */
-    uint64_t sp_el1;             /* Per-thread EL1 stack top (IPA) */
-    int sp_el1_slot;             /* Slot index in sp_el1_allocated (-1 = none).
-                                  * Stored at alloc time so the free path does
-                                  * not need to recompute (top - sp) / 4096; the
-                                  * shim data block is now at high IPA and only
-                                  * known via guest_t.
-                                  */
-    uint64_t generation; /* Bumped by thread_alloc each time this slot is
-                          * reused. Lets a caller holding a t pointer detect
-                          * that its slot was recycled to a different logical
-                          * thread while it was not looking (e.g. a clone
-                          * parent that raced with a starting-up worker's own
-                          * failure path). Read/written under thread_lock,
-                          * except for the lock-free comparison in
-                          * thread_join_workers' teardown poll, which uses
-                          * acquire/release ordering against thread_alloc's
-                          * release-store.
-                          */
-    bool join_abandoned; /* thread_join_workers timed out on this worker and
-                          * pthread_detach()ed it. Later join passes
-                          * (launch_destroy_guest runs one after main()'s) must
-                          * skip the entry: pthread_join/pthread_detach on an
-                          * already-detached thread is undefined.
-                          */
+    uint64_t clear_child_tid; /* GVA for CLONE_CHILD_CLEARTID (0=none) */
+    uint64_t sp_el1;          /* Per-thread EL1 stack top (IPA) */
+    int sp_el1_slot;          /* Slot index in sp_el1_allocated (-1 = none).
+                               * Stored at alloc time so the free path does
+                               * not need to recompute (top - sp) / 4096; the
+                               * shim data block is now at high IPA and only
+                               * known via guest_t.
+                               */
+    uint64_t generation;      /* Slot identity; protected by thread_lock. */
+    unsigned references; /* Held under thread_lock; prevents slot recycling. */
+    bool exit_cleanup_claimed;
+
     /* Per-thread signal mask lives at the top of the struct; see the lock-free
      * group there. saved_blocked is touched only under sig_lock by the owning
      * thread, so it stays here with the rest of the signal state.
@@ -152,6 +143,8 @@ typedef struct thread_entry {
      * and sets FUTEX_OWNER_DIED on each lock word.
      */
     uint64_t robust_list_head;
+
+    futex_pi_task_t futex_pi;
 
     /* rseq (restartable sequences) per-thread registration state. When rseq_gva
      * != 0, the thread has a registered struct rseq. Signal delivery and
@@ -231,6 +224,84 @@ typedef struct thread_entry {
     bool vm_exited;     /* Child has exited */
     int vm_exit_status; /* Wait-format exit status */
 
+    sched_task_state_t sched;
+
+    guest_thread_ctx_t guest_ctx;
+
+    /* Signal frames outlive a worker mount and migrate with the task. */
+    uint64_t sigreturn_cookies[16];
+    unsigned sigreturn_cookie_depth;
+    bool sig_fault_valid;
+    int32_t sig_fault_code;
+    uint64_t sig_fault_addr;
+    uint64_t sig_fault_esr;
+    int termination_wait_status;
+    bool sigreturn_x8_valid;
+    bool ptrace_stop_armed;
+    uint64_t sigreturn_x8_elr;
+    uint64_t sigreturn_x8_value;
+    int64_t nl_restart_deadline_ms;
+    int nl_restart_fd;
+    task_syscall_restart_t syscall_restart;
+    _Atomic bool park_restart_forbid;
+    int exec_resume;
+    uint64_t watchdog_progress_ns;
+    uint64_t io_continue_bytes;
+    struct io_stream_cont *io_stream_cont;
+    void *fuse_service;
+    bool sysv_waited;
+
+    /* Async park (pool unmount). Futex wait / nanosleep return SYSCALL_PARKED
+     * instead of pthread_cond_wait on the worker. Waker, deadline, or signal
+     * completes the park and READY-enqueues; remount injects X0 then resumes
+     * the HVC #5 shim epilogue path. IO waits (PARK_KIND_IO) remount with
+     * park_reissue so the SVC is dispatched again instead of injecting X0.
+     */
+    _Atomic int park_kind;
+    _Atomic uint64_t park_seq;
+    _Atomic bool park_active;
+    _Atomic bool park_result_pending;
+    _Atomic bool park_reissue;
+    _Atomic int64_t park_result;
+    _Atomic uint64_t wait_deadline_ns;
+    void *_Atomic async_futex_waiter;
+    unsigned async_futex_pub_bucket;
+    bool async_futex_relative; /* Plain FUTEX_WAIT: forbid restart on EINTR */
+    bool async_futex_timed;    /* Guest supplied a timeout (vs infinite) */
+    /* FUTEX_WAIT_REQUEUE_PI: signal before CMP_REQUEUE_PI must restart the SVC
+     * (Linux ERESTARTNOINTR) even without SA_RESTART. Remount/epilogue rewind
+     * ELR to the SVC and skip injecting EINTR so the handler's rt_sigreturn
+     * re-enters the wait. After requeue, park completes with EWOULDBLOCK
+     * instead (see futex_park_on_interrupt).
+     */
+    _Atomic bool async_futex_requeue_pi_restart;
+    guest_t *park_guest; /* Guest for charge drop / rem write */
+    uint64_t sleep_rem_gva;
+    bool sleep_write_rem;
+    int64_t sleep_requested_ns;
+    int64_t sleep_start_ns;
+    uint64_t park_rem_gva;
+    int64_t park_rem_ns;
+    _Atomic bool park_rem_pending;
+    int io_park_fd; /* Host fd for PARK_KIND_IO poll, or -1 */
+    short io_park_events;
+    uint64_t io_park_deadline_ns; /* Guest wait end (0 = infinite) */
+    /* Host fd SoftNS is driving through connect_nonblock_wait, or -1. Survives
+     * PARK_KIND_IO park_reissue so a remounted connect that sees EISCONN
+     * (connection landed while parked) can return 0 instead of leaking the host
+     * errno. Cleared when connect returns a final result to the guest. A
+     * genuine second connect after success finds this cleared and still reports
+     * EISCONN (tests/test-socket.c).
+     */
+    int connect_inflight_fd;
+
+    /* Absolute poll_now_ms() end for an in-flight ppoll/pselect/epoll wait.
+     * Survives park_reissue remounts so a guest timeout is not reset each
+     * quantum. 0 = unset. Cleared when the syscall returns to the guest
+     * (including injected -EINTR via sched_park_try_complete).
+     */
+    int64_t io_syscall_deadline_ms;
+
     /* Guest stack range supplied by clone3(stack, stack_size). elfuse uses this
      * to avoid tearing down a still-active child stack when another thread
      * munmaps the backing range before the child is done with its bootstrap
@@ -243,6 +314,9 @@ typedef struct thread_entry {
     int deferred_stack_unmap_count;
     int deferred_stack_unmap_busy;
 } thread_entry_t;
+
+/* Explicit alias: a guest user thread is a kernel task, not a vCPU. */
+typedef thread_entry_t kernel_task_t;
 
 /* The one definition of how the lock-free-scanned signal mask is accessed.
  * Writers are the owning thread under sig_lock, plus the parent that clones a
@@ -292,7 +366,8 @@ void thread_init(void);
 /* Register the main thread (thread 0). Called from main.c after the initial
  * vCPU is created. Sets current_thread for the main thread.
  */
-void thread_register_main(hv_vcpu_t vcpu,
+void thread_register_main(const guest_t *g,
+                          hv_vcpu_t vcpu,
                           hv_vcpu_exit_t *vexit,
                           int64_t tid,
                           uint64_t sp_el1);
@@ -305,8 +380,8 @@ typedef struct {
 
 /* Allocate a new thread table slot for the given TID, a VM-clone child when
  * @vm_clone is set and a thread of the caller's group when it is NULL.
- * Returns a pointer to the entry, or NULL if the table is full. The caller must
- * fill in vcpu, vexit, host_thread, sp_el1.
+ * Returns a new task, or NULL if storage cannot be allocated. The caller
+ * initializes its guest context and SP_EL1 before enqueueing it.
  */
 thread_entry_t *thread_alloc(int64_t tid,
                              uint64_t stack_start,
@@ -315,33 +390,8 @@ thread_entry_t *thread_alloc(int64_t tid,
 
 /* Mark a thread as inactive and release its table slot. */
 void thread_deactivate(thread_entry_t *t);
+void thread_exit_task(thread_entry_t *t, guest_t *g, int wait_status);
 
-/* Record the host pthread backing this entry, under thread_lock so concurrent
- * table readers (thread_join_workers snapshot, thread_alloc slot reuse) see a
- * consistent handle. joinable marks the handle as needing a pthread_join before
- * its slot can be reused; pass false for detached pthreads (vm-clone children).
- * generation must be the value of t->generation the caller observed when it
- * obtained t from thread_alloc: if the slot was recycled to a different logical
- * thread in the meantime (the calling worker failed startup and deactivated
- * before this call ran), the current generation no longer matches and the write
- * is rejected -- the caller then owns thr exclusively and must join or detach
- * it itself.
- *
- * Returns true if recorded.
- */
-bool thread_set_host_thread(thread_entry_t *t,
-                            pthread_t thr,
-                            bool joinable,
-                            uint64_t generation);
-
-/* Atomically claim the right to pthread_join a worker's handle.
- *
- * Returns true when the caller must join thr; false when someone else (slot
- * reuse in thread_alloc) already claimed it, or the slot no longer holds thr.
- * Used by the clone startup-failure rollback so the parent's join cannot race
- * with a concurrent slot reuse joining the same terminated pthread.
- */
-bool thread_claim_worker_join(thread_entry_t *t, pthread_t thr);
 
 /* Find a thread by guest TID. Returns NULL if not found. */
 thread_entry_t *thread_find(int64_t tid);
@@ -354,6 +404,12 @@ thread_entry_t *thread_find(int64_t tid);
  */
 thread_entry_t *thread_find_locked(int64_t tid);
 
+/* Lock-free TID lookup. Safe while the caller holds sig_lock (which serializes
+ * tpending writes); a racing deactivate may return a stale pointer only until
+ * active clears, so callers must treat a missing/inactive slot as "gone".
+ */
+thread_entry_t *thread_find_relaxed(int64_t tid);
+
 /* Lock-free check: is there an active thread with this TID?
  * Returns true if found. Safe to call without holding any lock (used from
  * futex_lock_pi to avoid lock order inversion with bucket locks). May return a
@@ -361,6 +417,10 @@ thread_entry_t *thread_find_locked(int64_t tid);
  * tolerate this.
  */
 bool thread_tid_alive(int64_t tid);
+
+/* Hold storage identity until release, including after task exit. */
+thread_entry_t *thread_acquire_tid(int64_t tid);
+void thread_release(thread_entry_t *t);
 
 /* Is there an active thread with this TID that is not a VM-clone child? Takes
  * thread_lock, because is_vm_clone is one of the fields thread_alloc clears
@@ -371,6 +431,11 @@ bool thread_tid_in_group(int64_t tid);
 /* Count currently active threads. */
 int thread_active_count(void);
 
+/* Current thread-table capacity (initialized slots, including inactive). Grows
+ * as clone needs more entries; use for host-side snapshot buffers.
+ */
+int thread_table_capacity(void);
+
 /* OR of every active thread's private pending bitmask (thread-directed
  * signals). The signal module folds this into its global "maybe pending" hint.
  * Caller must hold sig_lock so the tpending fields are stable; the active-slot
@@ -378,6 +443,13 @@ int thread_active_count(void);
  * superset.
  */
 uint64_t thread_pending_union(void);
+
+/* Active and departed thread-group CPU time; locks thread then scheduler. */
+uint64_t thread_process_cputime_ns(void);
+void thread_process_cputime_split_ns(uint64_t *user_ns, uint64_t *sys_ns);
+
+/* Lock-free: first active non-vm_clone thread in SCHED_STATE_RUNNING, or 0. */
+int64_t thread_find_running_tid(void);
 
 /* Fast path: return non-zero when exactly one guest thread is active. */
 int thread_is_single_active(void);
@@ -388,7 +460,7 @@ int thread_is_single_active(void);
  * at high IPA computed by guest_init, so callers must pass g; the slot index is
  * stored in t->sp_el1_slot so the free path (which is reached from teardown
  * contexts that lack g) can clear the bitmask directly.
- * Returns the SP_EL1 IPA, or 0 on slot exhaustion.
+ * Returns the SP_EL1 IPA, or 0 on IPA-pool exhaustion (ENOMEM to clone).
  */
 uint64_t thread_alloc_sp_el1(const guest_t *g, thread_entry_t *t);
 
@@ -409,6 +481,8 @@ void thread_sp_el1_region(const guest_t *g, uint64_t *lo, uint64_t *hi);
  * thread table lock during iteration.
  */
 void thread_for_each(void (*fn)(thread_entry_t *t, void *ctx), void *ctx);
+void thread_commit_exec_identity(void);
+void thread_for_each_ref(void (*fn)(thread_entry_t *t, void *ctx), void *ctx);
 
 /* True when a tracee that can still consume one owes a PTRACE_INTERRUPT stop.
  * An exited vm-clone is not one of those. Caller holds thread_lock.
@@ -418,33 +492,6 @@ bool thread_ptrace_interrupt_pending_locked(void);
 /* Count running VM-clone children for exec teardown checks. */
 int thread_count_active_vm_clones(void);
 
-/* Join worker threads (all active threads except the caller, minus any already
- * join_abandoned by a prior pass). Collects thread handles under the lock, then
- * polls OUTSIDE the lock under one shared 500ms deadline so workers can call
- * thread_deactivate() to set active=0. Workers still alive past the deadline
- * are detached and marked join_abandoned so a later pass (e.g.
- * launch_destroy_guest's internal join after main()'s) does not touch the same
- * handle twice.
- */
-void thread_join_workers(void);
-
-/* Destroy the main vCPU (owned by the calling thread) during teardown. HVF
- * vCPUs are thread-affine, so worker vCPUs are never destroyed here: an active
- * worker slot that has not published vm_exited is one whose owning thread is
- * still live -- running a vCPU or mid-bring-up about to enter one -- and a
- * cross-thread hv_vcpu_destroy on such a handle, or hv_vm_destroy while it
- * holds one, corrupts the kernel vCPU object and panics the host. Such a worker
- * is left for process-exit reclamation and reported via live_workers_left (may
- * be NULL) so the caller defers the rest of HVF teardown. A slot that has
- * already published vm_exited (a vm-clone child that self-destroyed its vCPU
- * and stays active only for wait4) holds no live vCPU and does not force the
- * deferral.
- *
- * Returns whether the main vCPU was destroyed.
- */
-bool thread_destroy_all_vcpus(hv_vcpu_t main_vcpu,
-                              bool main_vcpu_valid,
-                              bool *live_workers_left);
 
 /* Interrupt all active vCPUs by calling hv_vcpus_exit(). Used for signal
  * preemption: when a signal is queued while a vCPU is running in a tight loop
@@ -463,13 +510,6 @@ void thread_interrupt_all(void);
  */
 void thread_wake_all_blocked(void);
 
-/* The same wakes minus the futex interrupt, for work only the leader has to
- * notice (an execve handed to it). The interrupt flag is process-wide and
- * one-shot, so a teardown-strength wake used for a handoff hands an unexplained
- * EINTR to whichever thread consumes it. Callers must publish the reason the
- * leader's thread_stop_requested turns true BEFORE calling this.
- */
-void thread_wake_leader_for_work(void);
 
 /* Wake workers parked on internal condvars (fork barrier, ptrace stop/wait) so
  * exit_group teardown reaches them within a bounded time. hv_vcpus_exit only
@@ -538,12 +578,19 @@ void thread_fork_release_counted_locked(thread_entry_t *t);
  */
 int thread_exec_stop_requested(void);
 
-/* The leader has an execve handed to it and must leave whatever it is parked in
- * to run it. Published by the exec layer, read by thread_stop_requested, so the
- * hot-path predicate stays inside runtime/.
+/* True while thread_exec_de_thread holds the process in teardown. Unlike
+ * thread_exec_stop_requested(), this does not require current_thread to be a
+ * non-leader sibling; pool workers use it between mounts (current_thread NULL)
+ * to refuse remounting READY tasks during de_thread.
  */
-void thread_set_leader_work_pending(bool pending);
-bool thread_leader_work_pending(void);
+bool thread_exec_de_thread_active(void);
+
+/* Like thread_stop_requested(), but for an arbitrary guest task @t. Park
+ * interrupt/deadline callbacks run on the wake/timer thread (current_thread is
+ * the waker, not @t); they must use this rather than thread_stop_requested().
+ */
+int thread_stop_requested_for(const thread_entry_t *t);
+
 
 /* True when the calling thread must leave guest execution: a process-wide
  * exit_group was requested, or an execve is tearing this thread down. Every
@@ -561,20 +608,26 @@ int thread_stop_requested(void);
  */
 void thread_note_syscall(int nr);
 
-/* True when the only thing thread_stop_requested is reporting is an execve
- * handed to this leader: nothing is tearing this thread down. The wait it broke
- * has nothing to report to the guest, since Linux returns no EINTR without a
- * signal, so the syscall epilogue restarts the SVC instead and the handoff runs
- * from the run loop in between.
- */
-int thread_stop_is_leader_work_only(void);
 
-/* True when the caller is the thread group leader (the main host thread, the
- * one whose run loop returning tears the process down). de_thread cannot
- * destroy the leader, so an execve from any other thread is handed to it and
- * runs on its vCPU; see exec_handoff_to_leader.
- */
+/* The current task owns process teardown and survives an active exec. */
 bool thread_current_is_leader(void);
+
+/* True when the registered leader entry is still an active guest thread. After
+ * SYS_exit of the leader with siblings remaining, this is false and a
+ * non-leader execve must promote itself rather than hand off to a dead leader.
+ */
+bool thread_leader_is_active(void);
+
+/* Make the calling thread the SoftNS leader (main_thread_entry). Used when the
+ * original leader has already exited and a remaining thread must own process
+ * teardown / run execve in place.
+ */
+void thread_promote_current_to_leader(void);
+
+/* Thread-group leader entry (bootstrap / fork-child main). NULL before
+ * thread_register_main.
+ */
+thread_entry_t *thread_get_main(void);
 
 /* Drop the exec'ing thread's robust list and clear_child_tid, as Linux
  * begin_new_exec() does: both name addresses in the image that just went away.
@@ -597,13 +650,13 @@ int thread_exec_de_thread(void);
 
 /* Ptrace helpers. */
 
-/* Tracee: snapshot vCPU regs, enter ptrace-stop, block until resumed.
- * Returns the signal to inject (from tracer's PTRACE_CONT), or 0.
- */
+/* Snapshot and publish a stop; the outer loop releases the CPU worker. */
 int thread_ptrace_stop(thread_entry_t *t, int sig);
 
 /* Tracer: resume a stopped tracee with optional signal injection. */
 void thread_ptrace_cont(thread_entry_t *t, int sig);
+void thread_ptrace_apply_resume(thread_entry_t *t, hv_vcpu_t vcpu);
+bool thread_ptrace_stop_requested(thread_entry_t *t);
 
 /* Tracer: wait for a ptraced or vm-clone child to stop or exit.
  * Returns child TID on success, 0 on WNOHANG with none ready, or negative Linux

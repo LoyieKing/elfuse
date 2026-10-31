@@ -67,6 +67,8 @@
 #include "core/vdso.h"
 
 #include "runtime/thread.h"
+#include "runtime/sched/sched.h"
+#include "runtime/sched/vcpu_pool.h"
 
 #include "syscall/linux-wire.h"
 #include "syscall/fd.h"   /* signalfd_notify */
@@ -90,15 +92,29 @@ _Static_assert(sizeof(linux_rt_sigframe_t) + SIGFRAME_ALIGN - 1 <=
 
 /* Signal state (module-level, process-wide). */
 static signal_state_t sig_state;
-static _Thread_local int termination_wait_status;
+
+/* Job-control group stop: 0 while running, otherwise the signal that stopped
+ * the group. sig_lock serializes every transition; task iteration takes
+ * thread_lock beneath it, and the scheduler stop setters are leaves. A CLONE_VM
+ * process is a different thread group and is never included.
+ */
+static int group_stop_signum;
+
+#define LINUX_STOP_SIGNALS                                 \
+    (BIT64(LINUX_SIGSTOP - 1) | BIT64(LINUX_SIGTSTP - 1) | \
+     BIT64(LINUX_SIGTTIN - 1) | BIT64(LINUX_SIGTTOU - 1))
+
+/* Host SIGBUS recovery is execution-local: the guarded copy that arms it runs
+ * to completion on one worker before it can migrate.
+ */
 static _Thread_local host_sigbus_recovery_t host_sigbus_recovery;
 
-/* Per-thread pending fault info. When a synchronous fault (BRK, segfault, etc.)
- * needs to deliver a signal, the caller sets this before
- * signal_queue()+signal_deliver(). signal_deliver() consumes it to populate
- * si_code/si_addr/fault_address in the signal frame instead of the default
- * SI_USER/si_pid fields. Thread-local because each vCPU thread delivers signals
- * independently.
+/* Pending fault info for the current task. When a synchronous fault (BRK,
+ * segfault, etc.) needs to deliver a signal, the fault path records it and
+ * signal delivery consumes it to populate si_code/si_addr/fault_address in the
+ * signal frame instead of the default SI_USER/si_pid fields. It lives in the
+ * task rather than host TLS: a delivery can happen after the task unmounted and
+ * remounted on a different worker.
  */
 typedef struct {
     bool valid;    /* True if fault info is pending */
@@ -107,16 +123,45 @@ typedef struct {
     uint64_t esr;  /* Raw ESR_EL1 value (0 if not applicable) */
 } pending_fault_t;
 
-static _Thread_local pending_fault_t pending_fault;
+static void refresh_pending_hint_locked(void);
 
-/* Per-delivery SROP cookie. Stored when signal_deliver builds the frame (in
- * uc_flags), validated when signal_rt_sigreturn reads it back. Thread-local
- * because each vCPU thread delivers independently. A stack of cookies handles
- * nested signals (up to 16 deep).
+static pending_fault_t pending_fault_take(void)
+{
+    pending_fault_t fault = {0};
+    thread_entry_t *t = current_thread;
+    if (!t || !t->sig_fault_valid)
+        return fault;
+    fault.valid = true;
+    fault.si_code = t->sig_fault_code;
+    fault.addr = t->sig_fault_addr;
+    fault.esr = t->sig_fault_esr;
+    t->sig_fault_valid = false; /* One-shot, as force_sig_info is. */
+    return fault;
+}
+
+static void pending_fault_clear(void)
+{
+    if (current_thread)
+        current_thread->sig_fault_valid = false;
+}
+
+/* Clear the task-owned signal records that must not survive exec or slot reuse.
+ * Called by thread.c on the task being reset, not necessarily current.
  */
-#define MAX_NESTED_SIGNALS 16
-static _Thread_local uint64_t sigreturn_cookies[MAX_NESTED_SIGNALS];
-static _Thread_local int sigreturn_cookie_depth;
+void signal_task_reset(struct thread_entry *t)
+{
+    if (!t)
+        return;
+    t->sig_fault_valid = false;
+    t->sig_fault_code = 0;
+    t->sig_fault_addr = 0;
+    t->sig_fault_esr = 0;
+    t->termination_wait_status = 0;
+    t->sigreturn_x8_valid = false;
+    t->sigreturn_x8_elr = 0;
+    t->sigreturn_x8_value = 0;
+}
+
 
 /* Protects signal actions array. Multiple threads may call rt_sigaction
  * concurrently (e.g., during musl init). Blocked masks are per-thread (each
@@ -238,8 +283,8 @@ host_sigbus_recovery_t *signal_host_sigbus_recovery(void)
 /* Guest ITIMER_REAL emulation. Signal emulation keeps the guest's ITIMER_REAL
  * internally rather than forwarding to the host setitimer(), because macOS
  * shares alarm() and setitimer(ITIMER_REAL) as the same underlying timer, and
- * elfuse needs alarm() for its own vCPU per-iteration timeout. The guest timer
- * is checked after each syscall in the vCPU loop via signal_check_timer().
+ * elfuse uses that host timer for its execution watchdog. The guest timer is
+ * checked after each syscall in the vCPU loop via signal_check_timer().
  */
 typedef struct {
     _Atomic int active;      /* Non-zero if timer is armed */
@@ -247,9 +292,20 @@ typedef struct {
     struct timeval interval; /* Repeat interval (zero = one-shot) */
 } guest_itimer_t;
 
-static guest_itimer_t guest_itimer;      /* ITIMER_REAL -> SIGALRM */
-static guest_itimer_t guest_itimer_virt; /* ITIMER_VIRTUAL -> SIGVTALRM */
-static guest_itimer_t guest_itimer_prof; /* ITIMER_PROF -> SIGPROF */
+static guest_itimer_t guest_itimer; /* ITIMER_REAL -> SIGALRM */
+
+/* ITIMER_VIRTUAL / ITIMER_PROF count process CPU time, not wall time. Expiry is
+ * an absolute value of the same user/service ledger the scheduler charges, so a
+ * parked or group-stopped process cannot expire one.
+ */
+typedef struct {
+    _Atomic int active; /* Non-zero if timer is armed */
+    int64_t expiry_ns;  /* Absolute CPU-clock time of next fire */
+    int64_t interval_ns;
+} guest_cpu_itimer_t;
+
+static guest_cpu_itimer_t guest_itimer_virt; /* ITIMER_VIRTUAL -> SIGVTALRM */
+static guest_cpu_itimer_t guest_itimer_prof; /* ITIMER_PROF -> SIGPROF */
 
 /* Bounded per-process storage; Linux does not inherit POSIX timers at fork. */
 #define POSIX_TIMER_MAX 64
@@ -262,6 +318,9 @@ typedef enum {
 typedef struct {
     int32_t id, guest_clockid;
     int signum;
+    int32_t notify_tid;  /* 0 = process-directed; else SIGEV_THREAD_ID target */
+    int32_t creator_tid; /* thread that called timer_create */
+    int32_t cpu_target_tid; /* per-thread CPU clock target; 0 for process */
     int overruns, last_overrun;
     clockid_t host_clock;
     uint64_t value;
@@ -363,6 +422,120 @@ static inline uint64_t sig_bit(int signum)
 static inline int sig_uncatchable(int signum)
 {
     return signum == LINUX_SIGKILL || signum == LINUX_SIGSTOP;
+}
+
+typedef struct {
+    int signum;   /* private pending copy to drop; 0 drops every stop signal */
+    bool stopped; /* publish the group-stop reason instead of clearing it */
+} group_job_t;
+
+static void group_job_task(thread_entry_t *t, void *arg)
+{
+    const group_job_t *job = arg;
+    if (!t || t->is_vm_clone)
+        return; /* A CLONE_VM process is a different thread group. */
+    if (job->signum > 0)
+        pending_clear(&t->tpending.pending, sig_bit(job->signum));
+    else
+        pending_clear(&t->tpending.pending, LINUX_STOP_SIGNALS);
+    sched_task_set_group_stopped(t, job->stopped);
+}
+
+/* SIGSTOP cannot be caught; SIGTSTP/TTIN/TTOU stop only at SIG_DFL. */
+static bool group_stop_disposition_locked(int signum)
+{
+    if (signum == LINUX_SIGSTOP)
+        return true;
+    if (signum < 1 || signum > LINUX_NSIG)
+        return false;
+    if (sig_state.actions[signum - 1].sa_handler != LINUX_SIG_DFL)
+        return false;
+    return signal_default_disposition(signum) == SIG_DISP_STOP;
+}
+
+/* A queued job-control stop parks the whole thread group. The stop signal is
+ * consumed by the stop itself, not delivered when the group continues. A later
+ * stop signal while already stopped is discarded with the pending group state.
+ */
+static void signal_group_stop_job(int signum)
+{
+    bool entered = false;
+
+    pthread_mutex_lock(&sig_lock);
+    if (!group_stop_disposition_locked(signum)) {
+        pthread_mutex_unlock(&sig_lock);
+        return;
+    }
+    pending_clear(&sig_state.shared.pending, sig_bit(signum));
+    if (group_stop_signum == 0) {
+        group_stop_signum = signum;
+        entered = true;
+    }
+    group_job_t job = {.signum = signum, .stopped = true};
+    thread_for_each(group_job_task, &job);
+    refresh_pending_hint_locked();
+    pthread_mutex_unlock(&sig_lock);
+
+    if (entered)
+        proc_notify_group_stop(signum);
+}
+
+/* SIGCONT lifts the group stop immediately, even though the signal itself may
+ * still be delivered afterwards (default continue, or a handler). Stop signals
+ * queued while stopped are discarded, as Linux does.
+ */
+static void signal_group_continue_job(void)
+{
+    pthread_mutex_lock(&sig_lock);
+    if (group_stop_signum == 0) {
+        pthread_mutex_unlock(&sig_lock);
+        return;
+    }
+    group_stop_signum = 0;
+    pending_clear(&sig_state.shared.pending, LINUX_STOP_SIGNALS);
+    group_job_t job = {.signum = 0, .stopped = false};
+    thread_for_each(group_job_task, &job);
+    refresh_pending_hint_locked();
+    pthread_mutex_unlock(&sig_lock);
+
+    proc_notify_group_continue();
+}
+
+/* SIGKILL reaches a group-stopped task without waiting for SIGCONT. Clear both
+ * stop reasons so the tasks are runnable, then let the fatal signal deliver;
+ * parked waits are woken by the caller once it no longer holds sig_lock.
+ */
+static void signal_group_kill_job(void)
+{
+    pthread_mutex_lock(&sig_lock);
+    group_stop_signum = 0;
+    pending_clear(&sig_state.shared.pending, LINUX_STOP_SIGNALS);
+    group_job_t job = {.signum = 0, .stopped = false};
+    thread_for_each(group_job_task, &job);
+    refresh_pending_hint_locked();
+    pthread_mutex_unlock(&sig_lock);
+}
+
+static bool signal_is_stop_signal(int signum)
+{
+    return signum == LINUX_SIGSTOP || signum == LINUX_SIGTSTP ||
+           signum == LINUX_SIGTTIN || signum == LINUX_SIGTTOU;
+}
+
+/* Post-queue job-control action for a process-directed signal. Called without
+ * sig_lock: the helpers take it themselves, and the parked-task wake must run
+ * without the signal or thread lock held.
+ */
+static void signal_job_control(int signum)
+{
+    if (signum == LINUX_SIGCONT) {
+        signal_group_continue_job();
+    } else if (signum == LINUX_SIGKILL) {
+        signal_group_kill_job();
+        sched_wake_parked_for_pending_signal();
+    } else if (signal_is_stop_signal(signum)) {
+        signal_group_stop_job(signum);
+    }
 }
 
 static signal_rt_info_t signal_default_info(int signum)
@@ -525,14 +698,16 @@ static void posix_timer_discard_pending_locked(signal_pending_t *p, int id)
     }
 }
 
-/* The shared set as the current thread may take it. */
-static uint64_t shared_visible_locked(void)
+/* The shared set as thread @t may take it. A claim by another unblocked owner
+ * hides that bit from everyone else until delivery or release.
+ */
+static uint64_t shared_visible_for_locked(thread_entry_t *t)
 {
     uint64_t shared = pending_load(&sig_state.shared.pending);
     for (uint64_t c = shared_claimed & shared; c; c &= c - 1) {
         int idx = bit_ctz64(c);
         thread_entry_t *owner = shared_claim_owner[idx];
-        if (owner == current_thread)
+        if (owner == t)
             continue;
         uint64_t owner_blocked =
             atomic_load_explicit(&owner->blocked, memory_order_acquire);
@@ -540,6 +715,12 @@ static uint64_t shared_visible_locked(void)
             shared &= ~BIT64(idx);
     }
     return shared;
+}
+
+/* The shared set as the current thread may take it. */
+static uint64_t shared_visible_locked(void)
+{
+    return shared_visible_for_locked(current_thread);
 }
 
 /* Signals pending for the current thread: its private (thread-directed) set
@@ -712,9 +893,9 @@ void signal_reset_for_exec(void)
 
     /* Clear any stale pending fault info so it does not leak into the new
      * program's first signal delivery (e.g., if a BRK handler called execve
-     * with pending_fault still valid).
+     * with task fault info still valid).
      */
-    pending_fault.valid = false;
+    pending_fault_clear();
 }
 
 void signal_queue(int signum)
@@ -726,6 +907,11 @@ void signal_queue(int signum)
     /* Publish hint before releasing lock so vCPU hot path sees it. */
     refresh_pending_hint_locked();
     pthread_mutex_unlock(&sig_lock);
+
+    /* A job-control signal takes effect when queued, not when some task next
+     * runs: a stopped group has no task that could deliver it later.
+     */
+    signal_job_control(signum);
 
     /* Notify any signalfd instances whose mask includes this signal. This makes
      * the signalfd pipe readable so poll/epoll sees it.
@@ -770,6 +956,7 @@ void signal_queue_info(int signum,
     signal_enqueue_locked(&sig_state.shared, signum, &info);
     refresh_pending_hint_locked();
     pthread_mutex_unlock(&sig_lock);
+    signal_job_control(signum);
     signalfd_notify(signum);
 
     /* Same shim-globals attention raise as signal_queue: force the fast path
@@ -802,6 +989,11 @@ static bool signal_queue_thread_common(int64_t tid,
     thread_entry_t *t = thread_find_locked(tid);
     if (t) {
         signal_enqueue_locked(&t->tpending, signum, info);
+        if (signum == LINUX_SIGKILL) {
+            /* A fatal signal does not wait for SIGCONT to lift a stop. */
+            sched_task_set_group_stopped(t, false);
+            sched_task_set_trace_stopped(t, false);
+        }
         refresh_pending_hint_locked();
         blocked = thread_blocked_load(t);
         found = true;
@@ -811,6 +1003,17 @@ static bool signal_queue_thread_common(int64_t tid,
 
     if (!found)
         return false;
+
+    /* Thread-directed job control still acts on the whole group: SIGSTOP and
+     * friends stop every task, SIGCONT lifts the group stop. SIGKILL only needs
+     * the target runnable and its parked wait woken so delivery can proceed.
+     */
+    if (signum == LINUX_SIGCONT)
+        signal_group_continue_job();
+    else if (signum == LINUX_SIGKILL)
+        sched_wake_parked_for_pending_signal();
+    else if (signal_is_stop_signal(signum))
+        signal_group_stop_job(signum);
 
     /* Wake signalfd waiters. Linux backs every signalfd with the one shared
      * sighand wait queue, so a queued signal (directed or not) wakes it and
@@ -858,10 +1061,13 @@ bool signal_queue_thread_info(int64_t tid,
 
 void signal_set_fault_info(int si_code, uint64_t addr, uint64_t esr)
 {
-    pending_fault.valid = true;
-    pending_fault.si_code = si_code;
-    pending_fault.addr = addr;
-    pending_fault.esr = esr;
+    thread_entry_t *t = current_thread;
+    if (!t)
+        return; /* A host thread with no guest task cannot fault for one. */
+    t->sig_fault_valid = true;
+    t->sig_fault_code = si_code;
+    t->sig_fault_addr = addr;
+    t->sig_fault_esr = esr;
 }
 
 int signal_pending(void)
@@ -912,15 +1118,81 @@ bool signal_attention_needed(void)
     return false;
 }
 
+/* True when signal_deliver() would dequeue @signum and discard it without the
+ * guest observing anything: SIG_IGN, or a SIG_DFL whose action is ignore, stop,
+ * or continue. Caller holds sig_lock; @signum is 1..LINUX_NSIG.
+ */
+static bool signal_delivery_discards_locked(int signum)
+{
+    linux_sigaction_t *act = &sig_state.actions[signum - 1];
+    if (act->sa_handler == LINUX_SIG_IGN)
+        return true;
+    if (act->sa_handler != LINUX_SIG_DFL)
+        return false;
+    sig_disposition_t disp = signal_default_disposition(signum);
+    return disp == SIG_DISP_IGN || disp == SIG_DISP_CONT ||
+           disp == SIG_DISP_STOP;
+}
+
+/* The signal signal_deliver() will run next, in its own dequeue order: a shared
+ * signal claimed for this thread's temporary mask first, then the private
+ * pending set, then the shared set, lowest number in each, skipping the
+ * dispositions delivery discards.
+ *
+ * Returns 0 when nothing would reach a handler or a terminating default action.
+ *
+ * This is deliberately narrower than "anything pending". A wait that wakes on
+ * an interrupting signal has to be classified by the handler the guest will
+ * actually run: a second pending signal with different SA_RESTART flags is not
+ * what the syscall epilogue is about to deliver. Caller holds sig_lock.
+ */
+static int signal_next_delivery_locked(thread_entry_t *t, uint64_t blocked)
+{
+    signal_pending_t *tp = t ? &t->tpending : NULL;
+    uint64_t thread_d = tp ? (pending_load(&tp->pending) & ~blocked) : 0;
+    uint64_t shared_d = shared_visible_for_locked(t) & ~blocked;
+
+    /* signal_deliver_one prefers a shared signal this thread already claimed
+     * for a saved temporary mask, because that frame has to carry the mask the
+     * wait installed. A discarded claim is dequeued and ignored there, so the
+     * same skip applies here.
+     */
+    if (tp && *thread_saved_valid_ptr()) {
+        for (uint64_t c = shared_claimed & shared_d; c; c &= c - 1) {
+            int idx = bit_ctz64(c);
+            if (shared_claim_owner[idx] != t)
+                continue;
+            if (!signal_delivery_discards_locked(idx + 1))
+                return idx + 1;
+        }
+    }
+
+    for (int pass = 0; pass < 2; pass++) {
+        uint64_t bits = pass == 0 ? thread_d : shared_d;
+        for (; bits; bits &= bits - 1) {
+            int idx = bit_ctz64(bits);
+            if (!RANGE_CHECK(idx, 0, LINUX_NSIG))
+                return idx + 1; /* malformed set: let the wait escape */
+            if (!signal_delivery_discards_locked(idx + 1))
+                return idx + 1;
+        }
+    }
+    return 0;
+}
+
 bool signal_pending_interruption(bool *restart_out)
+{
+    return signal_pending_interruption_for(current_thread, restart_out);
+}
+
+bool signal_pending_interruption_for(thread_entry_t *t, bool *restart_out)
 {
     /* Same lock-free fast path as signal_pending(): the fd waits ask this
      * before every host wait.
      */
     uint64_t hint =
         atomic_load_explicit(&sig_pending_hint, memory_order_acquire);
-    uint64_t hint_blocked =
-        atomic_load_explicit(thread_blocked_ptr(), memory_order_acquire);
+    uint64_t hint_blocked = t ? thread_blocked_load(t) : signal_blocked_load();
     if ((hint & ~hint_blocked) == 0) {
         if (restart_out)
             *restart_out = false;
@@ -928,58 +1200,25 @@ bool signal_pending_interruption(bool *restart_out)
     }
 
     pthread_mutex_lock(&sig_lock);
-    uint64_t blocked =
-        atomic_load_explicit(thread_blocked_ptr(), memory_order_acquire);
-    uint64_t deliverable = self_pending_locked() & ~blocked;
-    if (deliverable == 0) {
-        pthread_mutex_unlock(&sig_lock);
-        if (restart_out)
-            *restart_out = false;
-        return false;
-    }
+    uint64_t blocked = t ? thread_blocked_load(t) : signal_blocked_load();
+    int signum = signal_next_delivery_locked(t, blocked);
+    bool interrupt = signum != 0;
+    bool restarts = false;
+    if (interrupt && RANGE_CHECK(signum - 1, 0, LINUX_NSIG)) {
+        linux_sigaction_t *act = &sig_state.actions[signum - 1];
 
-    /* Ignored/default-ignore signals are discarded by signal_deliver and must
-     * not interrupt waits. Any guest-visible delivery must escape the wait so
-     * the syscall epilogue can run the handler/default action; restart_out only
-     * tells FUSE whether all visible handlers are SA_RESTART.
-     */
-    bool any_interrupt = false;
-    bool all_restart = true;
-    uint64_t bits = deliverable;
-    while (bits) {
-        int idx = bit_ctz64(bits);
-        bits &= bits - 1;
-        if (!RANGE_CHECK(idx, 0, LINUX_NSIG)) {
-            any_interrupt = true;
-            all_restart = false;
-            break;
-        }
-        linux_sigaction_t *act = &sig_state.actions[idx];
-        if (act->sa_handler == LINUX_SIG_IGN) {
-            continue;
-        } else if (act->sa_handler == LINUX_SIG_DFL) {
-            /* Mirror signal_deliver's SIG_DFL switch: IGN, CONT, and STOP are
-             * all discarded with no guest-visible effect on elfuse (STOP/CONT
-             * are not meaningful here), so they cannot legitimately interrupt a
-             * wait.
-             */
-            sig_disposition_t disp = signal_default_disposition(idx + 1);
-            if (disp == SIG_DISP_IGN || disp == SIG_DISP_CONT ||
-                disp == SIG_DISP_STOP)
-                continue;
-            any_interrupt = true;
-            all_restart = false;
-        } else {
-            any_interrupt = true;
-            if ((act->sa_flags & LINUX_SA_RESTART) == 0)
-                all_restart = false;
-        }
+        /* Only a handler can restart a wait, and only when it asked for
+         * SA_RESTART. A terminating default action ends the process before any
+         * restart could run; discarded dispositions were filtered by the scan
+         * above.
+         */
+        restarts = act->sa_handler != LINUX_SIG_DFL &&
+                   (act->sa_flags & LINUX_SA_RESTART) != 0;
     }
-
     pthread_mutex_unlock(&sig_lock);
     if (restart_out)
-        *restart_out = any_interrupt && all_restart;
-    return any_interrupt;
+        *restart_out = restarts;
+    return interrupt;
 }
 
 void signal_get_state(signal_state_snapshot_t *state)
@@ -1316,6 +1555,32 @@ void signal_restore_saved_blocked(void)
     pthread_mutex_unlock(&sig_lock);
 }
 
+static void posix_timer_refresh_poll_hint_locked(void);
+
+/* Per-thread CPU timers die with their target task: the clock stops advancing,
+ * so Linux leaves the timer existing but unable to fire. Disarm it and drop a
+ * queued notification it owns, so a later timer_gettime reports a stopped timer
+ * instead of a pending one.
+ */
+static void posix_timer_drop_task_locked(int32_t tid)
+{
+    if (tid <= 0)
+        return;
+    bool changed = false;
+    for (int i = 0; i < POSIX_TIMER_MAX; i++) {
+        guest_posix_timer_t *timer = &posix_timers[i];
+        if (!timer->used || timer->cpu_target_tid != tid)
+            continue;
+        posix_timer_discard_pending_locked(&sig_state.shared, timer->id);
+        timer->expiry_ns = 0;
+        timer->interval_ns = 0;
+        timer->notification = POSIX_TIMER_NONE;
+        changed = true;
+    }
+    if (changed)
+        posix_timer_refresh_poll_hint_locked();
+}
+
 void signal_release_claims(struct thread_entry *t)
 {
     if (!t)
@@ -1330,6 +1595,8 @@ void signal_release_claims(struct thread_entry *t)
             released = true;
         }
     }
+    posix_timer_drop_task_locked(
+        (int32_t) atomic_load_explicit(&t->guest_tid, memory_order_relaxed));
     pthread_mutex_unlock(&sig_lock);
 
     /* A released signal is visible to the other threads again; wake the ones
@@ -1459,8 +1726,10 @@ void signal_set_itimer(const struct timeval *value,
      * handled by signal_attention_needed returning false at the next HVC
      * epilogue recompute -- no explicit clear here.
      */
-    if (arm)
+    if (arm) {
         attention_raise();
+        sched_kick_wait_timer();
+    }
 }
 
 void signal_get_itimer(struct timeval *value, struct timeval *interval)
@@ -1485,11 +1754,66 @@ void signal_get_itimer(struct timeval *value, struct timeval *interval)
     pthread_mutex_unlock(&sig_lock);
 }
 
+static bool posix_timer_is_cpu_clock(int guest_clockid);
+
+
 static int64_t posix_timer_now(clockid_t clockid)
 {
     struct timespec now;
     clock_gettime(clockid, &now);
     return timespec_to_ns_sat(now.tv_sec, now.tv_nsec);
+}
+
+/* Guest CPU clocks come from the scheduler ledger, never host CLOCK_*_CPUTIME:
+ * macOS THREAD_CPUTIME is calling-thread only, and PROCESS_CPUTIME includes
+ * SoftNS host workers (slice timer). VIRT charges guest execution only;
+ * PROF/SCHED charge guest execution plus service.
+ */
+static bool posix_timer_clock_is_perthread(int guest_clockid)
+{
+    int type;
+    bool per_thread;
+    int32_t target;
+    if (!linux_cpuclock_decode(guest_clockid, &type, &per_thread, &target))
+        return false;
+    return per_thread;
+}
+
+static int64_t posix_timer_cpu_now_ns(const guest_posix_timer_t *timer)
+{
+    int type;
+    bool per_thread;
+    int32_t target;
+    if (!linux_cpuclock_decode(timer->guest_clockid, &type, &per_thread,
+                               &target))
+        return 0;
+
+    uint64_t user_ns = 0, sys_ns = 0;
+    if (per_thread) {
+        int32_t tid = timer->cpu_target_tid;
+        if (tid == 0)
+            return 0; /* Target thread is gone; the clock no longer advances. */
+        /* Lifetime pin: a concurrent exit may otherwise reuse this slot while
+         * the poll samples it. Never hold this across a park (thread_lock ranks
+         * after sig_lock; the Core thread-table walk owns that order).
+         */
+        thread_entry_t *t = thread_acquire_tid(tid);
+        if (!t)
+            return 0;
+        if (!t->is_vm_clone)
+            sched_thread_cputime_split_ns(t, &user_ns, &sys_ns);
+        thread_release(t);
+    } else {
+        thread_process_cputime_split_ns(&user_ns, &sys_ns);
+    }
+    return (int64_t) (type == LINUX_CPUCLOCK_VIRT ? user_ns : user_ns + sys_ns);
+}
+
+static int64_t posix_timer_now_for(const guest_posix_timer_t *timer)
+{
+    if (posix_timer_is_cpu_clock(timer->guest_clockid))
+        return posix_timer_cpu_now_ns(timer);
+    return posix_timer_now(timer->host_clock);
 }
 
 static void posix_timer_refresh_poll_hint_locked(void)
@@ -1510,7 +1834,7 @@ static uint64_t posix_timer_advance_locked(guest_posix_timer_t *timer)
 {
     if (!timer->used || !timer->expiry_ns)
         return 0;
-    int64_t now = posix_timer_now(timer->host_clock);
+    int64_t now = posix_timer_now_for(timer);
     if (now < timer->expiry_ns)
         return 0;
     if (!timer->interval_ns) {
@@ -1532,7 +1856,7 @@ static void posix_timer_value_locked(guest_posix_timer_t *timer,
     /* Silent timers have no delivery work, so advance them only on query. */
     if (!timer->signum)
         posix_timer_advance_locked(timer);
-    int64_t now = posix_timer_now(timer->host_clock);
+    int64_t now = posix_timer_now_for(timer);
     int64_t remaining = timer->expiry_ns > now ? timer->expiry_ns - now : 0;
     *value = (linux_itimerspec_t) {
         .it_interval_sec = timer->interval_ns / NSEC_PER_SEC,
@@ -1563,6 +1887,15 @@ static void posix_timer_update_pending_locked(const guest_posix_timer_t *timer)
     }
 }
 
+static bool posix_timer_is_cpu_clock(int guest_clockid)
+{
+    int type;
+    bool per_thread;
+    int32_t target;
+    return linux_cpuclock_decode(guest_clockid, &type, &per_thread, &target);
+}
+
+
 static bool posix_timer_enqueue_waiting_locked(int signum)
 {
     bool queued = false;
@@ -1581,13 +1914,60 @@ static bool posix_timer_enqueue_waiting_locked(int signum)
         /* Each timer retains its notification until the shared queue has room,
          * including when another timer holds the same standard signal.
          */
+        signal_pending_t *dest = &sig_state.shared;
+        int32_t dest_tid = timer->notify_tid;
+
+        /* Process CPU timers must not use the shared set: a sleeping leader
+         * would steal SIGALRM (ks-posix_timers check_timer_distribution).
+         * Prefer the thread that is polling right now (the busy runner); the
+         * slice-timer quiet path has no current_thread, so fall back to the
+         * creator (the arming thread in that test).
+         */
+        if (!dest_tid && posix_timer_is_cpu_clock(timer->guest_clockid)) {
+            if (!posix_timer_clock_is_perthread(timer->guest_clockid)) {
+                if (current_thread) {
+                    dest_tid = (int32_t) atomic_load_explicit(
+                        &current_thread->guest_tid, memory_order_relaxed);
+                } else {
+                    dest_tid = (int32_t) thread_find_running_tid();
+                }
+            }
+            if (!dest_tid)
+                dest_tid = timer->creator_tid;
+        }
+        if (dest_tid) {
+            /* sig_lock serializes tpending; lock-free TID scan avoids nesting
+             * thread_lock (slice-timer quiet path would ABBA-deadlock).
+             */
+            thread_entry_t *target = thread_find_relaxed(dest_tid);
+            if (!target) {
+                timer->notification = POSIX_TIMER_NONE;
+                continue;
+            }
+            dest = &target->tpending;
+        }
+
+        /* Per-dest pending: another timer (or thread) may still need this
+         * signum on a different tpending. Do not abort the whole scan.
+         */
         if (signum < LINUX_SIGRTMIN &&
-            (pending_load(&sig_state.shared.pending) & sig_bit(signum)))
-            break;
+            (pending_load(&dest->pending) & sig_bit(signum)))
+            continue;
         if (signum >= LINUX_SIGRTMIN &&
-            sig_state.shared.rt_queue[signum - LINUX_SIGRTMIN] >=
-                RT_SIGQUEUE_MAX)
-            break;
+            dest->rt_queue[signum - LINUX_SIGRTMIN] >= RT_SIGQUEUE_MAX)
+            continue;
+
+        /* SIG_IGN: do not queue; fold this fire into overruns so a later
+         * handler restore + unblock still sees ks-posix_timers' coalesced
+         * overrun count (check_sig_ign SIGEV_SIGNAL).
+         */
+        if (sig_state.actions[signum - 1].sa_handler == LINUX_SIG_IGN) {
+            if (timer->overruns < INT32_MAX)
+                timer->overruns++;
+            timer->notification = POSIX_TIMER_NONE;
+            posix_timer_next_slot[signum - 1] = (i + 1) % POSIX_TIMER_MAX;
+            continue;
+        }
         signal_rt_info_t info = {
             .signum = timer->signum,
             .si_code = LINUX_SI_TIMER,
@@ -1596,7 +1976,7 @@ static bool posix_timer_enqueue_waiting_locked(int signum)
             .si_int = (int32_t) timer->value,
             .si_ptr = timer->value,
         };
-        signal_enqueue_locked(&sig_state.shared, timer->signum, &info);
+        signal_enqueue_locked(dest, timer->signum, &info);
         timer->notification = POSIX_TIMER_QUEUED;
         posix_timer_next_slot[signum - 1] = (i + 1) % POSIX_TIMER_MAX;
         queued = true;
@@ -1604,7 +1984,43 @@ static bool posix_timer_enqueue_waiting_locked(int signum)
     return queued;
 }
 
-static void posix_timer_check(void)
+/* Tasks a process-directed timer notification can actually reach. Linux's
+ * complete_signal() picks a task that leaves the signal unblocked; a group that
+ * blocks it everywhere (a signalfd reader is the usual case) has nothing to
+ * wake. Called from thread_for_each, so it must not take sig_lock or any
+ * blocking park lock; it only collects the targets' home slots.
+ */
+typedef struct {
+    uint64_t signums;
+    int self_cpu;
+    int slots[SCHED_MAX_CPUS];
+    int n;
+} timer_kick_scan_t;
+
+static void timer_kick_scan_one(thread_entry_t *t, void *ctx)
+{
+    timer_kick_scan_t *scan = ctx;
+    if (!t || t == current_thread || t->is_vm_clone)
+        return; /* Own pending set drains on this thread's return tail. */
+    if ((scan->signums & ~thread_blocked_load(t)) == 0)
+        return; /* Blocks every queued notification: nothing to deliver. */
+    int slot = sched_thread_cpu(t);
+    if (slot < 0 || slot == scan->self_cpu)
+        return;
+    for (int k = 0; k < scan->n; k++) {
+        if (scan->slots[k] == slot)
+            return;
+    }
+    if (scan->n < SCHED_MAX_CPUS)
+        scan->slots[scan->n++] = slot;
+}
+
+/* Advance and enqueue expired POSIX timers. When raise is false, skip
+ * attention_raise, for slice-timer park deadlines that would deadlock on
+ * thread_interrupt_all (same contract as signal_check_timer_real_quiet). Claim
+ * + remount deliver the pending signal to the parked sleeper.
+ */
+static void posix_timer_check_ex(bool raise)
 {
     if (!atomic_load_explicit(&posix_timers_need_poll, memory_order_acquire))
         return;
@@ -1640,25 +2056,182 @@ static void posix_timer_check(void)
     pthread_mutex_unlock(&sig_lock);
     for (uint64_t pending = notify; pending; pending &= pending - 1)
         signalfd_notify(bit_ctz64(pending) + 1);
-    if (notify)
-        attention_raise();
+
+    /* A QUEUED timer whose pending bit is still set never re-enters notify
+     * (standard signals cannot double-queue), so the first queue's wake does
+     * not cover a target that is still executing guest code. Kick only real
+     * delivery targets:
+     *
+     * - SIGEV_THREAD_ID and CPU-clock timers name a thread; kick that task so
+     *    a busy-loop target leaves hv_vcpu_run and drains its private set.
+     * - A process-directed timer needs a task that leaves the signal
+     *    unblocked, the task Linux's complete_signal() would pick. When every
+     *    task blocks it there is no vCPU to wake: signalfd_notify above wrote
+     *    the reader's pipe, wakeup_pipe_signal below reaches IO parks, and the
+     *    slice wall/CPU tick drains it once it becomes deliverable.
+     *
+     * Never kick this poll's own vCPU. The poll runs in a vCPU's syscall return
+     * tail and again from its tick, and that tail delivers the caller's own
+     * pending set. hv_vcpus_exit on a vCPU caught between runs makes the next
+     * hv_vcpu_run return CANCELED, whose handler repeats this poll: a
+     * self-directed kick around a notification only the guest can consume
+     * (blocked signalfd) would keep the guest from ever running the read, and
+     * the guest starves.
+     */
+    int kick_slots[SCHED_MAX_CPUS];
+    int kick_n = 0;
+    bool need_wake = false;
+    uint64_t unblocked_bits = 0;
+    int self_cpu = vcpu_pool_current_cpu();
+    pthread_mutex_lock(&sig_lock);
+    for (int i = 0; i < POSIX_TIMER_MAX; i++) {
+        guest_posix_timer_t *timer = &posix_timers[i];
+        if (!timer->used || !timer->signum ||
+            timer->notification != POSIX_TIMER_QUEUED)
+            continue;
+        int32_t tid = timer->notify_tid;
+        if (!tid && posix_timer_is_cpu_clock(timer->guest_clockid))
+            tid = timer->creator_tid;
+        if (!tid) {
+            unblocked_bits |= sig_bit(timer->signum);
+            continue;
+        }
+        need_wake = true;
+        thread_entry_t *t = thread_acquire_tid(tid);
+        if (!t)
+            continue;
+        int slot = sched_thread_cpu(t);
+        thread_release(t);
+        if (slot < 0 || slot == self_cpu)
+            continue;
+        bool seen = false;
+        for (int k = 0; k < kick_n; k++) {
+            if (kick_slots[k] == slot) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen && kick_n < (int) (sizeof kick_slots / sizeof kick_slots[0]))
+            kick_slots[kick_n++] = slot;
+    }
+    pthread_mutex_unlock(&sig_lock);
+
+    if (unblocked_bits) {
+        timer_kick_scan_t scan = {
+            .signums = unblocked_bits,
+            .self_cpu = self_cpu,
+        };
+        thread_for_each_ref(timer_kick_scan_one, &scan);
+        for (int k = 0; k < scan.n; k++) {
+            int slot = scan.slots[k];
+            bool seen = false;
+            for (int j = 0; j < kick_n; j++) {
+                if (kick_slots[j] == slot) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen &&
+                kick_n < (int) (sizeof kick_slots / sizeof kick_slots[0]))
+                kick_slots[kick_n++] = slot;
+        }
+        need_wake |= scan.n > 0;
+    }
+
+    if (!notify && !need_wake)
+        return;
+
+    /* Never attention_raise from the posix-timer poll paths. With a sibling
+     * parked in pthread_join, thread_interrupt_all deadlocks the arming/check
+     * vCPU (ks-posix_timers check_timer_distribution). Kick the target's home
+     * slot instead; canceled_exit / tick drain signal_pending there. The
+     * process-wide wakeup pipe still reaches parked IO/futex waiters.
+     */
+    (void) raise;
+    for (int k = 0; k < kick_n; k++)
+        vcpu_pool_kick_cpu(kick_slots[k]);
+    wakeup_pipe_signal();
+}
+
+static void posix_timer_check(void)
+{
+    posix_timer_check_ex(true);
+}
+
+static void posix_timer_check_quiet(void)
+{
+    posix_timer_check_ex(false);
+}
+
+/* Linux CPUCLOCK encoding (see kernel posix-cpu-timers):
+ *   clockid = (~pid << 3) | which | (perthread ? 4 : 0)
+ * glibc turns CLOCK_THREAD_CPUTIME_ID into MAKE_THREAD_CPUCLOCK(0, SCHED)=-2
+ * and CLOCK_PROCESS_CPUTIME_ID into MAKE_PROCESS_CPUCLOCK(0, SCHED)=-6. pid==0
+ * means "current". Reject other pids for now.
+ */
+static bool posix_timer_clock_ok(int clockid)
+{
+    if (clockid == LINUX_CLOCK_REALTIME || clockid == LINUX_CLOCK_MONOTONIC ||
+        clockid == LINUX_CLOCK_BOOTTIME || clockid == LINUX_CLOCK_TAI)
+        return true;
+
+    int type;
+    bool per_thread;
+    int32_t target;
+    if (!linux_cpuclock_decode(clockid, &type, &per_thread, &target))
+        return false;
+    (void) type;
+    if (!per_thread) {
+        /* Process clocks name this VM's thread group (0 = self). */
+        return target == 0 || target == (int32_t) proc_get_pid();
+    }
+    if (target == 0)
+        return current_thread != NULL; /* Self: the calling task. */
+    thread_entry_t *t = thread_acquire_tid(target);
+    bool ok = t && !t->is_vm_clone;
+    thread_release(t);
+    return ok;
+}
+
+static clockid_t posix_timer_host_clock(int guest_clockid, bool absolute)
+{
+    /* CPU clocks are served from the scheduler ledger by
+     * posix_timer_cpu_now_ns(); the host clock value stays valid but unused.
+     */
+    if (absolute && (guest_clockid == LINUX_CLOCK_REALTIME ||
+                     guest_clockid == LINUX_CLOCK_TAI))
+        return CLOCK_REALTIME;
+    return CLOCK_MONOTONIC;
 }
 
 int signal_posix_timer_create(int clockid,
                               int notify,
                               int signum,
                               uint64_t value,
+                              int32_t notify_tid,
                               bool default_event)
 {
-    if (clockid != LINUX_CLOCK_REALTIME && clockid != LINUX_CLOCK_MONOTONIC &&
-        clockid != LINUX_CLOCK_BOOTTIME)
+    if (!posix_timer_clock_ok(clockid))
         return -LINUX_EINVAL;
-    if (notify == LINUX_SIGEV_THREAD_ID)
-        return -LINUX_ENOSYS;
-    if (notify != LINUX_SIGEV_SIGNAL && notify != LINUX_SIGEV_NONE)
+    if (notify != LINUX_SIGEV_SIGNAL && notify != LINUX_SIGEV_NONE &&
+        notify != LINUX_SIGEV_THREAD_ID)
         return -LINUX_EINVAL;
-    if (notify == LINUX_SIGEV_SIGNAL && !RANGE_CHECK(signum, 1, LINUX_NSIG))
+    bool wants_signal =
+        notify == LINUX_SIGEV_SIGNAL || notify == LINUX_SIGEV_THREAD_ID;
+    if (wants_signal && !RANGE_CHECK(signum, 1, LINUX_NSIG))
         return -LINUX_EINVAL;
+    if (notify == LINUX_SIGEV_THREAD_ID && notify_tid <= 0)
+        return -LINUX_EINVAL;
+
+    /* A per-thread CPU clock with target 0 names the creating task; any other
+     * target is the TID encoded by pthread_getcpuclockid(). Process clocks keep
+     * cpu_target_tid 0 and read the group ledger.
+     */
+    int cpu_type;
+    bool cpu_per_thread = false;
+    int32_t cpu_target = 0;
+    bool cpu_clock =
+        linux_cpuclock_decode(clockid, &cpu_type, &cpu_per_thread, &cpu_target);
     int ret = -LINUX_EAGAIN;
     pthread_mutex_lock(&sig_lock);
     for (int i = 0; i < POSIX_TIMER_MAX; i++) {
@@ -1668,11 +2241,20 @@ int signal_posix_timer_create(int clockid,
             ret = posix_next_id;
             posix_next_id = ret == INT32_MAX ? 0 : ret + 1;
         } while (posix_timer_find_locked(ret));
+        int32_t creator = 0;
+        if (current_thread)
+            creator = (int32_t) atomic_load_explicit(&current_thread->guest_tid,
+                                                     memory_order_relaxed);
         posix_timers[i] = (guest_posix_timer_t) {
             .id = ret,
             .guest_clockid = clockid,
             .host_clock = CLOCK_MONOTONIC,
-            .signum = notify == LINUX_SIGEV_SIGNAL ? signum : 0,
+            .signum = wants_signal ? signum : 0,
+            .notify_tid = notify == LINUX_SIGEV_THREAD_ID ? notify_tid : 0,
+            .cpu_target_tid = (cpu_clock && cpu_per_thread)
+                                  ? (cpu_target ? cpu_target : creator)
+                                  : 0,
+            .creator_tid = creator,
             .value = default_event ? (uint64_t) ret : value,
             .used = true,
         };
@@ -1716,25 +2298,33 @@ int signal_posix_timer_set(int id,
     timer->last_overrun = 0;
     bool absolute = (flags & LINUX_TIMER_ABSTIME) != 0;
     /* Relative realtime timers must ignore wall-clock adjustments. */
-    timer->host_clock = absolute && timer->guest_clockid == LINUX_CLOCK_REALTIME
-                            ? CLOCK_REALTIME
-                            : CLOCK_MONOTONIC;
+    timer->host_clock = posix_timer_host_clock(timer->guest_clockid, absolute);
     int64_t value_ns =
         timespec_to_ns_sat(value->it_value_sec, value->it_value_nsec);
     timer->expiry_ns = value_ns;
     if (value_ns && !absolute &&
-        __builtin_add_overflow(posix_timer_now(timer->host_clock), value_ns,
+        __builtin_add_overflow(posix_timer_now_for(timer), value_ns,
                                &timer->expiry_ns))
         timer->expiry_ns = INT64_MAX;
     timer->interval_ns = value_ns ? timespec_to_ns_sat(value->it_interval_sec,
                                                        value->it_interval_nsec)
                                   : 0;
-    bool notify = value_ns && timer->signum;
     posix_timer_refresh_poll_hint_locked();
     refresh_pending_hint_locked();
+    bool due = false;
+    if (value_ns && timer->signum)
+        due = posix_timer_now_for(timer) >= timer->expiry_ns;
     pthread_mutex_unlock(&sig_lock);
-    if (notify)
-        attention_raise();
+
+    /* Do not attention_raise on every arm: with a sibling parked in join,
+     * thread_interrupt_all from the arming vCPU deadlocks (ks-posix_timers
+     * check_timer_distribution). Due timers are flushed via posix_timer_check
+     * below; future CPU/mono timers rely on slice cancel / wall deadline wakes.
+     */
+    if (value_ns)
+        sched_kick_wait_timer();
+    if (due)
+        posix_timer_check();
     return 0;
 }
 
@@ -1781,22 +2371,54 @@ static bool check_one_timer(guest_itimer_t *timer, const struct timeval *now)
     return true; /* expired */
 }
 
-/* cpu_timers selects whether ITIMER_VIRTUAL and ITIMER_PROF are advanced along
- * with ITIMER_REAL. All three are measured against the monotonic clock here,
- * which is an approximation for the two that Linux charges to CPU time, and it
- * only holds where the guest was actually running. A caller parked in a host
- * wait burns no guest CPU, so advancing them there would expire a virtual timer
- * out of wall clock the guest never spent.
- *
- * This narrows that error, it does not remove it. The expiry stays an absolute
- * monotonic instant, so a wait that spans it still leaves it expired, and the
- * next full check delivers SIGVTALRM or SIGPROF for time the guest did not
- * execute. Skipping the check inside the wait only stops the signal landing
- * while the thread is parked. Removing the error needs guest CPU-time
- * accounting, so that a wait can hold both timers rather than merely decline to
- * read them, and elfuse tracks no such clock today. ITIMER_REAL is exact either
- * way, because wall clock is what it counts.
+/* Process CPU time for ITIMER_VIRTUAL (which 1, guest execution only) and
+ * ITIMER_PROF (which 2, execution plus host syscall service). This is the same
+ * ledger the scheduler charges and the CPU clocks report, so neither timer can
+ * expire from wall time the guest never executed.
  */
+static int64_t itimer_cpu_now_ns(int which)
+{
+    uint64_t user_ns, sys_ns;
+    thread_process_cputime_split_ns(&user_ns, &sys_ns);
+    return (int64_t) (which == 1 ? user_ns : user_ns + sys_ns);
+}
+
+/* Returns true when the timer fired. Must be called with sig_lock held. */
+static bool check_one_cpu_timer(guest_cpu_itimer_t *timer, int64_t now_ns)
+{
+    if (!atomic_load_explicit(&timer->active, memory_order_relaxed))
+        return false;
+    if (now_ns < timer->expiry_ns)
+        return false;
+
+    if (timer->interval_ns > 0) {
+        int64_t elapsed = now_ns - timer->expiry_ns;
+        int64_t delta = (elapsed / timer->interval_ns + 1) * timer->interval_ns;
+        if (__builtin_add_overflow(timer->expiry_ns, delta, &timer->expiry_ns))
+            timer->expiry_ns = INT64_MAX;
+    } else {
+        atomic_store_explicit(&timer->active, 0, memory_order_release);
+    }
+    return true;
+}
+static void signal_enqueue_pending_nosignal(int signum)
+{
+    /* Enqueue into the shared pending set without attention_raise /
+     * thread_interrupt_all. Used when the caller already runs outside a mounted
+     * vCPU (slice-timer park deadlines): raising attention from that thread
+     * deadlocks in thread_interrupt_all / HVF, and the parked target is
+     * unmounted so a vCPU kick would not reach it anyway. The caller claims and
+     * completes the park; remount delivers.
+     */
+    if (signum < 1 || signum > LINUX_NSIG)
+        return;
+    pthread_mutex_lock(&sig_lock);
+    signal_enqueue_locked(&sig_state.shared, signum, NULL);
+    refresh_pending_hint_locked();
+    pthread_mutex_unlock(&sig_lock);
+    signalfd_notify(signum);
+}
+
 static void signal_check_timers(bool cpu_timers)
 {
     posix_timer_check();
@@ -1808,16 +2430,21 @@ static void signal_check_timers(bool cpu_timers)
         return;
 
     struct timeval now = monotonic_now();
+    int64_t cpu_now_virt = 0, cpu_now_prof = 0;
+    if (cpu_timers) {
+        cpu_now_virt = itimer_cpu_now_ns(1);
+        cpu_now_prof = itimer_cpu_now_ns(2);
+    }
     int sig_real = 0, sig_virt = 0, sig_prof = 0;
 
     pthread_mutex_lock(&sig_lock);
     if (check_one_timer(&guest_itimer, &now))
         sig_real = LINUX_SIGALRM;
     if (cpu_timers) {
-        if (check_one_timer(&guest_itimer_virt, &now))
-            sig_virt = 26; /* SIGVTALRM */
-        if (check_one_timer(&guest_itimer_prof, &now))
-            sig_prof = 27; /* SIGPROF */
+        if (check_one_cpu_timer(&guest_itimer_virt, cpu_now_virt))
+            sig_virt = LINUX_SIGVTALRM;
+        if (check_one_cpu_timer(&guest_itimer_prof, cpu_now_prof))
+            sig_prof = LINUX_SIGPROF;
     }
     pthread_mutex_unlock(&sig_lock);
 
@@ -1840,34 +2467,135 @@ void signal_check_timer_real(void)
     signal_check_timers(false);
 }
 
-/* Set/get ITIMER_VIRTUAL (which=1) or ITIMER_PROF (which=2) */
+/* Materialize ITIMER_REAL into a pending SIGALRM without kicking vCPUs. For
+ * async park deadline handlers on the slice-timer thread (see
+ * signal_enqueue_pending_nosignal).
+ */
+void signal_check_timer_real_quiet(void)
+{
+    /* Quiet for both POSIX timers and ITIMER_REAL: this runs on the slice-timer
+     * thread, where the attention_raise to thread_interrupt_all call would
+     * deadlock; park deadline handlers claim + complete instead.
+     */
+    posix_timer_check_quiet();
+    if (!atomic_load_explicit(&guest_itimer.active, memory_order_acquire))
+        return;
+
+    struct timeval now = monotonic_now();
+    int sig_real = 0;
+    pthread_mutex_lock(&sig_lock);
+    if (check_one_timer(&guest_itimer, &now))
+        sig_real = LINUX_SIGALRM;
+    pthread_mutex_unlock(&sig_lock);
+
+    if (sig_real)
+        signal_enqueue_pending_nosignal(sig_real);
+}
+
+uint64_t signal_next_wall_timer_deadline_ns(void)
+{
+    uint64_t nearest = UINT64_MAX;
+    struct timeval mono_tv = monotonic_now();
+    uint64_t mono_now = (uint64_t) mono_tv.tv_sec * (uint64_t) NSEC_PER_SEC +
+                        (uint64_t) mono_tv.tv_usec * 1000ULL;
+
+    pthread_mutex_lock(&sig_lock);
+    if (atomic_load_explicit(&guest_itimer.active, memory_order_relaxed)) {
+        uint64_t exp =
+            (uint64_t) guest_itimer.expiry.tv_sec * (uint64_t) NSEC_PER_SEC +
+            (uint64_t) guest_itimer.expiry.tv_usec * 1000ULL;
+        if (exp < nearest)
+            nearest = exp;
+    }
+    for (int i = 0; i < POSIX_TIMER_MAX; i++) {
+        guest_posix_timer_t *timer = &posix_timers[i];
+        if (!timer->used || !timer->signum || !timer->expiry_ns)
+            continue;
+
+        /* CPU-clock expiry is on_cpu_ns, not wall time. Treating it as mono
+         * made the slice timer spin (expiry << mono_now) and starve guests.
+         */
+        if (posix_timer_is_cpu_clock(timer->guest_clockid))
+            continue;
+        uint64_t exp_mono;
+        if (timer->host_clock == CLOCK_REALTIME) {
+            int64_t rt_now = posix_timer_now(CLOCK_REALTIME);
+            int64_t delta = timer->expiry_ns - rt_now;
+            if (delta <= 0)
+                exp_mono = mono_now;
+            else if (__builtin_add_overflow(mono_now, (uint64_t) delta,
+                                            &exp_mono))
+                exp_mono = UINT64_MAX;
+        } else {
+            /* CLOCK_MONOTONIC / similar: expiry_ns is already mono-based. */
+            if (timer->expiry_ns <= 0)
+                continue;
+            exp_mono = (uint64_t) timer->expiry_ns;
+        }
+        if (exp_mono < nearest)
+            nearest = exp_mono;
+    }
+    pthread_mutex_unlock(&sig_lock);
+    return nearest == UINT64_MAX ? 0 : nearest;
+}
+
+void signal_deliver_expired_wall_timers_quiet(void)
+{
+    signal_check_timer_real_quiet();
+    sched_wake_parked_for_pending_signal();
+}
+
+/* timeval <-> nanoseconds for the CPU-time interval timers. */
+static int64_t timeval_to_ns(const struct timeval *tv)
+{
+    return (int64_t) tv->tv_sec * 1000000000LL + (int64_t) tv->tv_usec * 1000LL;
+}
+
+static struct timeval ns_to_timeval(int64_t ns)
+{
+    if (ns < 0)
+        ns = 0;
+    return (struct timeval) {
+        .tv_sec = ns / 1000000000LL,
+        .tv_usec = (int) ((ns % 1000000000LL) / 1000),
+    };
+}
+
+/* Set/get ITIMER_VIRTUAL (which=1) or ITIMER_PROF (which=2). Both run on the
+ * process CPU ledger, so their expiry is CPU nanoseconds and a parked process
+ * cannot advance them.
+ */
 void signal_set_itimer_virt(int which,
                             const struct timeval *value,
                             const struct timeval *interval,
                             struct timeval *old_value,
                             struct timeval *old_interval)
 {
-    guest_itimer_t *timer =
+    guest_cpu_itimer_t *timer =
         (which == 1) ? &guest_itimer_virt : &guest_itimer_prof;
-    struct timeval now = monotonic_now();
+    bool arm = value && (value->tv_sec != 0 || value->tv_usec != 0);
+    int64_t now = itimer_cpu_now_ns(which);
 
     pthread_mutex_lock(&sig_lock);
     if (old_interval)
-        *old_interval = timer->interval;
+        *old_interval = ns_to_timeval(timer->interval_ns);
     if (old_value) {
+        int64_t remaining = 0;
         if (atomic_load_explicit(&timer->active, memory_order_relaxed) &&
-            timeval_cmp(&timer->expiry, &now) > 0)
-            *old_value = timeval_sub(&timer->expiry, &now);
-        else
-            *old_value = (struct timeval) {0, 0};
+            timer->expiry_ns > now)
+            remaining = timer->expiry_ns - now;
+        *old_value = ns_to_timeval(remaining);
     }
-    bool arm = value && (value->tv_sec != 0 || value->tv_usec != 0);
     if (value) {
         if (!arm) {
+            timer->interval_ns = 0;
             atomic_store_explicit(&timer->active, 0, memory_order_release);
         } else {
-            timer->expiry = timeval_add(&now, value);
-            timer->interval = interval ? *interval : (struct timeval) {0, 0};
+            if (__builtin_add_overflow(now, timeval_to_ns(value),
+                                       &timer->expiry_ns))
+                timer->expiry_ns = INT64_MAX;
+            timer->interval_ns =
+                interval ? timeval_to_ns(interval) : (int64_t) 0;
             atomic_store_explicit(&timer->active, 1, memory_order_release);
         }
     }
@@ -1881,24 +2609,31 @@ void signal_get_itimer_virt(int which,
                             struct timeval *value,
                             struct timeval *interval)
 {
-    guest_itimer_t *timer =
+    guest_cpu_itimer_t *timer =
         (which == 1) ? &guest_itimer_virt : &guest_itimer_prof;
 
     pthread_mutex_lock(&sig_lock);
     if (interval)
-        *interval = timer->interval;
+        *interval = ns_to_timeval(timer->interval_ns);
     if (value) {
+        int64_t remaining = 0;
         if (atomic_load_explicit(&timer->active, memory_order_relaxed)) {
-            struct timeval now = monotonic_now();
-            if (timeval_cmp(&timer->expiry, &now) > 0)
-                *value = timeval_sub(&timer->expiry, &now);
-            else
-                *value = (struct timeval) {0, 0};
-        } else {
-            *value = (struct timeval) {0, 0};
+            int64_t now = itimer_cpu_now_ns(which);
+            if (timer->expiry_ns > now)
+                remaining = timer->expiry_ns - now;
         }
+        *value = ns_to_timeval(remaining);
     }
     pthread_mutex_unlock(&sig_lock);
+}
+
+
+static void flush_thread_pending_one(thread_entry_t *th, void *ctx)
+{
+    int s = *(int *) ctx;
+    pending_clear(&th->tpending.pending, sig_bit(s));
+    if (s >= LINUX_SIGRTMIN)
+        th->tpending.rt_queue[s - LINUX_SIGRTMIN] = 0;
 }
 
 /* rt_sigaction. */
@@ -1964,6 +2699,33 @@ int64_t signal_rt_sigaction(guest_t *g,
             signum == LINUX_SIGCHLD &&
             sigaction_autoreaps_sigchld(&sig_state.actions[idx]);
         sig_state.actions[idx] = act;
+        /* Linux do_sigaction flushes pending when switching to SIG_IGN. */
+        if (act.sa_handler == LINUX_SIG_IGN) {
+            pending_clear(&sig_state.shared.pending, sig_bit(signum));
+            if (signum >= LINUX_SIGRTMIN) {
+                int rti = signum - LINUX_SIGRTMIN;
+                sig_state.shared.rt_queue[rti] = 0;
+            }
+            thread_for_each(flush_thread_pending_one, &signum);
+
+            /* Drop queued/waiting timer notifications. Fold the discarded
+             * pending expiration into overruns so a later handler restore +
+             * unblock still matches Linux's coalesced count (ks-posix_timers
+             * check_sig_ign expects signals==1 && overruns==29).
+             */
+            for (int ti = 0; ti < POSIX_TIMER_MAX; ti++) {
+                guest_posix_timer_t *tm = &posix_timers[ti];
+                if (!tm->used || tm->signum != signum)
+                    continue;
+                if (tm->notification == POSIX_TIMER_QUEUED ||
+                    tm->notification == POSIX_TIMER_WAITING) {
+                    if (tm->overruns < INT32_MAX)
+                        tm->overruns++;
+                }
+                tm->notification = POSIX_TIMER_NONE;
+            }
+            refresh_pending_hint_locked();
+        }
     }
 
     pthread_mutex_unlock(&sig_lock);
@@ -2096,21 +2858,27 @@ static int signal_first_waking_locked(uint64_t candidates)
  * thread-directed signal is already bound here. Without a thread to claim for
  * there is only one vCPU to race with. Caller holds sig_lock.
  */
-static int signal_claim_waking_locked(uint64_t blocked)
+static int signal_claim_waking_for_locked(thread_entry_t *t, uint64_t blocked)
 {
-    signal_pending_t *tp = current_thread ? &current_thread->tpending : NULL;
+    signal_pending_t *tp = t ? &t->tpending : NULL;
 
     int signum = signal_first_waking_locked(
         tp ? pending_load(&tp->pending) & ~blocked : 0);
     if (signum)
         return signum;
 
-    signum = signal_first_waking_locked(shared_visible_locked() & ~blocked);
-    if (signum && tp) {
+    signum =
+        signal_first_waking_locked(shared_visible_for_locked(t) & ~blocked);
+    if (signum && t) {
         shared_claimed |= sig_bit(signum);
-        shared_claim_owner[signum - 1] = current_thread;
+        shared_claim_owner[signum - 1] = t;
     }
     return signum;
+}
+
+static int signal_claim_waking_locked(uint64_t blocked)
+{
+    return signal_claim_waking_for_locked(current_thread, blocked);
 }
 
 bool signal_claim_interruption(void)
@@ -2127,6 +2895,33 @@ bool signal_claim_interruption(void)
     pthread_mutex_lock(&sig_lock);
     blocked = atomic_load_explicit(thread_blocked_ptr(), memory_order_acquire);
     bool claimed = signal_claim_waking_locked(blocked) != 0;
+    pthread_mutex_unlock(&sig_lock);
+    return claimed;
+}
+
+bool signal_claim_interruption_for(thread_entry_t *t)
+{
+    return signal_claim_interruption_for_ex(t, true);
+}
+
+/* poll_timers=false: caller already ran posix_timer_check_quiet / ITIMER quiet
+ * (slice-timer park deadlines must not attention_raise).
+ */
+bool signal_claim_interruption_for_ex(thread_entry_t *t, bool poll_timers)
+{
+    if (!t)
+        return false;
+    if (poll_timers)
+        posix_timer_check();
+    uint64_t hint =
+        atomic_load_explicit(&sig_pending_hint, memory_order_acquire);
+    uint64_t blocked = thread_blocked_load(t);
+    if ((hint & ~blocked) == 0)
+        return false;
+
+    pthread_mutex_lock(&sig_lock);
+    blocked = thread_blocked_load(t);
+    bool claimed = signal_claim_waking_for_locked(t, blocked) != 0;
     pthread_mutex_unlock(&sig_lock);
     return claimed;
 }
@@ -2222,7 +3017,14 @@ int64_t signal_rt_sigsuspend(guest_t *g, uint64_t mask_gva, uint64_t sigsetsize)
         pthread_mutex_unlock(&sig_lock);
     }
 
-    /* Always return -EINTR. */
+    /* Linux implements sigsuspend as ERESTARTNOHAND: a handler that runs
+     * returns EINTR to the guest whatever its SA_RESTART says, and only a wake
+     * with no handler restarts. This wait only breaks for a signal the guest
+     * can observe, so the handler case is the one that can reach here; forbid
+     * keeps the epilogue from turning the SA_RESTART handler into a re-entry of
+     * sigsuspend.
+     */
+    syscall_restart_forbid();
     return -LINUX_EINTR;
 
 #undef SIGSUSPEND_CHUNK_NS
@@ -2374,12 +3176,12 @@ int64_t signal_rt_sigtimedwait(guest_t *g,
             return -LINUX_EAGAIN;
 
         /* Exit if the process, or just this thread, is tearing down. The chunks
-         * already consumed above came out of the guest's timeout, so a restart
-         * of the original request would grant it the full span again.
+         * already consumed above came out of the guest's timeout, and Linux
+         * converts do_sigtimedwait's ERESTARTSYS to EINTR even without a
+         * timeout, so neither spelling restarts the original request.
          */
         if (thread_stop_requested()) {
-            if (has_timeout)
-                syscall_restart_forbid();
+            syscall_restart_forbid();
             return -LINUX_EINTR;
         }
 
@@ -2400,8 +3202,7 @@ int64_t signal_rt_sigtimedwait(guest_t *g,
             0;
         pthread_mutex_unlock(&sig_lock);
         if (interrupt) {
-            if (has_timeout)
-                syscall_restart_forbid();
+            syscall_restart_forbid();
             return -LINUX_EINTR;
         }
 
@@ -2632,24 +3433,49 @@ static void build_sigcontext_reserved(uint8_t *reserved,
  * does with an X8 the tracer writes back, are pre-existing and out of this
  * record's reach; docs/internals.md measures both.
  *
- * Per-vCPU: TLS, like cpu_tlbi_req and cpu_restart_req.
+ * Task-owned: a ptrace stop can unmount the worker between rt_sigreturn and the
+ * following signal delivery, and the resume may run on another worker.
  */
-static _Thread_local struct {
-    bool valid;
-    uint64_t elr; /* ELR_EL1 the value belongs to */
-    uint64_t x8;  /* what the guest had in X8 at that ELR */
-} sigreturn_x8;
 
 void signal_forget_sigreturn_x8(void)
 {
-    sigreturn_x8.valid = false;
+    if (current_thread)
+        current_thread->sigreturn_x8_valid = false;
 }
 
 void signal_repark_sigreturn_x8(hv_vcpu_t vcpu)
 {
-    if (!sigreturn_x8.valid)
+    thread_entry_t *t = current_thread;
+    if (!t || !t->sigreturn_x8_valid)
         return;
-    sigreturn_x8.elr = vcpu_get_sysreg(vcpu, HV_SYS_REG_ELR_EL1);
+    t->sigreturn_x8_elr = vcpu_get_sysreg(vcpu, HV_SYS_REG_ELR_EL1);
+}
+
+/* Resolve the live shim frame at SP_EL1, or NULL when SP_EL1 is outside the EL1
+ * stack slot region. The bound is the stack region rather than the shim data
+ * block that contains it: the block also holds the shim-globals cache at the
+ * bottom, and only the slots thread_alloc_sp_el1 carves from the top are stack.
+ * An SP_EL1 that is wrong but still inside the block would otherwise pass, and
+ * the write would land in that cache: silent corruption of live shim state
+ * where the whole point of the check is to report. thread_sp_el1_region derives
+ * the slots from the constants the allocator hands them out with.
+ */
+static uint8_t *shim_frame_at_sp(hv_vcpu_t vcpu, const guest_t *g)
+{
+    uint64_t sp_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_SP_EL1);
+    uint64_t lo, hi;
+
+    thread_sp_el1_region(g, &lo, &hi);
+    if (sp_el1 < lo || sp_el1 > hi - SHIM_FRAME_BYTES) {
+        /* Nothing that took an exception through the shim can be here. */
+        log_error(
+            "shim frame: SP_EL1 0x%llx is outside the EL1 stack region "
+            "[0x%llx, 0x%llx)",
+            (unsigned long long) sp_el1, (unsigned long long) lo,
+            (unsigned long long) hi);
+        return NULL;
+    }
+    return (uint8_t *) g->host_base + sp_el1;
 }
 
 /* Hand the shim the X8 that EL0 must see when it drops the frame it is holding,
@@ -2667,39 +3493,18 @@ void signal_repark_sigreturn_x8(hv_vcpu_t vcpu)
  * rebuilds the register set and always arrives through HVC #5. The BRK ptrace
  * stop on HVC #10 hands the registers to a tracer that may write them, and
  * handle_brk loads the frame without popping it.
- *
- * The bound is the EL1 stack region, not the shim data block that contains it.
- * The block holds the shim-globals cache at the bottom -- identity slots,
- * urandom ring, attention bitmask -- and only the slots thread_alloc_sp_el1
- * carves from the top are stack. An SP_EL1 that is wrong but still inside the
- * block would otherwise pass, and the write would land in that cache: silent
- * corruption of live shim state where the whole point of the check is to
- * report. thread_sp_el1_region derives the slots from the constants the
- * allocator hands them out with.
  */
 static void shim_publish_frame_x8(hv_vcpu_t vcpu,
                                   const guest_t *g,
                                   uint64_t x8_for_el0)
 {
-    uint64_t sp_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_SP_EL1);
-    uint64_t lo, hi;
-
-    thread_sp_el1_region(g, &lo, &hi);
-
-    if (sp_el1 < lo || sp_el1 > hi - SHIM_FRAME_BYTES) {
-        /* Nothing that took an exception through the shim can be here. Report
-         * it rather than write; the shim then hands EL0 the X8 the frame was
-         * entered with.
+    uint8_t *frame = shim_frame_at_sp(vcpu, g);
+    if (!frame) {
+        /* Reported by the resolver; the shim then hands EL0 the X8 the frame
+         * was entered with.
          */
-        log_error(
-            "shim frame: SP_EL1 0x%llx is outside the EL1 stack region "
-            "[0x%llx, 0x%llx)",
-            (unsigned long long) sp_el1, (unsigned long long) lo,
-            (unsigned long long) hi);
         return;
     }
-
-    uint8_t *frame = (uint8_t *) g->host_base + sp_el1;
     memcpy(frame + SHIM_FRAME_OFF_X8, &x8_for_el0, sizeof(x8_for_el0));
 }
 
@@ -2708,12 +3513,49 @@ void signal_publish_live_x8(hv_vcpu_t vcpu, const guest_t *g)
     shim_publish_frame_x8(vcpu, g, vcpu_get_gpr(vcpu, 8));
 }
 
+/* Read the X8 slot of the live shim frame at the current SP_EL1. The inverse of
+ * shim_publish_frame_x8, for the HVC #5 drop-frame safepoint: there the live X8
+ * carries the host's marker and the guest's own value is already in the frame,
+ * so this is the only place a ptrace stop can get the architectural X8 the
+ * tracer must see.
+ *
+ * Returns false when SP_EL1 names no live frame; callers then leave the
+ * register alone rather than trusting the marker as guest state.
+ */
+bool signal_shim_frame_x8(hv_vcpu_t vcpu, const guest_t *g, uint64_t *out)
+{
+    uint8_t *frame = shim_frame_at_sp(vcpu, g);
+    if (!frame)
+        return false;
+
+    memcpy(out, frame + SHIM_FRAME_OFF_X8, sizeof(*out));
+    return true;
+}
+
+/* Publish the complete architectural GPR set into the live shim frame. The
+ * frame-restoring tails reload X1-X30 from it, so a resume that must pass
+ * through one of those tails after the host applied a tracer's registers has to
+ * write them here first; otherwise the stale frame wins. SAVE_GPRS lays each
+ * GPR at its own 8-byte slot, X30 at [sp+240].
+ */
+void signal_publish_shim_frame_gprs(hv_vcpu_t vcpu,
+                                    const guest_t *g,
+                                    const uint64_t gprs[31])
+{
+    uint8_t *frame = shim_frame_at_sp(vcpu, g);
+    if (!frame)
+        return;
+
+    for (int i = 0; i < 31; i++)
+        memcpy(frame + (size_t) i * sizeof(gprs[0]), &gprs[i], sizeof(gprs[0]));
+}
+
 /* Build and install the rt_sigframe for `signum` on the current thread, with
  * sig_lock held on entry and released on every return path. Shared by
  * signal_deliver() (signal selected from the process-wide pending set) and
  * signal_deliver_fault() (synchronous fault forced onto the faulting thread).
- * rt_info supplies si_code/si_pid/sigval when no thread-local pending_fault is
- * set; the pending_fault is consumed (one-shot) when valid.
+ * rt_info supplies si_code/si_pid/sigval when no task fault record is set; the
+ * fault record is consumed (one-shot) when valid.
  *
  * Returns 1 if a handler frame was installed, 0 if the signal was ignored, and
  * -1 (with *exit_code set) when the default disposition terminates the guest.
@@ -2743,7 +3585,7 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
         /* Ignored; discard signal. Clear any stale fault info so it does not
          * leak into a later signal delivery.
          */
-        pending_fault.valid = false;
+        pending_fault_clear();
         pthread_mutex_unlock(&sig_lock);
         return 0;
     }
@@ -2751,7 +3593,7 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
     if (act->sa_handler == LINUX_SIG_DFL) {
         /* Apply default disposition */
         sig_disposition_t disp = signal_default_disposition(signum);
-        pending_fault.valid = false;
+        pending_fault_clear();
         switch (disp) {
         case SIG_DISP_TERM:
         case SIG_DISP_CORE:
@@ -2759,46 +3601,82 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
             pthread_mutex_unlock(&sig_lock);
             return -1; /* Terminate */
         case SIG_DISP_IGN:
-        case SIG_DISP_CONT:
-        case SIG_DISP_STOP:
             pthread_mutex_unlock(&sig_lock);
-            return 0; /* Ignore (STOP/CONT not meaningful for elfuse) */
+            return 0;
+        case SIG_DISP_CONT:
+            /* Continue lifts the group stop when the signal is queued, not
+             * here; a SIGCONT that reaches delivery has nothing left to do.
+             */
+            pthread_mutex_unlock(&sig_lock);
+            return 0;
+        case SIG_DISP_STOP:
+            /* Normally consumed when queued. If a stop signal reaches delivery
+             * anyway (the disposition became default-stop after it was queued),
+             * park the group from outside sig_lock. Never raise SIGSTOP: that
+             * would stop every host worker, including unrelated VMs.
+             */
+            pthread_mutex_unlock(&sig_lock);
+            signal_group_stop_job(signum);
+            return 0;
         }
     }
 
     /* Deliver to user handler: build rt_sigframe on guest stack */
 
     /* Past every disposition that discards the signal, so this is the point a
-     * handler frame is committed to. An armed SVC restart has to come off here,
-     * before the state below is snapshotted: the frame would otherwise capture
-     * the rewound PC together with the live X8, which is the shim's TLBI wire
-     * value rather than the syscall number, and rt_sigreturn would re-execute
-     * the SVC as whatever syscall that value names. Undoing the rewind also
-     * gives the guest back the EINTR it was going to get, which this signal now
-     * explains. See syscall_restart_arm in syscall/proc.h.
+     * handler frame is committed to. A completed wait may have armed a Linux
+     * ERESTARTSYS restart (syscall_restart_consider and proc_resume_task); the
+     * signal actually being delivered decides what happens to it:
      *
-     * Only on the syscall-return path, though. A vCPU kicked at EL0 after the
-     * ERET has already taken the restart: PC sits on the rewound SVC with the
-     * guest's argument still in X0 and the shim frame's X8 restored, and
-     * ELR_EL1 still holds the rewound value because no exception has replaced
-     * it. Cancel would match that stale ELR and write the EINTR into the live
-     * X0, the frame would save it, and the SVC would run after rt_sigreturn
-     * with -4 as its first argument. Leaving the restart alone is what Linux
-     * shows: the handler runs before the restarted call. The armed record is
-     * left alone, but the handler's own first syscall (rt_sigreturn at the
-     * latest) is the next dispatch, fails the ELR and syscall-number witness,
-     * and clears it. The SVC re-executed after rt_sigreturn therefore reads as
-     * a fresh call, so syscall_is_restarted() is false there: a connect that
-     * finished while the handler ran reports EISCONN where Linux returns 0.
-     * Narrow (a leader-work EINTR, then an EL0 kick before the rewound SVC
-     * runs), and left as is: keeping the record alive across the handler would
-     * let it match an unrelated later call at the same SVC site.
+     *   SA_RESTART  keep the rewind.  The frame's pc is the SVC, its X8 is the
+     *               syscall number, and X0 is still the guest's first
+     *               argument, so rt_sigreturn re-executes the call with the
+     *               arguments the guest originally passed.
+     *   otherwise   cancel.  That restores the post-SVC PC and writes the
+     *               EINTR result into X0, which the frame then records: the
+     *               guest sees the interrupted call, exactly Linux's answer
+     *               to a handler that did not ask for SA_RESTART.
+     *
+     * The other deliveries never reach this block. An ignored, default-ignore,
+     * stop, or continue signal commits no frame, and Linux restarts the
+     * interrupted call when no handler ran, so the rewind is left in place. A
+     * terminating default action ends the process.
+     *
+     * Only on the syscall-return path. A vCPU kicked at EL0 after the ERET has
+     * already taken the restart: PC sits on the rewound SVC with the guest's
+     * argument still in X0 and the shim frame's X8 restored, and ELR_EL1 still
+     * holds the rewound value because no exception has replaced it. The frame
+     * is saved from PC there, so it already carries the restart; deciding again
+     * would write -EINTR into the argument of a call that has not run.
+     *
+     * The record is task-owned, so a stop between the arm and this delivery
+     * does not lose the decision.
      */
     uint64_t cur_cpsr = 0;
     hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &cur_cpsr);
     bool el0_preempt = (cur_cpsr & 0xfULL) == 0;
-    if (!el0_preempt)
-        syscall_restart_cancel(vcpu);
+    bool restart_decided = false;
+    bool restart_kept = false;
+    uint64_t restart_nr = 0;
+    if (!el0_preempt && current_thread) {
+        task_syscall_restart_t *rs = &current_thread->syscall_restart;
+        if (rs->armed) {
+            restart_decided = true;
+            restart_nr = rs->nr;
+
+            /* Keep the rewind only while the guest has not left it; the same
+             * ELR compare syscall_restart_cancel uses.
+             */
+            uint64_t armed_elr = 0;
+            hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &armed_elr);
+            if (!rs->forbidden && (act->sa_flags & LINUX_SA_RESTART) != 0 &&
+                armed_elr == rs->elr_rewound) {
+                restart_kept = true;
+            } else {
+                syscall_restart_cancel(vcpu);
+            }
+        }
+    }
 
     /* 1. Save current vCPU state.
      *
@@ -2833,12 +3711,28 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
      * SVC it has not executed yet. Snapshotting the register there would record
      * the marker as the guest's X8, and the handler's own rt_sigreturn would
      * hand it back, so that SVC would run as syscall 2. Take what rt_sigreturn
-     * parked instead. A record exists only inside the epilogue that wrote it,
-     * so there is no later delivery for this to reach; see sigreturn_x8.
+     * parked instead. The record belongs to the task, so a stop between the two
+     * deliveries does not lose it; see sigreturn_x8.
      */
-    if (!el0_preempt && sigreturn_x8.valid && sigreturn_x8.elr == saved_pc) {
-        saved_regs[8] = sigreturn_x8.x8;
-        sigreturn_x8.valid = false;
+    thread_entry_t *x8_owner = current_thread;
+    if (!el0_preempt && x8_owner && x8_owner->sigreturn_x8_valid &&
+        x8_owner->sigreturn_x8_elr == saved_pc) {
+        saved_regs[8] = x8_owner->sigreturn_x8_value;
+        x8_owner->sigreturn_x8_valid = false;
+    }
+
+    /* The frame carries the guest's own X8, not the shim's TLBI wire value the
+     * epilogue left live. A decided restart recorded the number: restoring it
+     * is what lets a kept restart's rt_sigreturn dispatch the same syscall, and
+     * what keeps a cancelled one from handing the handler a bogus X8. A kept
+     * rewind also ends the arm record: the sigframe owns the rewind from here,
+     * and a surviving record could match a later call the handler makes at the
+     * same SVC site.
+     */
+    if (restart_decided && current_thread) {
+        saved_regs[8] = restart_nr;
+        if (restart_kept)
+            current_thread->syscall_restart.armed = false;
     }
 
     /* 1b. rseq abort: if the thread is in a restartable sequence critical
@@ -2860,18 +3754,19 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
     linux_rt_sigframe_t frame;
     memset(&frame, 0, sizeof(frame));
 
-    /* siginfo: fault signals use si_code/si_addr from pending_fault; queued RT
-     * signals preserve sender metadata and sigval.
+    /* siginfo: fault signals use si_code/si_addr from the task's fault record;
+     * queued RT signals preserve sender metadata and sigval.
      */
+    pending_fault_t fault = pending_fault_take();
     frame.info.si_signo = signum;
-    if (pending_fault.valid) {
-        frame.info.si_code = pending_fault.si_code;
+    if (fault.valid) {
+        frame.info.si_code = fault.si_code;
 
         /* si_addr overlaps si_pid/si_uid at offset 16 in the siginfo union. On
          * aarch64-linux, si_addr is a 64-bit pointer occupying both int32_t
          * fields. Write it via memcpy to avoid strict aliasing.
          */
-        memcpy(&frame.info.si_pid, &pending_fault.addr, 8);
+        memcpy(&frame.info.si_pid, &fault.addr, 8);
     } else {
         frame.info.si_code = rt_info.si_code;
         frame.info.si_pid = rt_info.si_pid;
@@ -2908,10 +3803,9 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
      * handlers read this to determine the BRK immediate value.
      */
     uint64_t frame_esr = 0;
-    if (pending_fault.valid) {
-        frame.uc.uc_mcontext.fault_address = pending_fault.addr;
-        frame_esr = pending_fault.esr;
-        pending_fault.valid = false; /* Consume (one-shot) */
+    if (fault.valid) {
+        frame.uc.uc_mcontext.fault_address = fault.addr;
+        frame_esr = fault.esr;
     }
 
     memcpy(frame.uc.uc_mcontext.regs, saved_regs, sizeof(saved_regs));
@@ -2969,13 +3863,10 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
         return -1;
     }
 
-    /* Push the SROP cookie for validation on rt_sigreturn. If nesting exceeds
-     * MAX_NESTED_SIGNALS, skip the cookie entirely (set uc_flags=0) so
-     * rt_sigreturn does not mis-validate.
-     */
+    /* A signal frame can return on a different worker after migration. */
     bool pushed_cookie = false;
-    if (sigreturn_cookie_depth < MAX_NESTED_SIGNALS) {
-        sigreturn_cookies[sigreturn_cookie_depth++] = cookie;
+    if (thr && thr->sigreturn_cookie_depth < 16) {
+        thr->sigreturn_cookies[thr->sigreturn_cookie_depth++] = cookie;
         pushed_cookie = true;
     } else {
         frame.uc.uc_flags = 0;
@@ -2989,7 +3880,7 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
             (unsigned long long) frame_sp, (unsigned long long) signal_sp,
             signum, sizeof(frame));
         if (pushed_cookie)
-            sigreturn_cookie_depth--;
+            thr->sigreturn_cookie_depth--;
         *exit_code = 128 + signum;
         pthread_mutex_unlock(&sig_lock);
         return -1;
@@ -3081,16 +3972,30 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
 
 static void signal_record_termination(int signum)
 {
-    termination_wait_status = signum;
+    thread_entry_t *t = current_thread;
+    if (!t)
+        return;
+    t->termination_wait_status = signum;
     if (signal_default_disposition(signum) == SIG_DISP_CORE)
-        termination_wait_status |= 0x80;
+        t->termination_wait_status |= 0x80;
 }
 
 int signal_take_termination_wait_status(void)
 {
-    int status = termination_wait_status;
-    termination_wait_status = 0;
+    thread_entry_t *t = current_thread;
+    if (!t)
+        return 0;
+    int status = t->termination_wait_status;
+    t->termination_wait_status = 0;
     return status;
+}
+
+int signal_linux_wait_status_for_exit(int exit_code)
+{
+    int signal_status = signal_take_termination_wait_status();
+    if (signal_status != 0)
+        return signal_status;
+    return (exit_code & 0xff) << 8;
 }
 
 /* signal_deliver_one() consumed a signal the guest never observes, so the
@@ -3271,9 +4176,11 @@ int signal_rt_sigreturn(hv_vcpu_t vcpu, guest_t *g)
     /* Validate SROP cookie from uc_flags. Zero means the cookie was skipped
      * (nesting overflow or pre-existing frame); allow those.
      */
+    thread_entry_t *thr = current_thread;
     uint64_t frame_cookie = frame.uc.uc_flags;
-    if (frame_cookie != 0 && sigreturn_cookie_depth > 0) {
-        uint64_t expected = sigreturn_cookies[sigreturn_cookie_depth - 1];
+    if (thr && frame_cookie != 0 && thr->sigreturn_cookie_depth > 0) {
+        uint64_t expected =
+            thr->sigreturn_cookies[thr->sigreturn_cookie_depth - 1];
         if (frame_cookie != expected) {
             log_error(
                 "rt_sigreturn: SROP cookie mismatch "
@@ -3282,7 +4189,7 @@ int signal_rt_sigreturn(hv_vcpu_t vcpu, guest_t *g)
                 (unsigned long long) frame_cookie);
             return -LINUX_EFAULT;
         }
-        sigreturn_cookie_depth--;
+        thr->sigreturn_cookie_depth--;
     }
 
     /* Validate restored PC before touching any vCPU state. Reject addresses in
@@ -3377,16 +4284,20 @@ int signal_rt_sigreturn(hv_vcpu_t vcpu, guest_t *g)
      * X8 is restored above with the other 30 GPRs and then handed over again,
      * because the marker is written into the same register. Without that second
      * hand-off the marker is what the ERET delivers, and a frame whose saved PC
-     * sits on an SVC issues it as syscall 2. The same value is parked for a
+     * sits on an SVC issues it as syscall 2. The same value is recorded for a
      * signal delivered later in this epilogue, which snapshots the register
-     * itself and would otherwise write the marker into the frame it builds. The
-     * park dies at the next vCPU resume whether or not anything took it.
+     * itself and would otherwise write the marker into the frame it builds.
+     * signal_forget_sigreturn_x8 drops the record at the next vCPU resume
+     * whether or not anything took it.
      */
     uint64_t restored_x8 = frame.uc.uc_mcontext.regs[8];
     shim_publish_frame_x8(vcpu, g, restored_x8);
-    sigreturn_x8.valid = true;
-    sigreturn_x8.elr = restored_pc;
-    sigreturn_x8.x8 = restored_x8;
+    thread_entry_t *x8_task = current_thread;
+    if (x8_task) {
+        x8_task->sigreturn_x8_valid = true;
+        x8_task->sigreturn_x8_elr = restored_pc;
+        x8_task->sigreturn_x8_value = restored_x8;
+    }
     hv_vcpu_set_reg(vcpu, HV_REG_X8, 2);
 
     /* Return SYSCALL_EXEC_HAPPENED to skip the normal X0 writeback, since

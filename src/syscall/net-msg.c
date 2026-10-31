@@ -161,6 +161,7 @@ int64_t net_send_xfer(const fd_block_state_t *st,
                       struct msghdr *msg,
                       int linux_flags)
 {
+    uint64_t prior = io_continue_take();
     uint64_t want = 0;
     for (int i = 0; i < (int) msg->msg_iovlen; i++) {
         if (!iov_total_add(want, msg->msg_iov[i].iov_len, &want))
@@ -170,12 +171,25 @@ int64_t net_send_xfer(const fd_block_state_t *st,
     bool blocking = want > 0 && sock_op_should_block(st, host_fd, linux_flags);
     int host_flags =
         translate_msg_flags(linux_flags) | (blocking ? MSG_DONTWAIT : 0);
-    uint64_t total = 0;
+    uint64_t total = prior <= want ? prior : 0;
+    if (total > 0) {
+        int spent = msg_iov_advance(msg->msg_iov, (int) msg->msg_iovlen,
+                                    (size_t) total);
+        msg->msg_iov += spent;
+        msg->msg_iovlen -= spent;
+        msg->msg_control = NULL;
+        msg->msg_controllen = 0;
+        msg->msg_name = NULL;
+        msg->msg_namelen = 0;
+    }
     int spins = 0;
     unsigned backoff = 0;
     for (;;) {
         if (blocking) {
-            int64_t waited = io_wait_fd_or_interrupted(host_fd, POLLOUT);
+            int64_t waited =
+                net_wait_progress(st, host_fd, POLLOUT, linux_flags, total);
+            if (waited == SYSCALL_PARKED)
+                return waited;
             if (waited < 0)
                 return total > 0 ? (int64_t) total : waited;
         }
@@ -512,6 +526,7 @@ static size_t msg_iov_total(const struct iovec *iov, int iovcnt)
 /* NOLINTNEXTLINE(readability-function-size) */
 int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
 {
+    uint64_t prior = io_continue_take();
     if (fd_get_type(fd) == FD_NETLINK)
         return netlink_recvmsg(fd, g, msg_gva, flags);
 
@@ -558,7 +573,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
 
         int64_t waited =
             len > 0
-                ? net_wait_or_interrupted(&sock_st, host_ref.fd, POLLIN, flags)
+                ? net_wait_progress(&sock_st, host_ref.fd, POLLIN, flags, prior)
                 : net_recv_zero_payload_gate(&sock_st, host_ref.fd, flags);
         if (waited < 0) {
             host_fd_ref_close(&host_ref);
@@ -566,8 +581,9 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
         }
 
         struct iovec host_iov = {
-            .iov_base = base,
-            .iov_len = len,
+            .iov_base =
+                prior > 0 && prior <= len ? (char *) base + prior : base,
+            .iov_len = len - (prior <= len ? prior : 0),
         };
         struct msghdr msg = {
             .msg_iov = &host_iov,
@@ -587,7 +603,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
             mac_flags &= ~MSG_WAITALL;
 
         ssize_t ret;
-        uint64_t total = 0;
+        uint64_t total = prior <= len ? prior : 0;
         for (;;) {
             msg.msg_flags = 0;
             ret = recvmsg(host_ref.fd, &msg, mac_flags);
@@ -599,18 +615,25 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
                     break;
                 host_iov.iov_base = (char *) base + total;
                 host_iov.iov_len = len - total;
-                waited = net_wait_or_interrupted(&sock_st, host_ref.fd, POLLIN,
-                                                 flags);
+                waited = net_wait_progress(&sock_st, host_ref.fd, POLLIN, flags,
+                                           total);
+                if (waited == SYSCALL_PARKED) {
+                    host_fd_ref_close(&host_ref);
+                    return waited;
+                }
                 if (waited < 0)
-                    break; /* interrupted after moving bytes: report the count
-                            */
+                    break;
                 continue;
             }
 
             if (!net_recv_should_retry(&sock_st, host_ref.fd, flags, ret))
                 break;
             waited =
-                net_wait_or_interrupted(&sock_st, host_ref.fd, POLLIN, flags);
+                net_wait_progress(&sock_st, host_ref.fd, POLLIN, flags, total);
+            if (waited == SYSCALL_PARKED) {
+                host_fd_ref_close(&host_ref);
+                return waited;
+            }
             if (waited < 0) {
                 if (total > 0)
                     break;
@@ -663,7 +686,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
     }
     int64_t waited =
         host_iov_has_payload(&host_iov, recv_iovcnt)
-            ? net_wait_or_interrupted(&sock_st, host_ref.fd, POLLIN, flags)
+            ? net_wait_progress(&sock_st, host_ref.fd, POLLIN, flags, prior)
             : net_recv_zero_payload_gate(&sock_st, host_ref.fd, flags);
     if (waited < 0) {
         host_iov_free(&host_iov);
@@ -721,7 +744,13 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
     size_t want = gather ? msg_iov_total(msg.msg_iov, (int) msg.msg_iovlen) : 0;
 
     ssize_t ret;
-    uint64_t total = 0;
+    uint64_t total = prior <= want ? prior : 0;
+    if (total > 0) {
+        int spent =
+            msg_iov_advance(msg.msg_iov, (int) msg.msg_iovlen, (size_t) total);
+        msg.msg_iov += spent;
+        msg.msg_iovlen -= spent;
+    }
     for (;;) {
         msg.msg_namelen = lmsg.msg_name ? sa_len : 0;
         msg.msg_controllen = ctrl_alloc;
@@ -745,15 +774,27 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
              */
             msg.msg_name = NULL;
             waited =
-                net_wait_or_interrupted(&sock_st, host_ref.fd, POLLIN, flags);
+                net_wait_progress(&sock_st, host_ref.fd, POLLIN, flags, total);
+            if (waited == SYSCALL_PARKED) {
+                free(mac_ctrl_heap);
+                host_iov_free(&host_iov);
+                host_fd_ref_close(&host_ref);
+                return waited;
+            }
             if (waited < 0)
-                break; /* interrupted after moving bytes: report the count */
+                break;
             continue;
         }
 
         if (!net_recv_should_retry(&sock_st, host_ref.fd, flags, ret))
             break;
-        waited = net_wait_or_interrupted(&sock_st, host_ref.fd, POLLIN, flags);
+        waited = net_wait_progress(&sock_st, host_ref.fd, POLLIN, flags, total);
+        if (waited == SYSCALL_PARKED) {
+            free(mac_ctrl_heap);
+            host_iov_free(&host_iov);
+            host_fd_ref_close(&host_ref);
+            return waited;
+        }
         if (waited < 0) {
             if (total > 0)
                 break;
@@ -1179,6 +1220,7 @@ int64_t sys_recvmmsg(guest_t *g,
 
         if (!lmsg.msg_name && (!lmsg.msg_control || lmsg.msg_controllen == 0) &&
             lmsg.msg_iovlen == 1) {
+            uint64_t prior = io_continue_take();
             struct {
                 uint64_t iov_base, iov_len;
             } guest_iov;
@@ -1204,13 +1246,17 @@ int64_t sys_recvmmsg(guest_t *g,
                     len = (size_t) avail;
             }
 
-            struct iovec host_iov = {.iov_base = base, .iov_len = len};
+            uint64_t total = prior <= len ? prior : 0;
+            struct iovec host_iov = {
+                .iov_base = total > 0 ? (char *) base + total : base,
+                .iov_len = len - total,
+            };
             struct msghdr host_msg = {
                 .msg_iov = &host_iov,
                 .msg_iovlen = 1,
             };
-            int64_t waited = len > 0 ? net_wait_or_interrupted(
-                                           &sock_st, host_ref.fd, POLLIN, flags)
+            int64_t waited = len > 0 ? net_wait_progress(&sock_st, host_ref.fd,
+                                                         POLLIN, flags, total)
                                      : net_recv_zero_payload_gate(
                                            &sock_st, host_ref.fd, flags);
             if (waited < 0) {
@@ -1226,7 +1272,6 @@ int64_t sys_recvmmsg(guest_t *g,
                 mac_flags &= ~MSG_WAITALL;
 
             ssize_t ret;
-            uint64_t total = 0;
             for (;;) {
                 host_msg.msg_flags = 0;
                 ret = recvmsg(host_ref.fd, &host_msg, mac_flags);
@@ -1238,8 +1283,12 @@ int64_t sys_recvmmsg(guest_t *g,
                         break;
                     host_iov.iov_base = (char *) base + total;
                     host_iov.iov_len = len - total;
-                    waited = net_wait_or_interrupted(&sock_st, host_ref.fd,
-                                                     POLLIN, flags);
+                    waited = net_wait_progress(&sock_st, host_ref.fd, POLLIN,
+                                               flags, total);
+                    if (waited == SYSCALL_PARKED) {
+                        host_fd_ref_close(&host_ref);
+                        return waited;
+                    }
                     if (waited < 0)
                         break;
                     continue;
@@ -1247,8 +1296,12 @@ int64_t sys_recvmmsg(guest_t *g,
 
                 if (!net_recv_should_retry(&sock_st, host_ref.fd, flags, ret))
                     break;
-                waited = net_wait_or_interrupted(&sock_st, host_ref.fd, POLLIN,
-                                                 flags);
+                waited = net_wait_progress(&sock_st, host_ref.fd, POLLIN, flags,
+                                           total);
+                if (waited == SYSCALL_PARKED) {
+                    host_fd_ref_close(&host_ref);
+                    return waited;
+                }
                 if (waited < 0) {
                     if (total > 0)
                         break;

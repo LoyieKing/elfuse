@@ -714,7 +714,7 @@ int guest_bootstrap_create_vcpu(guest_t *g,
     *out_vcpu = vcpu;
     *out_vexit = vexit;
 
-    thread_register_main(vcpu, vexit, proc_get_pid(), el1_sp);
+    thread_register_main(g, vcpu, vexit, proc_get_pid(), el1_sp);
 
     t0 = startup_trace_now_ns();
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1, shim_ipa + 0x800));

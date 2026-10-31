@@ -21,10 +21,11 @@
 
 static _Atomic int64_t guest_pid = 1, parent_pid = 0;
 static _Atomic bool child_subreaper;
+static _Atomic bool soft_newpid;
+static _Atomic int dumpable = 1; /* Linux PR_SET/GET_DUMPABLE */
 static _Atomic uint32_t emu_uid = GUEST_UID, emu_euid = GUEST_UID;
 static _Atomic uint32_t emu_suid = GUEST_UID, emu_gid = GUEST_GID;
 static _Atomic uint32_t emu_egid = GUEST_GID, emu_sgid = GUEST_GID;
-static _Atomic int32_t emu_nice = 0;
 
 static pthread_mutex_t session_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic int64_t guest_sid = 1, guest_pgid = 1;
@@ -88,6 +89,7 @@ void proc_identity_init(void)
     guest_pid = 1;
     parent_pid = 0;
     child_subreaper = false;
+    atomic_store_explicit(&dumpable, 1, memory_order_relaxed);
 
     uint32_t uid = GUEST_UID;
     uint32_t gid = GUEST_GID;
@@ -112,7 +114,6 @@ void proc_identity_init(void)
     emu_gid = gid;
     emu_egid = gid;
     emu_sgid = gid;
-    emu_nice = 0;
     guest_sid = 1;
     guest_pgid = 1;
     guest_fg_pgrp = 1;
@@ -267,14 +268,10 @@ void proc_set_ids(uint32_t uid,
     emu_sgid = sgid;
 }
 
-int32_t proc_get_nice(void)
-{
-    return emu_nice;
-}
 
-void proc_set_nice(int32_t val)
+bool proc_has_cap_sys_nice(void)
 {
-    emu_nice = val;
+    return proc_get_euid() == 0;
 }
 
 bool proc_pid_alive(int pid)
@@ -284,32 +281,6 @@ bool proc_pid_alive(int pid)
     return thread_tid_alive((int64_t) pid);
 }
 
-int64_t proc_sys_setpriority(int which, int who, int prio)
-{
-    if (which != 0)
-        return -LINUX_EINVAL;
-
-    /* emu_nice is process-global. Reject non-self task IDs until nice is
-     * tracked per task rather than silently changing every thread's value.
-     */
-    if (who != 0 && who != (int) guest_pid)
-        return -LINUX_ESRCH;
-    if (prio < -20)
-        prio = -20;
-    if (prio > 19)
-        prio = 19;
-    emu_nice = prio;
-    return 0;
-}
-
-int64_t proc_sys_getpriority(int which, int who)
-{
-    if (which != 0)
-        return -LINUX_EINVAL;
-    if (!proc_pid_alive(who))
-        return -LINUX_ESRCH;
-    return 20 - emu_nice;
-}
 
 int64_t proc_get_sid(void)
 {
@@ -425,6 +396,16 @@ void proc_set_identity(int64_t pid, int64_t ppid)
     parent_pid = ppid;
 }
 
+void proc_set_soft_newpid(bool enabled)
+{
+    atomic_store_explicit(&soft_newpid, enabled, memory_order_relaxed);
+}
+
+bool proc_in_soft_newpid(void)
+{
+    return atomic_load_explicit(&soft_newpid, memory_order_relaxed);
+}
+
 void proc_set_ppid(int64_t ppid)
 {
     parent_pid = ppid;
@@ -438,4 +419,17 @@ void proc_set_child_subreaper(bool enabled)
 bool proc_get_child_subreaper(void)
 {
     return child_subreaper;
+}
+
+void proc_set_dumpable(int value)
+{
+    /* Linux: SUID_DUMP_DISABLE(0) or SUID_DUMP_USER(1). Other values get EINVAL
+     * at the prctl layer; we store the clamped 0/1 here.
+     */
+    atomic_store_explicit(&dumpable, value ? 1 : 0, memory_order_relaxed);
+}
+
+int proc_get_dumpable(void)
+{
+    return atomic_load_explicit(&dumpable, memory_order_relaxed);
 }

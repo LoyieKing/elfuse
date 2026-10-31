@@ -28,6 +28,7 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <poll.h>
+#include <sys/event.h>
 #include <termios.h>
 #include <time.h>
 
@@ -42,6 +43,10 @@
 #include "runtime/futex.h" /* futex_interrupt_consume, in the tty drain */
 #include "runtime/procemu.h"
 #include "runtime/thread.h"
+#include "runtime/sched/sched.h"
+#include "runtime/sched/vcpu_pool.h"
+#include "runtime/sched/exec.h"
+#include "debug/log.h"
 
 #include "syscall/linux-wire.h"
 #include "syscall/asyncio.h"
@@ -55,6 +60,7 @@
 #include "syscall/net-sockopt.h"
 #include "syscall/usbdev.h"
 #include "syscall/proc.h"
+#include "syscall/proc-pidfd.h"
 #include "syscall/signal.h"
 #include "syscall/sys.h"
 #include "syscall/wakeup-pipe.h"
@@ -253,7 +259,75 @@ int64_t io_retry_backoff(unsigned *backoff_us)
     return 0;
 }
 
-/* Milliseconds on CLOCK_MONOTONIC, for the bounded wait's deadline. */
+
+/* Parked descriptor readiness
+ *
+ * A parked wait does not sleep in host poll() on a worker: io_park_unmount()
+ * registers the host descriptors with one pump thread blocked in kqueue, and
+ * the pump completes the park for reissue when a descriptor is ready. A wait
+ * whose descriptors kqueue refuses, or one with no descriptor at all, parks
+ * too, with a periodic recheck instead of a fixed quantum per wait. The guest
+ * deadline is a kqueue timeout, so an expired wait is retired on time rather
+ * than at the next slice.
+ *
+ * A registration holds a task reference until it is retired, so the slot cannot
+ * be recycled underneath a pending event. Events carry the registration serial,
+ * never a pointer; a serial that is no longer registered is dropped. Each
+ * registration also captures the park generation it was armed for: a completion
+ * acts only while the task is still parked in the same IO generation, so a
+ * wakeup that lost the race to a signal, or to a later park on the same task,
+ * cannot complete the task's next wait. Watched descriptors are dup'ed for the
+ * registration, so a guest close cannot hand the pump an unrelated file that
+ * reused the number.
+ *
+ * io_wait_lock is the innermost lock of the registration machinery: the
+ * deadline and signal scans call io_wait_cancel_seq() with thread_lock held,
+ * which is why task references are released by the pump from a reclaim list
+ * rather than at the retraction site. Every IO completion also takes it: a
+ * completion that wins must retract the splice continuation before the task
+ * becomes runnable, and holding it across the scheduler call keeps two wakers
+ * from both acting on one park. The scheduler takes sched_lock only to enqueue
+ * there and never calls back into this file.
+ */
+#define IO_WAIT_BATCH 64
+#define IO_WAIT_RECHECK_NS (200ULL * 1000 * 1000)
+#define IO_WAIT_USER_IDENT 1
+
+typedef struct io_wait_reg {
+    struct io_wait_reg *next;
+    uint64_t serial;
+    struct thread_entry *task;
+    uint64_t park_seq;    /* Generation of the park it was armed for */
+    uint64_t deadline_ns; /* guest timeout, 0 = none */
+    uint64_t recheck_ns;  /* fallback wake, 0 = none */
+    uint32_t nsrc;
+    /* One byte per source: bit 0 read, bit 1 write, bit 2 except. */
+    uint8_t armed[IO_WAIT_MAX_SOURCES];
+    io_wait_source_t src[IO_WAIT_MAX_SOURCES];
+} io_wait_reg_t;
+
+/* One pump wakeup. The generation travels with the task reference so the
+ * completion can tell the park this event belongs to from a later one the task
+ * may arm after a racing waker released it.
+ */
+typedef struct io_wait_done {
+    struct thread_entry *task;
+    uint64_t park_seq;
+} io_wait_done_t;
+
+typedef struct io_wait_reclaim {
+    struct io_wait_reclaim *next;
+    struct thread_entry *task;
+} io_wait_reclaim_t;
+
+static pthread_mutex_t io_wait_lock = PTHREAD_MUTEX_INITIALIZER;
+static io_wait_reg_t *io_wait_head;
+static io_wait_reclaim_t *io_wait_reclaim_head;
+static uint64_t io_wait_serial;
+static _Atomic int io_wait_kq = -1;
+static pthread_once_t io_wait_once = PTHREAD_ONCE_INIT;
+
+/* Milliseconds on CLOCK_MONOTONIC, for waits that report in milliseconds. */
 static int64_t io_now_ms(void)
 {
     struct timespec ts;
@@ -261,15 +335,718 @@ static int64_t io_now_ms(void)
     return (int64_t) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+static uint64_t io_mono_ns(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
+    return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
+
+static int io_wait_kq_fd(void)
+{
+    return atomic_load_explicit(&io_wait_kq, memory_order_acquire);
+}
+
+/* Ask the pump to recompute timeouts and drain the reclaim list. A missing pump
+ * is a no-op: no registration exists without one.
+ */
+static void io_wait_trigger(void)
+{
+    int kq = io_wait_kq_fd();
+    if (kq < 0)
+        return;
+    struct kevent kev;
+    EV_SET(&kev, IO_WAIT_USER_IDENT, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+    (void) kevent(kq, &kev, 1, NULL, 0, NULL);
+}
+
+static io_wait_reg_t *io_wait_find_locked(uint64_t serial)
+{
+    for (io_wait_reg_t *r = io_wait_head; r; r = r->next) {
+        if (r->serial == serial)
+            return r;
+    }
+    return NULL;
+}
+
+static void io_wait_unlink_locked(io_wait_reg_t *reg)
+{
+    io_wait_reg_t **pp = &io_wait_head;
+    while (*pp) {
+        if (*pp == reg) {
+            *pp = reg->next;
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+}
+
+static void io_wait_del_locked(const io_wait_reg_t *reg, uint32_t i, int filter)
+{
+    struct kevent kev;
+    EV_SET(&kev, (uintptr_t) reg->src[i].fd, filter, EV_DELETE, 0, 0, NULL);
+    (void) kevent(io_wait_kq_fd(), &kev, 1, NULL, 0, NULL);
+}
+
+/* Release the descriptors and the registration. The caller has already unlinked
+ * it, so no event can name it after this returns.
+ */
+static void io_wait_free_locked(io_wait_reg_t *reg)
+{
+    for (uint32_t i = 0; i < reg->nsrc; i++) {
+        if (reg->src[i].fd < 0)
+            continue;
+        if (reg->armed[i] & 1)
+            io_wait_del_locked(reg, i, EVFILT_READ);
+        if (reg->armed[i] & 2)
+            io_wait_del_locked(reg, i, EVFILT_WRITE);
+        if (reg->armed[i] & 4)
+            io_wait_del_locked(reg, i, EVFILT_EXCEPT);
+        close(reg->src[i].fd);
+    }
+    free(reg);
+}
+
+/* The pump owns the release because the scans that retract an IO park may hold
+ * thread_lock when they do it.
+ */
+static void io_wait_reclaim_locked(thread_entry_t *t)
+{
+    io_wait_reclaim_t *node = malloc(sizeof(*node));
+    if (!node) {
+        log_error("io: wait reclaim allocation failed");
+        return;
+    }
+    node->task = t;
+    node->next = io_wait_reclaim_head;
+    io_wait_reclaim_head = node;
+}
+
+static int io_wait_collect_locked(uint64_t now, io_wait_done_t *batch, int cap)
+{
+    int n = 0;
+    io_wait_reg_t **pp = &io_wait_head;
+    while (*pp && n < cap) {
+        io_wait_reg_t *reg = *pp;
+        bool due = (reg->deadline_ns != 0 && reg->deadline_ns <= now) ||
+                   (reg->recheck_ns != 0 && reg->recheck_ns <= now);
+        if (!due) {
+            pp = &reg->next;
+            continue;
+        }
+        *pp = reg->next;
+        if (reg->task) {
+            batch[n].task = reg->task;
+            batch[n].park_seq = reg->park_seq;
+            n++;
+        }
+        io_wait_free_locked(reg);
+    }
+    return n;
+}
+
+static uint64_t io_wait_next_locked(void)
+{
+    uint64_t next = 0;
+    for (io_wait_reg_t *reg = io_wait_head; reg; reg = reg->next) {
+        uint64_t d = reg->deadline_ns;
+        if (d != 0 && (next == 0 || d < next))
+            next = d;
+        d = reg->recheck_ns;
+        if (d != 0 && (next == 0 || d < next))
+            next = d;
+    }
+    return next;
+}
+
+static void *io_wait_pump_main(void *arg)
+{
+    int kq = (int) (intptr_t) arg;
+    for (;;) {
+        io_wait_done_t done[IO_WAIT_BATCH];
+        int ndone = 0;
+        io_wait_reclaim_t *reclaim;
+
+        pthread_mutex_lock(&io_wait_lock);
+        reclaim = io_wait_reclaim_head;
+        io_wait_reclaim_head = NULL;
+        ndone = io_wait_collect_locked(io_mono_ns(), done, IO_WAIT_BATCH);
+        uint64_t next = io_wait_next_locked();
+        pthread_mutex_unlock(&io_wait_lock);
+
+        while (reclaim) {
+            io_wait_reclaim_t *node = reclaim;
+            reclaim = node->next;
+            thread_release(node->task);
+            free(node);
+        }
+        for (int i = 0; i < ndone; i++) {
+            io_wait_done_t *d = &done[i];
+
+            /* The completion takes io_wait_lock as well: an in-place signal
+             * completion claims the continuation in that same lock, so the two
+             * cannot both act on one park. A wakeup whose generation no longer
+             * matches only drops the reference the registration held.
+             */
+            pthread_mutex_lock(&io_wait_lock);
+            (void) sched_park_try_complete_reissue_seq(d->task, PARK_KIND_IO,
+                                                       d->park_seq);
+            pthread_mutex_unlock(&io_wait_lock);
+            thread_release(d->task);
+        }
+        if (ndone > 0)
+            continue;
+
+        struct timespec rel;
+        struct timespec *tsp = NULL;
+        if (next != 0) {
+            uint64_t now = io_mono_ns();
+            if (next <= now)
+                continue;
+            uint64_t wait_ns = next - now;
+            rel.tv_sec = (time_t) (wait_ns / 1000000000ULL);
+            rel.tv_nsec = (long) (wait_ns % 1000000000ULL);
+            tsp = &rel;
+        }
+
+        struct kevent evs[IO_WAIT_BATCH];
+        int n = kevent(kq, NULL, 0, evs, IO_WAIT_BATCH, tsp);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            log_error("io: wait pump kevent: %s", strerror(errno));
+            continue;
+        }
+        if (n == 0)
+            continue;
+
+        pthread_mutex_lock(&io_wait_lock);
+        for (int i = 0; i < n; i++) {
+            if (evs[i].filter == EVFILT_USER)
+                continue;
+            io_wait_reg_t *reg =
+                io_wait_find_locked((uint64_t) (uintptr_t) evs[i].udata);
+            if (!reg)
+                continue;
+            io_wait_unlink_locked(reg);
+            if (reg->task && ndone < IO_WAIT_BATCH) {
+                done[ndone].task = reg->task;
+                done[ndone].park_seq = reg->park_seq;
+                ndone++;
+            }
+            io_wait_free_locked(reg);
+        }
+        pthread_mutex_unlock(&io_wait_lock);
+
+        for (int i = 0; i < ndone; i++) {
+            io_wait_done_t *d = &done[i];
+            pthread_mutex_lock(&io_wait_lock);
+            (void) sched_park_try_complete_reissue_seq(d->task, PARK_KIND_IO,
+                                                       d->park_seq);
+            pthread_mutex_unlock(&io_wait_lock);
+            thread_release(d->task);
+        }
+    }
+    return NULL;
+}
+
+static void io_wait_start(void)
+{
+    int kq = kqueue();
+    if (kq < 0) {
+        log_error("io: wait pump kqueue: %s", strerror(errno));
+        return;
+    }
+    struct kevent kev;
+    EV_SET(&kev, IO_WAIT_USER_IDENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0,
+           NULL);
+    if (kevent(kq, &kev, 1, NULL, 0, NULL) < 0) {
+        log_error("io: wait pump user event: %s", strerror(errno));
+        close(kq);
+        return;
+    }
+
+    pthread_t thread;
+    int err = pthread_create(&thread, NULL, io_wait_pump_main,
+                             (void *) (intptr_t) kq);
+    if (err != 0) {
+        log_error("io: wait pump pthread_create: %s", strerror(err));
+        close(kq);
+        return;
+    }
+    (void) pthread_detach(thread);
+    atomic_store_explicit(&io_wait_kq, kq, memory_order_release);
+}
+
+/* Register this park's descriptors.
+ *
+ * Returns false when no pump exists, or when a waker completed the park before
+ * the registration could be linked, so the caller arms a bounded scheduler
+ * recheck instead.
+ */
+static bool io_wait_register(thread_entry_t *t,
+                             const io_wait_source_t *sources,
+                             uint32_t nsrc,
+                             uint64_t deadline_ns,
+                             uint64_t park_seq)
+{
+    if (!t || nsrc > IO_WAIT_MAX_SOURCES)
+        return false;
+
+    pthread_once(&io_wait_once, io_wait_start);
+    int kq = io_wait_kq_fd();
+    if (kq < 0)
+        return false;
+
+    thread_entry_t *ref = thread_acquire_tid(thread_tid(t));
+    if (!ref)
+        return false;
+
+    io_wait_reg_t *reg = calloc(1, sizeof(*reg));
+    if (!reg) {
+        thread_release(ref);
+        return false;
+    }
+    reg->task = ref;
+    reg->park_seq = park_seq;
+    reg->deadline_ns = deadline_ns;
+    reg->nsrc = nsrc;
+    bool fully_watched = true;
+    int watched = 0;
+
+    pthread_mutex_lock(&io_wait_lock);
+
+    /* A waker may have completed the park between publishing its generation and
+     * this registration. Linking the record then would only hold the task
+     * reference until a recheck drops a completion that can never match, so
+     * fail the registration instead. Completions take this lock too, and the
+     * task cannot arm another park until this call returns, so the check cannot
+     * go stale before the record is linked.
+     */
+    if (!exec_park_active_load(t) || exec_park_kind_load(t) != PARK_KIND_IO ||
+        sched_park_seq(t) != park_seq) {
+        pthread_mutex_unlock(&io_wait_lock);
+        thread_release(ref);
+        free(reg);
+        return false;
+    }
+    reg->serial = ++io_wait_serial;
+    uint64_t udata = reg->serial;
+    for (uint32_t i = 0; i < nsrc; i++) {
+        reg->src[i].fd = -1;
+        reg->src[i].events = sources[i].events;
+        if (sources[i].fd < 0)
+            continue;
+        int fd = dup(sources[i].fd);
+        if (fd < 0) {
+            fully_watched = false;
+            continue;
+        }
+        reg->src[i].fd = fd;
+
+        if (sources[i].events & (POLLIN | POLLRDNORM | POLLRDBAND)) {
+            struct kevent kev;
+            EV_SET(&kev, (uintptr_t) fd, EVFILT_READ, EV_ADD | EV_ONESHOT, 0, 0,
+                   (void *) (uintptr_t) udata);
+            if (kevent(kq, &kev, 1, NULL, 0, NULL) == 0) {
+                reg->armed[i] |= 1;
+                watched++;
+            } else {
+                fully_watched = false;
+            }
+        }
+        if (sources[i].events & (POLLOUT | POLLWRNORM | POLLWRBAND)) {
+            struct kevent kev;
+            EV_SET(&kev, (uintptr_t) fd, EVFILT_WRITE, EV_ADD | EV_ONESHOT, 0,
+                   0, (void *) (uintptr_t) udata);
+            if (kevent(kq, &kev, 1, NULL, 0, NULL) == 0) {
+                reg->armed[i] |= 2;
+                watched++;
+            } else {
+                fully_watched = false;
+            }
+        }
+        if (sources[i].events & POLLPRI) {
+            struct kevent kev;
+            EV_SET(&kev, (uintptr_t) fd, EVFILT_EXCEPT, EV_ADD | EV_ONESHOT,
+                   NOTE_OOB, 0, (void *) (uintptr_t) udata);
+            if (kevent(kq, &kev, 1, NULL, 0, NULL) == 0) {
+                reg->armed[i] |= 4;
+                watched++;
+            } else {
+                fully_watched = false;
+            }
+        }
+    }
+    if (!fully_watched || watched == 0)
+        reg->recheck_ns = io_mono_ns() + IO_WAIT_RECHECK_NS;
+    reg->next = io_wait_head;
+    io_wait_head = reg;
+    pthread_mutex_unlock(&io_wait_lock);
+
+    io_wait_trigger();
+    return true;
+}
+
+/* Retire @t's registrations. With a nonzero @seq only the registration armed
+ * for that park generation is retracted, so a stale timer or signal scan cannot
+ * remove the registration of a later park on the same task; 0 retires every one
+ * (exit). Safe under thread_lock: the task reference is handed to the pump.
+ */
+static void io_wait_cancel_seq(struct thread_entry *t, uint64_t seq)
+{
+    if (!t)
+        return;
+
+    pthread_mutex_lock(&io_wait_lock);
+    io_wait_reg_t **pp = &io_wait_head;
+    while (*pp) {
+        io_wait_reg_t *reg = *pp;
+        if (reg->task != t || (seq != 0 && reg->park_seq != seq)) {
+            pp = &reg->next;
+            continue;
+        }
+        *pp = reg->next;
+        io_wait_reclaim_locked(reg->task);
+        io_wait_free_locked(reg);
+    }
+    pthread_mutex_unlock(&io_wait_lock);
+    io_wait_trigger();
+}
+
+static void io_wait_cancel(struct thread_entry *t)
+{
+    io_wait_cancel_seq(t, 0);
+}
+
+/* Task-owned stream-copy continuation for splice. A chunk read from the input
+ * may be only partly written when the output asks to block, and splice's usual
+ * input is a pipe, so a re-dispatched SVC cannot rebuild those bytes from the
+ * file position. The record therefore carries the pending chunk, the offsets
+ * and the pinned ends; io_task_cancel_wait() frees it if the task exits while
+ * parked, and io_park_complete_interrupt() frees it when a signal delivers the
+ * short count instead of re-dispatching the SVC.
+ */
+#define IO_COPY_BUF_SIZE (64 * 1024)
+
+#define IO_STREAM_CONT_SPLICE 1
+
+struct io_stream_cont {
+    int kind;
+    host_fd_ref_t in_ref, out_ref;
+    int in_gfd, out_gfd;
+    fd_block_state_t in_st, out_st;
+    int64_t off_in, off_out;
+    uint64_t moved;     /* Bytes written to the output so far */
+    uint64_t remaining; /* Requested bytes not yet read from the input */
+    size_t chunk_len;   /* Bytes read into buf, minus what has been written */
+    size_t chunk_done;
+    bool nonblock;
+    bool pipe_out;
+    uint64_t off_in_gva, off_out_gva;
+    uint8_t buf[IO_COPY_BUF_SIZE];
+};
+
+/* The waker that completes a park and the task's own exit path can both reach
+ * for the continuation. io_wait_lock is the lock that already serializes
+ * retracting a parked wait, so the pointer is claimed under it: exactly one of
+ * the paths observes the record, and only that one releases its descriptor
+ * references.
+ */
+static struct io_stream_cont *io_stream_cont_take(thread_entry_t *t)
+{
+    pthread_mutex_lock(&io_wait_lock);
+    struct io_stream_cont *cont = t->io_stream_cont;
+    t->io_stream_cont = NULL;
+    pthread_mutex_unlock(&io_wait_lock);
+    return cont;
+}
+
+static void io_stream_cont_publish(thread_entry_t *t,
+                                   struct io_stream_cont *cont)
+{
+    pthread_mutex_lock(&io_wait_lock);
+    t->io_stream_cont = cont;
+    pthread_mutex_unlock(&io_wait_lock);
+}
+
+static void io_stream_cont_free(struct io_stream_cont *cont)
+{
+    if (!cont)
+        return;
+    host_fd_ref_close(&cont->in_ref);
+    host_fd_ref_close(&cont->out_ref);
+    free(cont);
+}
+
+/* Defined with the stream copiers. A park that abandons a pending chunk puts
+ * its unsent tail back through it before the SVC result is delivered.
+ */
+static bool io_rewind_unsent(int64_t off_in, int in_hfd, ssize_t unsent);
+
+void io_task_cancel_wait(struct thread_entry *t)
+{
+    if (!t)
+        return;
+
+    /* Retract the registration too: its reference and dup'ed descriptors go
+     * through the pump, so this is safe from the exit path even when it holds
+     * thread_lock. A pump wakeup still in flight carries the retired generation
+     * and can only drop that reference.
+     */
+    io_wait_cancel(t);
+    io_stream_cont_free(io_stream_cont_take(t));
+    t->io_continue_bytes = 0;
+}
+
+bool io_park_can_unmount(void)
+{
+    /* Whether the execution backend can unmount is its decision; every task is
+     * a pool task now, so a handler's own thread is the only condition.
+     */
+    return current_thread != NULL;
+}
+
+int64_t io_park_unmount_multi(const io_wait_source_t *sources,
+                              uint32_t nsrc,
+                              int timeout_ms)
+{
+    thread_entry_t *self = current_thread;
+    if (!self)
+        return -LINUX_EINVAL;
+
+    signal_check_timer_real();
+
+    if (thread_stop_requested() || signal_claim_interruption())
+        return -LINUX_EINTR;
+
+    if (timeout_ms == 0)
+        return 1;
+
+    if (nsrc > IO_WAIT_MAX_SOURCES)
+        nsrc = IO_WAIT_MAX_SOURCES;
+
+    /* No separate readiness probe: kqueue reports a descriptor's current state
+     * when the knote is added, so a source that became ready between the
+     * caller's failed transfer and this registration wakes the pump at once and
+     * the park completes with a reissue.
+     */
+
+    uint64_t guest_dl = 0;
+    if (timeout_ms > 0)
+        guest_dl = io_mono_ns() + (uint64_t) timeout_ms * 1000000ULL;
+
+    exec_park_kind_store(self, PARK_KIND_IO);
+    exec_park_result_pending_store(self, false);
+    exec_park_reissue_store(self, false);
+    self->park_guest = NULL;
+    self->io_park_fd = (sources && nsrc > 0) ? sources[0].fd : -1;
+    self->io_park_events = (sources && nsrc > 0) ? sources[0].events : 0;
+    self->io_park_deadline_ns = guest_dl;
+
+    sched_disarm_wait_deadline(self);
+
+    /* The generation is taken after every field of this park is written, and
+     * its release-ordered update precedes park_active: a waker that matches the
+     * generation sees a complete park, while one that races the arm reads a
+     * generation it cannot match until park_active is set. No event can arrive
+     * before the registration below, so there is no lost wake between them.
+     */
+    uint64_t park_seq = sched_park_seq_next(self);
+    exec_park_active_store(self, true);
+
+    if (!io_wait_register(self, sources, nsrc, guest_dl, park_seq)) {
+        /* No event pump, or the park was already completed: a bounded recheck
+         * is the only wake this wait has. If the park is already gone the
+         * deadline is harmless (the scan ignores an inactive park) and the next
+         * arm clears it.
+         */
+        uint64_t wake_at = io_mono_ns() + IO_WAIT_RECHECK_NS;
+        if (guest_dl != 0 && guest_dl < wake_at)
+            wake_at = guest_dl;
+        sched_arm_wait_deadline(self, wake_at);
+    }
+
+    /* A signal or stop request that landed between the generation publish and
+     * the visibility of park_active was invisible to the wake scan. Now that
+     * the park is published, run the same claim check the scan would: either
+     * this observes the interruption, or the scan observes the park.
+     */
+    io_park_on_interrupt(self);
+
+    return SYSCALL_PARKED;
+}
+
+int64_t io_park_unmount(int host_fd, short events, int timeout_ms)
+{
+    io_wait_source_t source = {.fd = host_fd, .events = events};
+    return io_park_unmount_multi(host_fd >= 0 ? &source : NULL,
+                                 host_fd >= 0 ? 1 : 0, timeout_ms);
+}
+
+static bool io_park_in_progress(const thread_entry_t *t)
+{
+    return t && exec_park_active_load(t) &&
+           exec_park_kind_load(t) == PARK_KIND_IO;
+}
+
+/* End an IO park after a signal or teardown. A read/write park that already
+ * moved bytes reports those bytes rather than EINTR, which is what Linux does
+ * for a blocking transfer interrupted after a short count. A splice park has
+ * the same rule, with its moved count carried in io_continue_bytes.
+ *
+ * The generation is read under io_wait_lock, which every IO completion takes.
+ * That makes the continuation claim and the completion atomic with respect to
+ * other wakers: once this completion wins, the task is runnable and a fresh
+ * syscall could look for a continuation, so the winner must retract it before
+ * publishing the wakeup. A pump completion that wins instead leaves the record
+ * published for the re-dispatched SVC.
+ */
+static void io_park_complete_interrupt(thread_entry_t *t)
+{
+    struct io_stream_cont *stream = NULL;
+    bool completed;
+
+    pthread_mutex_lock(&io_wait_lock);
+    if (!exec_park_active_load(t) || exec_park_kind_load(t) != PARK_KIND_IO) {
+        /* Some other waker already delivered this wait; leave its result and
+         * continuation alone.
+         */
+        pthread_mutex_unlock(&io_wait_lock);
+        return;
+    }
+    uint64_t park_seq = sched_park_seq(t);
+    uint64_t cont = t->io_continue_bytes;
+
+    /* A stream continuation means the moved count exists only for an in-place
+     * result: a re-dispatched splice drops io_continue_bytes at entry. Clear it
+     * before the completion can wake the task, so no fresh syscall can consume
+     * an old count. A read/write park has no second copy of its progress and
+     * keeps the count until this completion wins.
+     */
+    if (t->io_stream_cont != NULL)
+        t->io_continue_bytes = 0;
+    if ((cont & IO_CONT_VALID) != 0 && (cont & ~IO_CONT_VALID) > 0)
+        completed = sched_park_try_complete_seq(
+            t, PARK_KIND_IO, park_seq, (int64_t) (cont & ~IO_CONT_VALID));
+    else
+        completed = sched_park_try_complete_seq(t, PARK_KIND_IO, park_seq,
+                                                -LINUX_EINTR);
+    if (completed) {
+        stream = t->io_stream_cont;
+        t->io_stream_cont = NULL;
+        t->io_continue_bytes = 0;
+    }
+    pthread_mutex_unlock(&io_wait_lock);
+    if (stream && stream->chunk_done < stream->chunk_len) {
+        /* The SVC is not dispatched again, so the chunk is gone. Put the unsent
+         * tail back when the input can seek, so the descriptor's position
+         * matches the short count just delivered; a pipe cannot and keeps the
+         * old position.
+         */
+        (void) io_rewind_unsent(
+            stream->off_in, stream->in_ref.fd,
+            (ssize_t) (stream->chunk_len - stream->chunk_done));
+    }
+    io_stream_cont_free(stream);
+}
+
+void io_park_on_deadline(thread_entry_t *t)
+{
+    if (!io_park_in_progress(t))
+        return;
+
+    /* Mirror the sync io_wait slices: materialize ITIMER_REAL into a pending
+     * SIGALRM before the claim check. Use the quiet variant, because this runs
+     * on the slice-timer thread and signal_check_timer_real()'s attention_raise
+     * to thread_interrupt_all deadlocks there.
+     */
+    signal_check_timer_real_quiet();
+
+    /* Bind the wakeup to the park this scan was raised for: same generation and
+     * same wait deadline. A later park on the same task has both changed;
+     * completing it here would wake a wait whose deadline has not expired, and
+     * cancelling by task alone would retract the registration that keeps it
+     * alive.
+     */
+    uint64_t deadline = exec_park_deadline_ns_load(t);
+    if (deadline == 0 || deadline > sched_now_ns())
+        return;
+    uint64_t park_seq = sched_park_seq(t);
+    if (park_seq == 0)
+        return;
+
+    bool teardown = thread_stop_requested_for(t);
+    if (teardown || signal_claim_interruption_for_ex(t, false)) {
+        /* A pending signal or teardown belongs to whatever wait is live now, so
+         * the in-place path retires this generation. A later one it cannot name
+         * keeps its registration and completion.
+         */
+        io_wait_cancel_seq(t, teardown ? 0 : park_seq);
+        io_park_complete_interrupt(t);
+        return;
+    }
+
+    /* A fallback recheck or the guest deadline: re-run the SVC, which owns the
+     * timeout result and the remaining time.
+     */
+    io_wait_cancel_seq(t, park_seq);
+    pthread_mutex_lock(&io_wait_lock);
+    if (exec_park_kind_load(t) == PARK_KIND_IO &&
+        exec_park_deadline_ns_load(t) == deadline &&
+        sched_park_seq(t) == park_seq)
+        (void) sched_park_try_complete_reissue_seq(t, PARK_KIND_IO, park_seq);
+    pthread_mutex_unlock(&io_wait_lock);
+}
+
+void io_park_on_interrupt(thread_entry_t *t)
+{
+    if (!io_park_in_progress(t))
+        return;
+
+    /* Same claim-before-EINTR rule as futex/sleep parks. */
+    bool teardown = thread_stop_requested_for(t);
+    if (!teardown && !signal_claim_interruption_for(t))
+        return;
+
+    uint64_t park_seq = sched_park_seq(t);
+    if (park_seq == 0)
+        return;
+
+    io_wait_cancel_seq(t, teardown ? 0 : park_seq);
+    io_park_complete_interrupt(t);
+}
+
 int64_t io_wait_fd_or_interrupted(int host_fd, short events)
 {
     return io_wait_fd_timed_or_interrupted(host_fd, events, -1);
 }
 
-int64_t io_wait_fd_timed_or_interrupted(int host_fd,
-                                        short events,
-                                        int timeout_ms)
+/* allow_park is false only for a transfer that must not unmount. Every io_xfer
+ * caller today parks: guest-buffer transfers carry io_continue_bytes, splice
+ * carries the task's stream continuation, and the stream copiers park with the
+ * same byte count.
+ */
+static int64_t io_wait_fd_timed_ex(int host_fd,
+                                   short events,
+                                   int timeout_ms,
+                                   bool allow_park)
 {
+    if (timeout_ms != 0 && host_fd >= 0) {
+        struct pollfd ready = {.fd = host_fd, .events = events};
+        int probe = poll(&ready, 1, 0);
+        if (probe < 0)
+            return linux_errno();
+        if (probe > 0 && ready.revents)
+            return 0;
+    }
+    if (allow_park && io_park_can_unmount()) {
+        int64_t parked = io_park_unmount(host_fd, events, timeout_ms);
+        if (parked == SYSCALL_PARKED || parked <= 0 || parked == 1)
+            return parked;
+    }
+
     int wake_fd = wakeup_pipe_read_fd();
 
     /* An absolute deadline rather than a countdown: the 200 ms slices below
@@ -297,20 +1074,9 @@ int64_t io_wait_fd_timed_or_interrupted(int host_fd,
         signal_check_timer_real();
 
         /* Teardown leaves before polling: this thread is going away and has
-         * nobody to report readiness to. An execve handed to this leader is
-         * different, because the thread keeps running and the dispatcher
-         * restarts the SVC, so leaving without looking throws away a wait whose
-         * fd may already be ready and pays for a whole syscall re-entry to
-         * discover it. Look first, with a zero timeout so the run loop still
-         * reaches the handoff promptly, and leave only if there is nothing.
-         *
-         * Correctness does not depend on this: the restart re-polls either way,
-         * and a connect loop under a sibling exec loop completes 4000/4000 with
-         * or without it. Progress does. Measured over four runs of that loop,
-         * median 1.8 s here against 2.9 s when the wait leaves before polling.
+         * nobody to report readiness to.
          */
-        bool leader_only = thread_stop_is_leader_work_only();
-        if (!leader_only && thread_stop_requested())
+        if (thread_stop_requested())
             return -LINUX_EINTR;
 
         /* Ignored/default-ignore signals do not interrupt; restartable handlers
@@ -345,8 +1111,8 @@ int64_t io_wait_fd_timed_or_interrupted(int host_fd,
          * drain the byte meant to wake this one. The 200 ms recheck guarantees
          * every waiter re-evaluates its own interrupt conditions.
          */
-        int slice = leader_only ? 0 : 200;
-        if (bounded && !leader_only) {
+        int slice = 200;
+        if (bounded) {
             int64_t left = deadline_ms - io_now_ms();
             if (left <= 0)
                 return 1;
@@ -363,11 +1129,16 @@ int64_t io_wait_fd_timed_or_interrupted(int host_fd,
         if (fds[0].revents)
             return 0;
 
-        if (leader_only)
-            return -LINUX_EINTR;
         if (bounded && deadline_ms - io_now_ms() <= 0)
             return 1;
     }
+}
+
+int64_t io_wait_fd_timed_or_interrupted(int host_fd,
+                                        short events,
+                                        int timeout_ms)
+{
+    return io_wait_fd_timed_ex(host_fd, events, timeout_ms, true);
 }
 
 /* True when a transfer in this direction can work on a description opened with
@@ -478,23 +1249,103 @@ static int iov_advance(struct iovec *iov, int iovcnt, size_t moved)
 }
 
 
+/* Continuation helpers for a blocking read/write that parked after moving
+ * bytes. The handler consumes the task field on re-dispatch, and io_xfer arms
+ * it again at every wait; a result delivered in place clears it.
+ */
+uint64_t io_continue_take(void)
+{
+    thread_entry_t *t = current_thread;
+    if (!t)
+        return 0;
+    uint64_t cont = t->io_continue_bytes;
+    t->io_continue_bytes = 0;
+    return (cont & IO_CONT_VALID) != 0 ? cont & ~IO_CONT_VALID : 0;
+}
+
+static void io_cont_drop(void)
+{
+    if (current_thread)
+        current_thread->io_continue_bytes = 0;
+}
+
+/* park_ok: the caller's SVC can be re-dispatched after an unmount. False for a
+ * transfer holding a local chunk (the stream copiers), where a re-dispatched
+ * SVC could consume or emit the same bytes twice.
+ *
+ * continuation: NULL for a transfer whose caller keeps that local state;
+ * otherwise the bytes an earlier attempt of this SVC already moved, taken with
+ * io_cont_take(). The vector is advanced past those bytes so a re-dispatched
+ * SVC cannot move guest data twice.
+ */
 int64_t io_xfer(int fd,
                 int host_fd,
                 short events,
                 struct iovec *iov,
                 int iovcnt,
                 ssize_t *out,
-                const fd_block_state_t *pinned)
+                const fd_block_state_t *pinned,
+                bool park_ok,
+                const uint64_t *continuation)
 {
     bool is_read = (events & POLLIN) != 0;
     fd_block_state_t st = *pinned;
     bool is_socket = st.type == FD_SOCKET;
 
-    /* Nothing that can block: a regular file, a directory, or a closed slot on
-     * its way to EBADF. One host call, nothing asked before it.
+    /* Sum through the proved add rather than by hand: the total feeds the
+     * completion test below, and iov_total_add is where this tree states that
+     * an iovec sum cannot carry past SSIZE_MAX. Every caller reaching here has
+     * already been clamped, so the reject is unreachable today -- which is the
+     * same "unreachable by provenance rather than by construction" the header
+     * was written about.
      */
-    if (st.type == FD_CLOSED || !st.can_block) {
+    uint64_t want = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        if (!iov_total_add(want, iov[i].iov_len, &want)) {
+            if (continuation)
+                io_cont_drop();
+            return -LINUX_EINVAL;
+        }
+    }
+
+    /* A re-dispatched SVC resumes after the bytes an earlier attempt moved. */
+    uint64_t prior = continuation ? *continuation : 0;
+    if (prior > want)
+        prior = 0;
+    if (prior > 0) {
+        int spent = iov_advance(iov, iovcnt, (size_t) prior);
+        iov += spent;
+        iovcnt -= spent;
+    }
+    ssize_t total = (ssize_t) prior;
+    bool resumed = prior > 0;
+
+    /* Nothing to move: read(fd, buf, 0) and write(fd, buf, 0) report 0 on a
+     * blocking fd rather than waiting for one. Every caller guards this today,
+     * and the wait below would never end if one stopped.
+     */
+    if (want == 0) {
+        if (continuation)
+            io_cont_drop();
+        *out = 0;
+        return 0;
+    }
+    if ((uint64_t) total == want) {
+        if (continuation)
+            io_cont_drop();
+        *out = total;
+        return 0;
+    }
+
+    /* Nothing that can block: a regular file, a directory, or a closed slot on
+     * its way to EBADF. One host call, nothing asked before it. A resumed
+     * transfer stays on the waiting path so the remaining bytes still land
+     * before the SVC reports.
+     */
+    if (!resumed && (st.type == FD_CLOSED || !st.can_block)) {
         *out = io_xfer_once(host_fd, is_socket, is_read, iov, iovcnt);
+        if (continuation)
+            io_cont_drop();
         return 0;
     }
 
@@ -518,43 +1369,27 @@ int64_t io_xfer(int fd,
          * description another process shares, so a sibling that drains the pipe
          * between the poll and the read leaves the read blocked.
          */
-        if (st.call_nonblock) {
+        if (!resumed && st.call_nonblock) {
             struct pollfd pfd = {.fd = host_fd, .events = events};
             if (poll(&pfd, 1, 0) <= 0) {
+                if (continuation)
+                    io_cont_drop();
                 errno = EAGAIN;
                 *out = -1;
                 return 0;
             }
             *out = io_xfer_once(host_fd, is_socket, is_read, iov, iovcnt);
+            if (continuation)
+                io_cont_drop();
             return 0;
         }
-        if (!io_foreign_should_block(host_fd, events)) {
+        if (!resumed && !io_foreign_should_block(host_fd, events)) {
             *out = io_xfer_once(host_fd, is_socket, is_read, iov, iovcnt);
+            if (continuation)
+                io_cont_drop();
             return 0;
         }
         wait_first = true;
-    }
-
-    /* Sum through the proved add rather than by hand: the total feeds the
-     * completion test below, and iov_total_add is where this tree states that
-     * an iovec sum cannot carry past SSIZE_MAX. Every caller reaching here has
-     * already been clamped, so the reject is unreachable today -- which is the
-     * same "unreachable by provenance rather than by construction" the header
-     * was written about.
-     */
-    uint64_t want = 0;
-    for (int i = 0; i < iovcnt; i++) {
-        if (!iov_total_add(want, iov[i].iov_len, &want))
-            return -LINUX_EINVAL;
-    }
-
-    /* Nothing to move: read(fd, buf, 0) and write(fd, buf, 0) report 0 on a
-     * blocking fd rather than waiting for one. Every caller guards this today,
-     * and the wait below would never end if one stopped.
-     */
-    if (want == 0) {
-        *out = 0;
-        return 0;
     }
 
     /* Every way a round can end badly leaves through the tail below, which
@@ -565,19 +1400,62 @@ int64_t io_xfer(int fd,
      * return and errno are the answer. Both are set only on the round that
      * breaks, so neither can go stale.
      */
-    ssize_t total = 0, xfer_ret = 0;
+    ssize_t xfer_ret = 0;
     int xfer_errno = 0;
     int64_t fail = 0;
     unsigned backoff = 0, spins = 0;
     for (;;) {
         if (wait_first) {
-            int64_t waited = io_wait_fd_or_interrupted(host_fd, events);
-            if (waited < 0) {
-                /* Interrupted, by a guest signal or by elfuse's own teardown
-                 * and execve-handoff wakes.
+            /* A caller passing park_ok with no continuation owns the wait
+             * decision: it must record any progress and park itself, because
+             * only it knows what a re-dispatched SVC can rebuild.
+             *
+             * The probe is what keeps a re-dispatch from looping: the
+             * foreign-fd branch above enters this loop with wait_first set and
+             * has not transferred anything yet, so returning NEED_WAIT
+             * unconditionally would park on a descriptor kqueue immediately
+             * calls ready and then refuse to transfer it again. A ready
+             * descriptor transfers here; only an unready one goes back for the
+             * caller's park. Bytes already moved by this attempt are returned
+             * without another wait, since the caller's continuation carries
+             * them.
+             */
+            if (park_ok && continuation == NULL) {
+                if (total > 0) {
+                    *out = total;
+                    return IO_XFER_NEED_WAIT;
+                }
+                struct pollfd pfd = {.fd = host_fd, .events = events};
+                if (poll(&pfd, 1, 0) <= 0) {
+                    *out = total;
+                    return IO_XFER_NEED_WAIT;
+                }
+
+                /* Ready: transfer now rather than ask for a park that would
+                 * re-enter this same branch and refuse the transfer again.
                  */
-                fail = waited;
-                break;
+            } else {
+                int64_t waited;
+                if (total > 0) {
+                    /* Bytes already landed on the host fd. A guest-buffer
+                     * transfer regains its place through io_continue_bytes when
+                     * the SVC is re-dispatched.
+                     */
+                    if (continuation && current_thread)
+                        current_thread->io_continue_bytes =
+                            IO_CONT_VALID | (uint64_t) total;
+                    waited = io_wait_fd_timed_ex(
+                        host_fd, events, -1, park_ok && continuation != NULL);
+                } else {
+                    waited = io_wait_fd_timed_ex(host_fd, events, -1, park_ok);
+                }
+                if (waited < 0) {
+                    /* Interrupted, or parked. SYSCALL_PARKED leaves the
+                     * continuation field set and is returned below.
+                     */
+                    fail = waited;
+                    break;
+                }
             }
         }
 
@@ -672,6 +1550,14 @@ int64_t io_xfer(int fd,
         iovcnt -= spent;
     }
 
+    /* A parked result is not a failure: io_continue_bytes carries the bytes
+     * already moved, and the SVC is re-dispatched after the wake.
+     */
+    if (fail == SYSCALL_PARKED)
+        return SYSCALL_PARKED;
+    if (continuation)
+        io_cont_drop();
+
     /* A write that moved bytes and then found the reader gone reports the
      * count, and Linux still raises SIGPIPE: pipe_write sends the signal even
      * when it has something to return. io_write_result cannot do it, since the
@@ -727,12 +1613,11 @@ static int64_t tty_drain_interruptible(int host_fd)
             return 0;
 
         signal_check_timer_real();
-        bool leader_only = thread_stop_is_leader_work_only();
-        bool interrupted = (!leader_only && thread_stop_requested()) ||
-                           (!leader_only && futex_interrupt_consume()) ||
+        bool interrupted = thread_stop_requested() ||
+                           futex_interrupt_consume() ||
                            signal_claim_interruption();
         if (!interrupted) {
-            int ret = poll(fds, 1, leader_only ? 0 : 20);
+            int ret = poll(fds, 1, 20);
             if (ret < 0 && errno != EINTR)
                 return linux_errno();
 
@@ -744,7 +1629,6 @@ static int64_t tty_drain_interruptible(int host_fd)
              */
             if (ret > 0 && wake_fd >= 0 && (fds[0].revents & POLLIN))
                 wakeup_pipe_drain();
-            interrupted = leader_only;
         }
         if (interrupted) {
             /* Linux returns a plain -EINTR here (not ERESTARTSYS), and part of
@@ -967,9 +1851,10 @@ static bool rosetta_ioctl_target_fd(guest_t *g, int host_fd)
      * rosetta_finalize publishes the bounds before issuing any ioctl.
      */
     if (g->rosetta_va_base && g->rosetta_size) {
-        if (!current_thread)
+        hv_vcpu_t vcpu = 0;
+        if (!vcpu_pool_current_vcpu(&vcpu))
             return false;
-        uint64_t pc = vcpu_get_sysreg(current_thread->vcpu, HV_SYS_REG_ELR_EL1);
+        uint64_t pc = vcpu_get_sysreg(vcpu, HV_SYS_REG_ELR_EL1);
         if (pc < g->rosetta_va_base ||
             pc - g->rosetta_va_base >= g->rosetta_size)
             return false;
@@ -1646,7 +2531,11 @@ static int64_t fsize_limit_writev(int host_fd,
     return 0;
 }
 
-int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
+static int64_t sys_write_cont(guest_t *g,
+                              int fd,
+                              uint64_t buf_gva,
+                              uint64_t count,
+                              uint64_t prior)
 {
     int type = fd_get_type(fd);
     if (type == FD_FUSE_DEV)
@@ -1720,7 +2609,8 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
      */
     struct iovec iov = {.iov_base = buf, .iov_len = count};
     ssize_t ret;
-    int64_t wwait = io_xfer(fd, host_ref.fd, POLLOUT, &iov, 1, &ret, &write_st);
+    int64_t wwait = io_xfer(fd, host_ref.fd, POLLOUT, &iov, 1, &ret, &write_st,
+                            true, &prior);
     if (wwait < 0) {
         host_fd_ref_close(&host_ref);
         return wwait;
@@ -1728,6 +2618,11 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
 
     host_fd_ref_close(&host_ref);
     return io_write_result(ret);
+}
+
+int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
+{
+    return sys_write_cont(g, fd, buf_gva, count, io_continue_take());
 }
 
 int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
@@ -1814,7 +2709,9 @@ int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
      */
     struct iovec iov = {.iov_base = buf, .iov_len = count};
     ssize_t ret;
-    int64_t rwait = io_xfer(fd, host_ref.fd, POLLIN, &iov, 1, &ret, &read_st);
+    uint64_t prior = 0;
+    int64_t rwait =
+        io_xfer(fd, host_ref.fd, POLLIN, &iov, 1, &ret, &read_st, true, &prior);
     if (rwait < 0) {
         host_fd_ref_close(&host_ref);
         return rwait;
@@ -2399,8 +3296,9 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
     }
 
     ssize_t ret;
-    int64_t rwait =
-        io_xfer(fd, host_ref.fd, POLLIN, host_iov.iov, iovcnt, &ret, &readv_st);
+    uint64_t prior = 0;
+    int64_t rwait = io_xfer(fd, host_ref.fd, POLLIN, host_iov.iov, iovcnt, &ret,
+                            &readv_st, true, &prior);
     if (rwait < 0) {
         host_iov_free(&host_iov);
         host_fd_ref_close(&host_ref);
@@ -2415,6 +3313,8 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
 
 int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
 {
+    uint64_t prior = io_continue_take();
+
     /* Ahead of every shortcut below, including the empty-vector one:
      * do_iter_write refuses on the file's mode before it looks at the vector.
      */
@@ -2433,7 +3333,7 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
         int64_t err = single_guest_iov(g, iov_gva, &giov);
         if (err < 0)
             return err;
-        return sys_write(g, fd, giov.iov_base, giov.iov_len);
+        return sys_write_cont(g, fd, giov.iov_base, giov.iov_len, prior);
     }
 
     /* Special FD types: glibc may use writev() for eventfd wakeup writes.
@@ -2491,7 +3391,7 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
 
     ssize_t ret;
     int64_t wwait = io_xfer(fd, host_ref.fd, POLLOUT, host_iov.iov, iovcnt,
-                            &ret, &writev_st);
+                            &ret, &writev_st, true, &prior);
     if (wwait < 0) {
         host_iov_free(&host_iov);
         host_fd_ref_close(&host_ref);
@@ -2963,6 +3863,16 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
             fd_table[fd].linux_flags &= ~LINUX_O_CLOEXEC;
         pthread_mutex_unlock(&fd_lock);
         return 0;
+    }
+
+    /* PIDFD_GET_INFO: type 0xFF nr 11, _IOWR. Match by type+nr; size varies
+     * across uapi versions (VER0=64 .. VER3=88+).
+     */
+    if (((request >> 8) & 0xff) == 0xff && (request & 0xff) == 11 &&
+        ((request >> 30) & 3) == 3) {
+        if (fd_get_type(fd) != FD_PIDFD)
+            return -LINUX_ENOTTY;
+        return pidfd_ioctl_get_info(g, fd, arg);
     }
 
     /* usbdevfs fds answer their own ioctl set; the host fd behind them is a
@@ -3832,12 +4742,6 @@ int64_t sys_fallocate(int fd, int mode, int64_t offset, int64_t len)
     return 0;
 }
 
-/* Scratch buffer size for the file-copy syscall emulations. Heap-allocated per
- * call rather than placed on the stack: guest threads run on host pthreads
- * whose stacks are far smaller than a 64KiB frame would tolerate.
- */
-#define IO_COPY_BUF_SIZE (64 * 1024)
-
 /* Chunked read/write copy shared by sendfile and copy_file_range. Reads from
  * in_hfd (honoring proc_try_chunk_read_intercept for /proc-backed guest fd
  * in_gfd) and writes to out_hfd. A non-negative *off_in / *off_out selects
@@ -3874,33 +4778,6 @@ static bool io_rewind_unsent(int64_t off_in, int in_hfd, ssize_t unsent)
     return lseek(in_hfd, (off_t) -unsent, SEEK_CUR) >= 0;
 }
 
-/* An interrupted write of a chunk already drained out of the input: give up on
- * it, or keep writing?
- *
- * If the unsent tail can be put back, the interruption is reportable and the
- * guest loses nothing. If it cannot -- a pipe, the usual splice input --
- * abandoning it drops those bytes outright, so the write has to continue: an
- * ordinary SIGCHLD arriving mid-splice must not eat 64 KiB of the guest's
- * stream. Teardown is the one interruption that wins anyway, because the thread
- * is going away and the image with it, so there is nobody left for the bytes to
- * reach; without it the caller would spin, since io_xfer reports the stop
- * request every time it is asked.
- *
- * Both stream copiers ask this, and they asked it in opposite spellings before
- * it was one function. *rewound_out says which of the two answers a true return
- * came from, because only the caller can spell syscall_restart_forbid() where
- * scripts/check-eintr-contract.py can see it, and only the teardown answer owes
- * it: an input the rewind put back is one the restart may safely re-read.
- */
-static bool io_give_up_unsent(int64_t off_in,
-                              int in_hfd,
-                              ssize_t unsent,
-                              bool *rewound_out)
-{
-    bool rewound = io_rewind_unsent(off_in, in_hfd, unsent);
-    *rewound_out = rewound;
-    return rewound || thread_stop_requested();
-}
 
 /* fsize_room for a stream copy: @off_out is the output offset, or negative for
  * the descriptor's own position.
@@ -3922,8 +4799,11 @@ static bool fsize_copy_room(int out_hfd, int64_t off_out, uint64_t *room)
  * or answers EAGAIN when it does not block, and one whose writers are gone ends
  * the copy. Nothing is waited for once bytes have moved.
  *
- * Returns 1 after sending SIGXFSZ, 0 when the input has nothing more, or a
- * negative Linux errno from the read or the wait.
+ * Returns 1 after sending SIGXFSZ, 0 when the input has nothing more,
+ * IO_XFER_NEED_WAIT when the caller must park for input readiness, or a
+ * negative Linux errno from the probe. The wait itself is never taken here: a
+ * task that parked would hold no worker, and splice's continuation already
+ * carries everything the SVC needs to resume.
  */
 static int64_t copy_past_fsize(int in_hfd,
                                int64_t off_in,
@@ -3941,29 +4821,26 @@ static int64_t copy_past_fsize(int in_hfd,
         return 1;
     }
 
-    /* A pipe's write end never turns readable while its read end is open, so
-     * the wait below would never end. do_splice and do_sendfile refuse an input
-     * not open for reading with EBADF before they look at anything else.
+    /* A pipe's write end never turns readable while its read end is open, so a
+     * readiness probe would never complete. do_splice and do_sendfile refuse an
+     * input not open for reading with EBADF before they look at anything else.
      */
     int in_fl = fcntl(in_hfd, F_GETFL);
     if (in_fl >= 0 && (in_fl & O_ACCMODE) == O_WRONLY)
         return -LINUX_EBADF;
-    for (;;) {
-        int queued = 0;
-        if (ioctl(in_hfd, FIONREAD, &queued) == 0 && queued > 0) {
-            sys_rlimit_send_xfsz();
-            return 1;
-        }
 
-        struct pollfd pfd = {.fd = in_hfd, .events = POLLIN};
-        if (!nothing_moved || (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLHUP)))
-            return 0;
-        if (!io_eagain_should_wait(in_st, in_hfd))
-            return -LINUX_EAGAIN;
-        int64_t waited = io_wait_fd_or_interrupted(in_hfd, POLLIN);
-        if (waited < 0)
-            return waited;
+    int queued = 0;
+    if (ioctl(in_hfd, FIONREAD, &queued) == 0 && queued > 0) {
+        sys_rlimit_send_xfsz();
+        return 1;
     }
+
+    struct pollfd pfd = {.fd = in_hfd, .events = POLLIN};
+    if (!nothing_moved || (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLHUP)))
+        return 0;
+    if (!io_eagain_should_wait(in_st, in_hfd))
+        return -LINUX_EAGAIN;
+    return IO_XFER_NEED_WAIT;
 }
 
 typedef struct {
@@ -3972,10 +4849,40 @@ typedef struct {
     fd_block_state_t in_st, out_st;
 } copy_ends_t;
 
+/* Park after a chunk read from the input has been only partly written. The
+ * unsent tail is put back when the input is seekable, so the re-dispatched SVC
+ * resumes at the first unwritten byte, which is what io_continue_bytes and the
+ * guest offsets reconstruct.
+ *
+ * Unrewindable inputs no longer have a fallback here: do_sendfile rejects a
+ * pipe input with EINVAL before any byte moves (do_splice_direct's do_splice_to
+ * requires splice_read, which a pipe does not have), and copy_file_range only
+ * takes regular files. If one reaches this anyway, IO_XFER_NEED_WAIT says the
+ * chunk cannot be carried across a park; the caller reports the bytes that did
+ * land instead of pinning the worker.
+ */
+static int64_t copy_park_unsent(const copy_ends_t *ends,
+                                int64_t off_in,
+                                ssize_t unsent,
+                                uint64_t total)
+{
+    if (!io_rewind_unsent(off_in, ends->in_hfd, unsent))
+        return IO_XFER_NEED_WAIT;
+    if (current_thread)
+        current_thread->io_continue_bytes = IO_CONT_VALID | total;
+    int64_t parked = io_park_unmount(ends->out_hfd, POLLOUT, -1);
+    if (parked == SYSCALL_PARKED)
+        return SYSCALL_PARKED;
+    if (current_thread)
+        current_thread->io_continue_bytes = 0;
+    return total > 0 ? (int64_t) total : parked;
+}
+
 static int64_t copy_fd_range(const copy_ends_t *ends,
                              int64_t *off_in,
                              int64_t *off_out,
-                             uint64_t len)
+                             uint64_t len,
+                             uint64_t prior)
 {
     int in_gfd = ends->in_gfd, in_hfd = ends->in_hfd;
     int out_gfd = ends->out_gfd, out_hfd = ends->out_hfd;
@@ -3983,11 +4890,14 @@ static int64_t copy_fd_range(const copy_ends_t *ends,
     fd_block_state_t in_st = ends->in_st;
     fd_block_state_t out_st = ends->out_st;
 
+    if (prior > len)
+        prior = 0;
+
     char *buf = malloc(IO_COPY_BUF_SIZE);
     if (!buf)
         return -LINUX_ENOMEM;
 
-    size_t total = 0, remaining = len;
+    size_t total = (size_t) prior, remaining = len - prior;
     int64_t ret;
     while (remaining > 0) {
         size_t chunk =
@@ -3997,6 +4907,19 @@ static int64_t copy_fd_range(const copy_ends_t *ends,
             if (room == 0) {
                 int64_t past =
                     copy_past_fsize(in_hfd, *off_in, &in_st, total == 0);
+                if (past == IO_XFER_NEED_WAIT) {
+                    /* The caller owns the wait: park for input readiness and
+                     * let the re-dispatched SVC repeat the probe.
+                     */
+                    if (current_thread)
+                        current_thread->io_continue_bytes =
+                            IO_CONT_VALID | total;
+                    int64_t parked = io_park_unmount(in_hfd, POLLIN, -1);
+                    ret = parked == SYSCALL_PARKED
+                              ? parked
+                              : (total > 0 ? (int64_t) total : parked);
+                    goto done;
+                }
                 if (total == 0 && past != 0) {
                     ret = past > 0 ? -LINUX_EFBIG : past;
                     goto done;
@@ -4023,8 +4946,21 @@ static int64_t copy_fd_range(const copy_ends_t *ends,
                  * to go through io_xfer to keep the guest's blocking semantics.
                  */
                 struct iovec iov = {.iov_base = buf, .iov_len = chunk};
-                int64_t waited =
-                    io_xfer(in_gfd, in_hfd, POLLIN, &iov, 1, &nr, &in_st);
+                int64_t waited = io_xfer(in_gfd, in_hfd, POLLIN, &iov, 1, &nr,
+                                         &in_st, true, NULL);
+                if (waited == IO_XFER_NEED_WAIT) {
+                    /* Nothing consumed yet: park for input readiness and let
+                     * the re-dispatched SVC repeat this read.
+                     */
+                    if (current_thread)
+                        current_thread->io_continue_bytes =
+                            IO_CONT_VALID | total;
+                    int64_t parked = io_park_unmount(in_hfd, POLLIN, -1);
+                    ret = parked == SYSCALL_PARKED
+                              ? parked
+                              : (total > 0 ? (int64_t) total : parked);
+                    goto done;
+                }
                 if (waited < 0) {
                     ret = total > 0 ? (int64_t) total : waited;
                     goto done;
@@ -4038,42 +4974,44 @@ static int64_t copy_fd_range(const copy_ends_t *ends,
         if (nr == 0)
             break; /* EOF */
 
-        ssize_t nw;
+        ssize_t nw = 0;
         if (*off_out >= 0) {
             nw = pwrite(out_hfd, buf, nr, *off_out);
         } else {
             struct iovec iov = {.iov_base = buf, .iov_len = (size_t) nr};
-            unsigned backoff = 0;
-            for (;;) {
-                int64_t waited =
-                    io_xfer(out_gfd, out_hfd, POLLOUT, &iov, 1, &nw, &out_st);
-                if (waited >= 0)
-                    break;
+            int64_t waited = io_xfer(out_gfd, out_hfd, POLLOUT, &iov, 1, &nw,
+                                     &out_st, true, NULL);
+            if (waited == IO_XFER_NEED_WAIT || waited == SYSCALL_PARKED) {
+                ssize_t written =
+                    (waited == IO_XFER_NEED_WAIT && nw > 0) ? nw : 0;
+                total += (size_t) written;
+                remaining -= (size_t) written;
+                if (*off_in >= 0)
+                    *off_in += written;
+                if (*off_out >= 0)
+                    *off_out += written;
 
-                /* The retry has to be this inner loop and not the outer one:
-                 * continuing there would read a fresh chunk over the nr bytes
-                 * still sitting in buf and drop them, which is exactly what
-                 * keeping the write alive exists to prevent. io_xfer leaves iov
-                 * untouched when it reports a negative, since it only rewrites
-                 * the vector once something has moved and never fails after
-                 * that, so the same iov is safe to hand back. sendfile does not
-                 * reject a pipe in_fd the way Linux does, so an unrewindable
-                 * input is reachable here too.
-                 */
-                bool rewound;
-                if (io_give_up_unsent(*off_in, in_hfd, nr, &rewound)) {
-                    if (!rewound)
-                        syscall_restart_forbid();
-                    ret = total > 0 ? (int64_t) total : waited;
-                    goto done;
+                ssize_t unsent = nr - written;
+                ret = copy_park_unsent(ends, *off_in, unsent, (uint64_t) total);
+                if (ret == IO_XFER_NEED_WAIT) {
+                    /* The input cannot put the unsent tail back, so a
+                     * re-dispatched SVC would start past those bytes. Report
+                     * the short count instead of finishing the chunk in line.
+                     */
+                    syscall_restart_forbid();
+                    ret = total > 0 ? (int64_t) total : -LINUX_EINVAL;
                 }
-
-                /* Nothing to give up on and nothing tearing this thread down,
-                 * so the write has to keep going. io_xfer answers the pending
-                 * signal on entry, so retrying it bare is a spin; sleep between
-                 * rounds instead.
-                 */
-                io_backoff_sleep(&backoff);
+                goto done;
+            }
+            if (waited < 0) {
+                ret = total > 0 ? (int64_t) total : waited;
+                goto done;
+            }
+            if (nw < 0) {
+                if (errno == EPIPE)
+                    signal_queue(LINUX_SIGPIPE);
+                ret = total > 0 ? (int64_t) total : linux_errno();
+                goto done;
             }
         }
         if (nw < 0) {
@@ -4083,21 +5021,15 @@ static int64_t copy_fd_range(const copy_ends_t *ends,
             goto done;
         }
 
-        total += nw;
-        remaining -= nw;
+        total += (size_t) nw;
+        remaining -= (size_t) nw;
         if (*off_in >= 0)
             *off_in += nw;
         if (*off_out >= 0)
             *off_out += nw;
         if (nw < nr) {
-            /* Short write. For position-based input, read() already consumed
-             * all nr bytes but only nw were sent, so rewind the input fd by the
-             * unsent nr - nw so a later call re-reads them. Linux advances the
-             * input only by bytes actually transferred. For offset-based input,
-             * pread left the position untouched and off_in advanced by nw only,
-             * so there is nothing to undo. Best-effort: a non-seekable input
-             * (which sendfile/copy_file_range do not accept) simply keeps the
-             * prior behavior.
+            /* A short write that did not park: put the unsent tail back and
+             * report the count, the way a nonblocking write does.
              */
             (void) io_rewind_unsent(*off_in, in_hfd, nr - nw);
             break;
@@ -4107,6 +5039,8 @@ static int64_t copy_fd_range(const copy_ends_t *ends,
 
 done:
     free(buf);
+    if (ret != SYSCALL_PARKED && current_thread)
+        current_thread->io_continue_bytes = 0;
     return ret;
 }
 
@@ -4145,6 +5079,13 @@ int64_t sys_sendfile(guest_t *g,
                      uint64_t offset_gva,
                      uint64_t count)
 {
+    /* A re-dispatched SVC resumes after the bytes the parked attempt moved.
+     * Taken before any descriptor check: a check that now fails on a reused
+     * guest fd must still consume the continuation, or it would leak into the
+     * next syscall.
+     */
+    uint64_t prior = io_continue_take();
+
     host_fd_ref_t out_ref, in_ref;
     fd_block_state_t out_st, in_st;
     int64_t err = host_fd_ref_open_io_state(out_fd, &out_ref, NULL, &out_st);
@@ -4177,6 +5118,29 @@ int64_t sys_sendfile(guest_t *g,
     if (err < 0)
         goto out_sendfile;
 
+    /* do_sendfile hands the copy to do_splice_direct, whose do_splice_to
+     * refuses an input without splice_read. A pipe has none: do_splice's FIFO
+     * branch is specific to splice(2), so sendfile from a pipe is EINVAL, after
+     * the read-mode, offset and output checks (Linux fs/read_write.c,
+     * fs/splice.c). Refusing it here also leaves copy_fd_range without an
+     * unrewindable input, which is what makes its partial-write park sound: a
+     * pipe input would have consumed a chunk that no re-dispatched SVC could
+     * rebuild.
+     */
+    struct stat in_sb;
+    if (fstat(in_ref.fd, &in_sb) == 0 && S_ISFIFO(in_sb.st_mode)) {
+        err = -LINUX_EINVAL;
+        goto out_sendfile;
+    }
+
+    /* Offsets advance by the continuation, so the guest's original offset plus
+     * the bytes the parked attempt moved is where the transfer resumes.
+     */
+    if (prior > count)
+        prior = 0;
+    if (offset >= 0)
+        offset += (int64_t) prior;
+
     /* sendfile has no output offset, so out always uses write(). */
     int64_t off_out = -1;
     int64_t moved = copy_fd_range(&(copy_ends_t) {.in_gfd = in_fd,
@@ -4185,7 +5149,7 @@ int64_t sys_sendfile(guest_t *g,
                                                   .out_gfd = out_fd,
                                                   .out_hfd = out_ref.fd,
                                                   .out_st = out_st},
-                                  &offset, &off_out, count);
+                                  &offset, &off_out, count, prior);
     if (moved < 0) {
         err = moved;
         goto out_sendfile;
@@ -4261,6 +5225,12 @@ int64_t sys_copy_file_range(guest_t *g,
     if (flags != 0)
         return -LINUX_EINVAL;
 
+    /* Continuation after a park: taken before any descriptor check, so a check
+     * that now fails on a reused guest fd cannot leave the byte count for the
+     * next syscall to pick up.
+     */
+    uint64_t prior = io_continue_take();
+
     host_fd_ref_t in_ref, out_ref;
     fd_block_state_t in_st, out_st;
     int64_t err = host_fd_ref_open_io_state(fd_in, &in_ref, NULL, &in_st);
@@ -4304,6 +5274,14 @@ int64_t sys_copy_file_range(guest_t *g,
         goto out_copy_file_range;
     }
 
+    /* Skip the bytes the earlier attempt moved. */
+    if (prior > len)
+        len = prior;
+    if (off_in >= 0)
+        off_in += (int64_t) prior;
+    if (off_out >= 0)
+        off_out += (int64_t) prior;
+
     /* generic_copy_file_checks (Linux fs/read_write.c) applies RLIMIT_FSIZE to
      * the whole request before anything is read: EFBIG and SIGXFSZ at or past
      * the limit whatever the length, and a length cut at the limit otherwise.
@@ -4326,7 +5304,7 @@ int64_t sys_copy_file_range(guest_t *g,
                                                   .out_gfd = fd_out,
                                                   .out_hfd = out_ref.fd,
                                                   .out_st = out_st},
-                                  &off_in, &off_out, len);
+                                  &off_in, &off_out, len, prior);
     if (moved < 0) {
         err = moved;
         goto out_copy_file_range;
@@ -4355,76 +5333,75 @@ out_copy_file_range:
 
 /* splice/tee. */
 
-/* splice: emulate by reading from in_fd and writing to out_fd One splice chunk
- * in flight: the two ends, and the guest offsets that advance with it. Kept
- * together so the drain below can be a function rather than a fourth level of
- * nesting inside sys_splice.
+/* Why the splice loop stopped, when it stopped early. A park request is not a
+ * failure: the continuation carries the pending chunk and the offsets to the
+ * SVC's next dispatch.
  */
 typedef struct {
-    int fd_in, in_hfd;
-    int fd_out, out_hfd;
-    int64_t off_in, off_out; /* -1 when the guest passed no offset */
-
-    /* Both ends classified once, from the descriptors sys_splice pinned. The
-     * per-chunk alternative lets a sibling reusing either fd number change the
-     * transfer form partway through a copy that is still holding the old
-     * descriptors.
-     */
-    fd_block_state_t in_st, out_st;
-} splice_state_t;
-
-/* Why the drain stopped, when it stopped early. */
-typedef struct {
     bool stop;        /* the outer loop must end */
+    bool park;        /* the caller must park on park_fd/park_events */
     bool rw_error;    /* a write failed; errno is in saved_errno */
     int saved_errno;  /* preserved across the guest writes at done */
     int64_t wait_err; /* interrupted wait, reported only if nothing moved */
+    int park_fd;
+    short park_events;
 } splice_fail_t;
 
-/* Drain one read chunk to the output the way splice does: a short write is
- * continued rather than reported, so the chunk either lands whole or the caller
- * stops.
+/* Drain the chunk the continuation holds to the output the way splice does: a
+ * short write is continued rather than reported, so the chunk either lands
+ * whole or the loop stops. When the output asks to block, the unsent tail is
+ * already recorded in cont (chunk_done/chunk_len, off_out, moved) and the
+ * caller parks; the SVC's next dispatch drains it before reading more, so no
+ * worker is held and no byte is replayed.
  *
- * Returns the bytes written, which is the caller's whole accounting; the input
- * rewind that a partial chunk needs happens here, since only this loop knows
- * how much of the chunk never left.
+ * Returns the bytes written in this call. The input rewind that a failed
+ * partial chunk needs happens here, since only this loop knows how much of the
+ * chunk never left.
  */
-static size_t splice_drain_chunk(splice_state_t *st,
-                                 uint8_t *buf,
-                                 size_t n,
-                                 splice_fail_t *f)
+static size_t splice_drain_chunk(struct io_stream_cont *cont, splice_fail_t *f)
 {
     size_t written = 0;
-    unsigned backoff = 0;
-    while (written < n) {
-        ssize_t w;
-        if (st->off_out >= 0) {
-            w = pwrite(st->out_hfd, buf + written, n - written, st->off_out);
+    while (cont->chunk_done < cont->chunk_len) {
+        size_t left = cont->chunk_len - cont->chunk_done;
+        ssize_t w = 0;
+        if (cont->off_out >= 0) {
+            w = pwrite(cont->out_ref.fd, cont->buf + cont->chunk_done, left,
+                       cont->off_out);
         } else {
-            struct iovec iov = {.iov_base = buf + written,
-                                .iov_len = n - written};
-            int64_t waited = io_xfer(st->fd_out, st->out_hfd, POLLOUT, &iov, 1,
-                                     &w, &st->out_st);
-            if (waited < 0) {
-                bool rewound;
-                if (io_give_up_unsent(st->off_in, st->in_hfd,
-                                      (ssize_t) (n - written), &rewound)) {
-                    if (!rewound)
-                        syscall_restart_forbid();
-                    f->wait_err = waited;
-                    f->stop = true;
-                    return written;
+            struct iovec iov = {.iov_base = cont->buf + cont->chunk_done,
+                                .iov_len = left};
+            int64_t waited = io_xfer(cont->out_gfd, cont->out_ref.fd, POLLOUT,
+                                     &iov, 1, &w, &cont->out_st, true, NULL);
+            if (waited == IO_XFER_NEED_WAIT) {
+                if (w > 0) {
+                    cont->chunk_done += (size_t) w;
+                    cont->moved += (size_t) w;
+                    if (cont->off_in >= 0)
+                        cont->off_in += w;
+                    if (cont->off_out >= 0)
+                        cont->off_out += w;
+                    written += (size_t) w;
                 }
 
-                /* Nothing to give up on and nothing tearing this thread down,
-                 * so the write has to keep going. io_xfer answers the pending
-                 * signal on entry, so retrying it bare is a spin; sleep between
-                 * rounds instead.
+                /* The tail stays in cont. If the arm cannot park and this
+                 * reports EINTR, re-running the SVC would read past bytes the
+                 * input has already given up.
                  */
-                io_backoff_sleep(&backoff);
-                continue;
+                syscall_restart_forbid();
+                f->park = true;
+                f->park_fd = cont->out_ref.fd;
+                f->park_events = POLLOUT;
+                f->stop = true;
+                return written;
             }
-            backoff = 0;
+            if (waited < 0) {
+                if (!io_rewind_unsent(cont->off_in, cont->in_ref.fd,
+                                      (ssize_t) left))
+                    syscall_restart_forbid();
+                f->wait_err = waited;
+                f->stop = true;
+                return written;
+            }
         }
         if (w <= 0) {
             if (w < 0) {
@@ -4434,23 +5411,28 @@ static size_t splice_drain_chunk(splice_state_t *st,
                     signal_queue(LINUX_SIGPIPE);
             }
 
-            /* Position-based input: read() consumed all n bytes but only
-             * written were moved, so rewind the input by the difference to
-             * match Linux advancing only by bytes transferred. Best-effort; a
-             * pipe input, the common splice case, cannot seek and keeps the
-             * prior behavior.
+            /* Position-based input: the read consumed the whole chunk but only
+             * chunk_done went out, so rewind the difference to match Linux
+             * advancing only by bytes transferred. A pipe input cannot seek;
+             * the guest is handed the short count and the unread tail stays
+             * consumed.
              */
-            (void) io_rewind_unsent(st->off_in, st->in_hfd,
-                                    (ssize_t) (n - written));
+            if (!io_rewind_unsent(cont->off_in, cont->in_ref.fd,
+                                  (ssize_t) left))
+                syscall_restart_forbid();
             f->stop = true;
             return written;
         }
+        cont->chunk_done += (size_t) w;
+        cont->moved += (size_t) w;
+        if (cont->off_in >= 0)
+            cont->off_in += w;
+        if (cont->off_out >= 0)
+            cont->off_out += w;
         written += (size_t) w;
-        if (st->off_in >= 0)
-            st->off_in += w;
-        if (st->off_out >= 0)
-            st->off_out += w;
     }
+    cont->chunk_len = 0;
+    cont->chunk_done = 0;
     return written;
 }
 
@@ -4492,6 +5474,39 @@ static bool splice_end_nonblock(const fd_block_state_t *st, int host_fd)
     return fl >= 0 && (fl & O_NONBLOCK);
 }
 
+/* Publish @cont and unmount the task until @host_fd answers @events. The
+ * continuation belongs to the task from here: a pump completion re-dispatches
+ * the SVC, and a signal completion frees the record after reporting the bytes
+ * already moved. An arm that fails before the unmount leaves the record with
+ * the caller, which is the only path that returns a result instead of parking.
+ */
+static int64_t io_splice_park(struct io_stream_cont *cont,
+                              int host_fd,
+                              short events)
+{
+    thread_entry_t *t = current_thread;
+    if (!t)
+        return cont->moved > 0 ? (int64_t) cont->moved : -LINUX_EINVAL;
+
+    t->io_continue_bytes = IO_CONT_VALID | cont->moved;
+    io_stream_cont_publish(t, cont);
+    int64_t parked = io_park_unmount(host_fd, events, -1);
+    if (parked == SYSCALL_PARKED)
+        return SYSCALL_PARKED;
+
+    /* The arm failed before unmounting, so no completion can have claimed the
+     * continuation. The pending tail is about to be dropped with it; put it
+     * back first when the input can seek, so the descriptor position matches
+     * the short count this call is about to report.
+     */
+    (void) io_stream_cont_take(t);
+    t->io_continue_bytes = 0;
+    if (cont->chunk_done < cont->chunk_len)
+        (void) io_rewind_unsent(cont->off_in, cont->in_ref.fd,
+                                (ssize_t) (cont->chunk_len - cont->chunk_done));
+    return cont->moved > 0 ? (int64_t) cont->moved : parked;
+}
+
 int64_t sys_splice(guest_t *g,
                    int fd_in,
                    uint64_t off_in_gva,
@@ -4506,118 +5521,169 @@ int64_t sys_splice(guest_t *g,
     if (len == 0)
         return 0;
 
-    host_fd_ref_t in_ref, out_ref;
-    fd_block_state_t in_st, out_st;
-    int64_t err = host_fd_ref_open_io_state(fd_in, &in_ref, NULL, &in_st);
-    if (err < 0)
-        return err;
-    err = host_fd_ref_open_io_state(fd_out, &out_ref, NULL, &out_st);
-    if (err < 0) {
-        host_fd_ref_close(&in_ref);
-        return err;
-    }
-
-    /* Handle offsets */
-    int64_t off_in = -1, off_out = -1;
-    if (off_in_gva) {
-        if (guest_read_small(g, off_in_gva, &off_in, sizeof(off_in)) < 0) {
-            host_fd_ref_close(&out_ref);
-            host_fd_ref_close(&in_ref);
-            return -LINUX_EFAULT;
-        }
-    }
-    if (off_out_gva) {
-        if (guest_read_small(g, off_out_gva, &off_out, sizeof(off_out)) < 0) {
-            host_fd_ref_close(&out_ref);
-            host_fd_ref_close(&in_ref);
-            return -LINUX_EFAULT;
+    struct io_stream_cont *cont = NULL;
+    if (current_thread) {
+        cont = io_stream_cont_take(current_thread);
+        if (cont && cont->kind != IO_STREAM_CONT_SPLICE) {
+            io_stream_cont_free(cont);
+            cont = NULL;
         }
     }
 
-    err = splice_in_check(in_ref.fd);
-    if (err == 0)
-        err = splice_out_check(out_ref.fd);
-    if (err < 0) {
-        host_fd_ref_close(&out_ref);
-        host_fd_ref_close(&in_ref);
-        return err;
+    if (cont) {
+        /* A re-dispatched SVC. The pending chunk, the offsets and the pinned
+         * ends are the ones the original call left; the guest fd numbers may
+         * have been closed and reused in the meantime, so resolving them again
+         * could transfer on a different object than the one this SVC started
+         * with.
+         */
+        io_cont_drop();
+    } else {
+        host_fd_ref_t in_ref, out_ref;
+        fd_block_state_t in_st, out_st;
+        int64_t err = host_fd_ref_open_io_state(fd_in, &in_ref, NULL, &in_st);
+        if (err < 0)
+            return err;
+        err = host_fd_ref_open_io_state(fd_out, &out_ref, NULL, &out_st);
+        if (err < 0) {
+            host_fd_ref_close(&in_ref);
+            return err;
+        }
+
+        /* Handle offsets */
+        int64_t off_in = -1, off_out = -1;
+        if (off_in_gva) {
+            if (guest_read_small(g, off_in_gva, &off_in, sizeof(off_in)) < 0) {
+                host_fd_ref_close(&out_ref);
+                host_fd_ref_close(&in_ref);
+                return -LINUX_EFAULT;
+            }
+        }
+        if (off_out_gva) {
+            if (guest_read_small(g, off_out_gva, &off_out, sizeof(off_out)) <
+                0) {
+                host_fd_ref_close(&out_ref);
+                host_fd_ref_close(&in_ref);
+                return -LINUX_EFAULT;
+            }
+        }
+
+        err = splice_in_check(in_ref.fd);
+        if (err == 0)
+            err = splice_out_check(out_ref.fd);
+        if (err < 0) {
+            host_fd_ref_close(&out_ref);
+            host_fd_ref_close(&in_ref);
+            return err;
+        }
+
+        /* Emulate with a read/write loop over the continuation's buffer. splice
+         * fully drains each read chunk rather than stopping on a short write,
+         * which is why it does not share copy_fd_range; splice_drain_chunk is
+         * that drain.
+         *
+         * SPLICE_F_NONBLOCK makes a pipe end nonblocking for this one call,
+         * whatever O_NONBLOCK it carries (splice_from_pipe_next and
+         * wait_for_space, Linux fs/splice.c), and an AF_UNIX stream input as
+         * well. do_splice also raises the flag itself when a pipe end is
+         * O_NONBLOCK: the input for pipe-to-file, the output for file-to-pipe,
+         * either for pipe-to-pipe. The output is never made nonblocking here: a
+         * chunk is read before it is written, and a pipe or socket input cannot
+         * take back what a nonblocking write then failed to place. A pipe
+         * output is asked for room before each read instead. The check reserves
+         * nothing: another writer that fills the pipe before the write leaves
+         * the write blocked, where Linux holds the pipe lock across both.
+         */
+        struct stat in_sb, out_sb;
+        bool in_fifo = fstat(in_ref.fd, &in_sb) == 0 && S_ISFIFO(in_sb.st_mode);
+        bool out_fifo =
+            fstat(out_ref.fd, &out_sb) == 0 && S_ISFIFO(out_sb.st_mode);
+        bool nonblock = (flags & LINUX_SPLICE_F_NONBLOCK) ||
+                        (in_fifo && splice_end_nonblock(&in_st, in_ref.fd)) ||
+                        (out_fifo && splice_end_nonblock(&out_st, out_ref.fd));
+        in_st.call_nonblock = nonblock && splice_flag_reaches_input(in_ref.fd);
+        bool pipe_out = off_out < 0 && out_fifo;
+
+        cont = malloc(sizeof(*cont));
+        if (!cont) {
+            host_fd_ref_close(&out_ref);
+            host_fd_ref_close(&in_ref);
+            return -LINUX_ENOMEM;
+        }
+        cont->kind = IO_STREAM_CONT_SPLICE;
+        cont->in_ref = in_ref;
+        cont->out_ref = out_ref;
+        cont->in_gfd = fd_in;
+        cont->out_gfd = fd_out;
+        cont->in_st = in_st;
+        cont->out_st = out_st;
+        cont->off_in = off_in;
+        cont->off_out = off_out;
+        cont->moved = 0;
+        cont->remaining = len;
+        cont->chunk_len = 0;
+        cont->chunk_done = 0;
+        cont->nonblock = nonblock;
+        cont->pipe_out = pipe_out;
+        cont->off_in_gva = off_in_gva;
+        cont->off_out_gva = off_out_gva;
     }
 
-    /* Emulate with a read/write loop over a heap buffer. splice fully drains
-     * each read chunk rather than stopping on a short write, which is why it
-     * does not share copy_fd_range; splice_drain_chunk is that drain.
-     */
-    uint8_t *buf = malloc(IO_COPY_BUF_SIZE);
-    if (!buf) {
-        host_fd_ref_close(&out_ref);
-        host_fd_ref_close(&in_ref);
-        return -LINUX_ENOMEM;
-    }
-    size_t chunk = len > IO_COPY_BUF_SIZE ? IO_COPY_BUF_SIZE : len;
-
-    splice_state_t st = {.fd_in = fd_in,
-                         .in_hfd = in_ref.fd,
-                         .fd_out = fd_out,
-                         .out_hfd = out_ref.fd,
-                         .off_in = off_in,
-                         .off_out = off_out,
-                         .in_st = in_st,
-                         .out_st = out_st};
-
-    /* SPLICE_F_NONBLOCK makes a pipe end nonblocking for this one call,
-     * whatever O_NONBLOCK it carries (splice_from_pipe_next and wait_for_space,
-     * Linux fs/splice.c), and an AF_UNIX stream input as well. do_splice also
-     * raises the flag itself when a pipe end is O_NONBLOCK: the input for
-     * pipe-to-file, the output for file-to-pipe, either for pipe-to-pipe. The
-     * output is never made nonblocking here: a chunk is read before it is
-     * written, and a pipe or socket input cannot take back what a nonblocking
-     * write then failed to place. A pipe output is asked for room before each
-     * read instead. The check reserves nothing: another writer that fills the
-     * pipe before the write leaves the write blocked, where Linux holds the
-     * pipe lock across both.
-     */
-    struct stat in_sb, out_sb;
-    bool in_fifo = fstat(st.in_hfd, &in_sb) == 0 && S_ISFIFO(in_sb.st_mode);
-    bool out_fifo = fstat(st.out_hfd, &out_sb) == 0 && S_ISFIFO(out_sb.st_mode);
-    bool nonblock = (flags & LINUX_SPLICE_F_NONBLOCK) ||
-                    (in_fifo && splice_end_nonblock(&st.in_st, st.in_hfd)) ||
-                    (out_fifo && splice_end_nonblock(&st.out_st, st.out_hfd));
-    st.in_st.call_nonblock = nonblock && splice_flag_reaches_input(st.in_hfd);
-    bool pipe_out = st.off_out < 0 && out_fifo;
     splice_fail_t f = {0};
-    size_t total = 0;
-    int64_t ret;
-    while (total < len) {
-        size_t n = (len - total) > chunk ? chunk : (len - total);
+    for (;;) {
+        /* A chunk left by an earlier attempt, or by the read at the bottom of
+         * this loop, goes out before any more input is consumed.
+         */
+        if (cont->chunk_done < cont->chunk_len) {
+            (void) splice_drain_chunk(cont, &f);
+            if (f.stop)
+                break;
+            continue;
+        }
+        if (cont->remaining == 0)
+            break;
+
+        size_t n = cont->remaining > IO_COPY_BUF_SIZE
+                       ? IO_COPY_BUF_SIZE
+                       : (size_t) cont->remaining;
         uint64_t fsize_room;
-        if (fsize_copy_room(st.out_hfd, st.off_out, &fsize_room)) {
+        if (fsize_copy_room(cont->out_ref.fd, cont->off_out, &fsize_room)) {
             if (fsize_room == 0) {
-                int64_t past = copy_past_fsize(st.in_hfd, st.off_in, &st.in_st,
-                                               total == 0);
+                int64_t past = copy_past_fsize(cont->in_ref.fd, cont->off_in,
+                                               &cont->in_st, cont->moved == 0);
+                if (past == IO_XFER_NEED_WAIT) {
+                    f.park = true;
+                    f.park_fd = cont->in_ref.fd;
+                    f.park_events = POLLIN;
+                    f.stop = true;
+                    break;
+                }
                 if (past > 0) {
                     f.rw_error = true;
                     f.saved_errno = EFBIG;
                 } else if (past < 0) {
                     f.wait_err = past;
                 }
+                f.stop = true;
                 break;
             }
             if (n > fsize_room)
-                n = fsize_room;
+                n = (size_t) fsize_room;
         }
 
-        if (pipe_out) {
+        if (cont->pipe_out) {
             /* A pipe whose reader is gone polls POLLHUP without POLLOUT on
              * macOS; wait_for_space answers it with EPIPE and SIGPIPE before
              * anything is read, with or without the flag.
              */
-            struct pollfd pfd = {.fd = st.out_hfd, .events = POLLOUT};
+            struct pollfd pfd = {.fd = cont->out_ref.fd, .events = POLLOUT};
             int pr = poll(&pfd, 1, 0);
             if (pr > 0 && (pfd.revents & (POLLHUP | POLLERR))) {
-                if (total == 0)
+                if (cont->moved == 0)
                     signal_queue(LINUX_SIGPIPE);
                 f.rw_error = true; /* reported only if nothing moved */
                 f.saved_errno = EPIPE;
+                f.stop = true;
                 break;
             }
 
@@ -4628,65 +5694,98 @@ int64_t sys_splice(guest_t *g,
              * difference it takes whole (measured, the buffer growing on demand
              * included).
              */
-            if (nonblock) {
+            if (cont->nonblock) {
                 if (pr <= 0 || !(pfd.revents & POLLOUT)) {
                     f.rw_error = true;
                     f.saved_errno = EAGAIN;
+                    f.stop = true;
                     break;
                 }
                 struct stat sb;
-                size_t room = PIPE_BUF;
-                if (fstat(st.out_hfd, &sb) == 0 && sb.st_blksize > sb.st_size &&
-                    (size_t) (sb.st_blksize - sb.st_size) > room)
-                    room = (size_t) (sb.st_blksize - sb.st_size);
-                if (n > room)
-                    n = room;
+                size_t pipe_room = PIPE_BUF;
+                if (fstat(cont->out_ref.fd, &sb) == 0 &&
+                    sb.st_blksize > sb.st_size &&
+                    (size_t) (sb.st_blksize - sb.st_size) > pipe_room)
+                    pipe_room = (size_t) (sb.st_blksize - sb.st_size);
+                if (n > pipe_room)
+                    n = pipe_room;
             }
         }
-        ssize_t r;
-        if (st.off_in >= 0) {
-            r = pread(st.in_hfd, buf, n, st.off_in);
+
+        ssize_t r = 0;
+        if (cont->off_in >= 0) {
+            r = pread(cont->in_ref.fd, cont->buf, n, cont->off_in);
         } else {
             /* An owned fd is nonblocking on the host, so the transfer keeps the
-             * guest's blocking semantics only by going through io_xfer.
+             * guest's blocking semantics only by going through io_xfer. park_ok
+             * with no continuation asks the transfer to report
+             * IO_XFER_NEED_WAIT rather than wait itself, because only this loop
+             * owns the chunk the park has to carry.
              */
-            struct iovec iov = {.iov_base = buf, .iov_len = n};
-            int64_t waited =
-                io_xfer(st.fd_in, st.in_hfd, POLLIN, &iov, 1, &r, &st.in_st);
+            struct iovec iov = {.iov_base = cont->buf, .iov_len = n};
+            int64_t waited = io_xfer(cont->in_gfd, cont->in_ref.fd, POLLIN,
+                                     &iov, 1, &r, &cont->in_st, true, NULL);
+            if (waited == IO_XFER_NEED_WAIT) {
+                f.park = true;
+                f.park_fd = cont->in_ref.fd;
+                f.park_events = POLLIN;
+                f.stop = true;
+                break;
+            }
             if (waited < 0) {
                 f.wait_err = waited;
-                goto done;
+                f.stop = true;
+                break;
             }
         }
         if (r < 0) {
             f.rw_error = true;
             f.saved_errno = errno;
+            f.stop = true;
             break;
         }
-        if (r == 0)
+        if (r == 0) {
+            f.stop = true;
             break; /* EOF */
+        }
 
-        total += splice_drain_chunk(&st, buf, (size_t) r, &f);
+        cont->remaining -= (uint64_t) r;
+        cont->chunk_len = (size_t) r;
+        cont->chunk_done = 0;
+        (void) splice_drain_chunk(cont, &f);
         if (f.stop)
-            goto done;
+            break;
     }
 
-done:
-    /* Write back updated offsets, then pick the return value. Preserve partial
-     * transfer success: if bytes were already moved, return that count even
-     * when an offset writeback faults (consistent with
+    /* The drain or the read asked for a readiness wait. Arm it after every
+     * offset and chunk update above, so the continuation is exactly the state
+     * the next dispatch resumes from.
+     */
+    if (f.park) {
+        int64_t parked = io_splice_park(cont, f.park_fd, f.park_events);
+        if (parked == SYSCALL_PARKED)
+            return parked;
+        if (parked < 0)
+            f.wait_err = parked;
+    }
+
+    /* Write back the updated offsets, then pick the return value. Preserve
+     * partial transfer success: if bytes were already moved, return that count
+     * even when an offset writeback faults (consistent with
      * sendfile/copy_file_range). A failed off_in writeback skips the off_out
      * writeback, matching the kernel.
      */
-    if (off_in_gva && st.off_in >= 0 &&
-        guest_write_small(g, off_in_gva, &st.off_in, sizeof(st.off_in)) < 0) {
-        ret = total > 0 ? (int64_t) total : -LINUX_EFAULT;
-    } else if (off_out_gva && st.off_out >= 0 &&
-               guest_write_small(g, off_out_gva, &st.off_out,
-                                 sizeof(st.off_out)) < 0) {
-        ret = total > 0 ? (int64_t) total : -LINUX_EFAULT;
-    } else if (total > 0) {
-        ret = (int64_t) total;
+    int64_t ret;
+    if (cont->off_in_gva && cont->off_in >= 0 &&
+        guest_write_small(g, cont->off_in_gva, &cont->off_in,
+                          sizeof(cont->off_in)) < 0) {
+        ret = cont->moved > 0 ? (int64_t) cont->moved : -LINUX_EFAULT;
+    } else if (cont->off_out_gva && cont->off_out >= 0 &&
+               guest_write_small(g, cont->off_out_gva, &cont->off_out,
+                                 sizeof(cont->off_out)) < 0) {
+        ret = cont->moved > 0 ? (int64_t) cont->moved : -LINUX_EFAULT;
+    } else if (cont->moved > 0) {
+        ret = (int64_t) cont->moved;
     } else if (f.wait_err) {
         ret = f.wait_err;
     } else if (f.rw_error) {
@@ -4697,9 +5796,7 @@ done:
         ret = 0;
     }
 
-    free(buf);
-    host_fd_ref_close(&out_ref);
-    host_fd_ref_close(&in_ref);
+    io_stream_cont_free(cont);
     return ret;
 }
 
@@ -4712,6 +5809,12 @@ int64_t sys_vmsplice(guest_t *g,
 {
     (void) flags;
 
+    /* Bytes an earlier attempt of this SVC already moved. The vector below is
+     * rebuilt from the guest's entries every dispatch, and io_xfer advances it
+     * past those bytes, so a park does not send one segment twice.
+     */
+    uint64_t prior = io_continue_take();
+
     /* One pin and one classification for the whole call: the descriptor is
      * pinned here and every segment below transfers on it, so re-resolving the
      * slot per segment would let a sibling reusing this fd number change the
@@ -4721,19 +5824,31 @@ int64_t sys_vmsplice(guest_t *g,
     fd_block_state_t vm_st;
     int64_t err = host_fd_ref_open_io_state(fd, &host_ref, NULL, &vm_st);
     if (err < 0)
-        return err;
+        return prior > 0 ? (int64_t) prior : err;
     if (nr_segs > 1024) {
         host_fd_ref_close(&host_ref);
-        return -LINUX_EINVAL; /* UIO_MAXIOV */
+        return prior > 0 ? (int64_t) prior : -LINUX_EINVAL; /* UIO_MAXIOV */
     }
 
-    size_t total = 0;
+    struct iovec stack_iov[64];
+    struct iovec *iov = stack_iov;
+    if (nr_segs > 64) {
+        iov = malloc((size_t) nr_segs * sizeof(*iov));
+        if (!iov) {
+            host_fd_ref_close(&host_ref);
+            return prior > 0 ? (int64_t) prior : -LINUX_ENOMEM;
+        }
+    }
+
+    int iovcnt = 0;
     for (unsigned long i = 0; i < nr_segs; i++) {
         linux_iovec_t liov;
         if (guest_read_small(g, iov_gva + i * sizeof(linux_iovec_t), &liov,
                              sizeof(liov)) < 0) {
+            if (iov != stack_iov)
+                free(iov);
             host_fd_ref_close(&host_ref);
-            return total > 0 ? (int64_t) total : -LINUX_EFAULT;
+            return prior > 0 ? (int64_t) prior : -LINUX_EFAULT;
         }
 
         if (liov.iov_len == 0)
@@ -4741,34 +5856,40 @@ int64_t sys_vmsplice(guest_t *g,
         uint64_t avail = 0;
         void *src =
             guest_ptr_bound(g, liov.iov_base, &avail, MEM_PERM_R, liov.iov_len);
-        if (!src)
-            return host_fd_ref_close(&host_ref),
-                   (total > 0 ? (int64_t) total : -LINUX_EFAULT);
+        if (!src) {
+            if (iov != stack_iov)
+                free(iov);
+            host_fd_ref_close(&host_ref);
+            return prior > 0 ? (int64_t) prior : -LINUX_EFAULT;
+        }
         uint64_t len = liov.iov_len;
         if (len > avail)
             len = avail;
-
-        struct iovec iov = {.iov_base = src, .iov_len = len};
-        ssize_t w;
-        int64_t waited = io_xfer(fd, host_ref.fd, POLLOUT, &iov, 1, &w, &vm_st);
-        if (waited < 0) {
-            host_fd_ref_close(&host_ref);
-            return total > 0 ? (int64_t) total : waited;
-        }
-        if (w < 0) {
-            if (errno == EPIPE)
-                signal_queue(LINUX_SIGPIPE);
-            err = total > 0 ? (int64_t) total : linux_errno();
-            host_fd_ref_close(&host_ref);
-            return err;
-        }
-        total += w;
-        if ((uint64_t) w < len)
-            break;
+        iov[iovcnt].iov_base = src;
+        iov[iovcnt].iov_len = (size_t) len;
+        iovcnt++;
     }
 
+    ssize_t w = 0;
+    int64_t waited = 0;
+    if (iovcnt == 0) {
+        w = 0;
+    } else {
+        waited = io_xfer(fd, host_ref.fd, POLLOUT, iov, iovcnt, &w, &vm_st,
+                         true, &prior);
+    }
+    if (iov != stack_iov)
+        free(iov);
     host_fd_ref_close(&host_ref);
-    return (int64_t) total;
+
+    if (waited < 0)
+        return waited;
+    if (w < 0) {
+        if (errno == EPIPE)
+            signal_queue(LINUX_SIGPIPE);
+        return linux_errno();
+    }
+    return (int64_t) w;
 }
 
 /* tee: copy data between two pipes without consuming it. Full emulation would

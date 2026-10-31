@@ -16,7 +16,7 @@ Supported user-facing options:
 | `-h`, `--help` | Print built-in usage help |
 | `-V`, `--version` | Print the build version and exit |
 | `-v`, `--verbose` | Enable syscall-level and loader diagnostics |
-| `-t`, `--timeout N` | Per-iteration vCPU watchdog, in seconds (default `10`, `0` disables) |
+| `-t`, `--timeout N` | Guest execution watchdog, in seconds (default `10`, `0` disables) |
 | `--sysroot PATH` | Resolve guest absolute paths under `PATH`, falling back to the host for paths it does not hold |
 | `--create-sysroot PATH` | Provision a case-sensitive APFS sparsebundle mounted at `PATH`, then use it as the sysroot |
 | `--no-rosetta` | Disable the x86_64-via-Rosetta translator (also `ELFUSE_NO_ROSETTA=1`) |
@@ -45,10 +45,10 @@ session. Two properties are worth knowing before using it:
 Unset, which is the default, no exec ever elevates. A value that is not an
 absolute path is rejected at startup rather than ignored.
 
-`--timeout` is a run-loop watchdog. It does not cap total process runtime. It
-only bounds a single `hv_vcpu_run()` iteration before the host regains control,
-which is what allows host-side timers and signals to be observed promptly.
-Setting `--timeout 0` disables this watchdog for long-running CPU-bound guests.
+`--timeout` watches guest execution without exception progress across scheduler
+preemption. Detection takes up to two periods; a blocked syscall does not count
+as stalled execution. It does not cap total process runtime. Setting
+`--timeout 0` disables the watchdog for long-running CPU-bound guests.
 
 ## Guest Identity, Working Directory, And Environment
 

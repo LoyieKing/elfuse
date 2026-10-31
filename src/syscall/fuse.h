@@ -6,7 +6,10 @@
 
 #include "core/guest.h"
 
+struct thread_entry;
+
 void fuse_init(void);
+void fuse_task_cancel_wait(struct thread_entry *t);
 
 int64_t sys_mount(guest_t *g,
                   uint64_t source_gva,

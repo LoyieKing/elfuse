@@ -62,6 +62,23 @@ int64_t net_wait_or_interrupted(const fd_block_state_t *st,
     return io_wait_fd_or_interrupted(host_fd, events);
 }
 
+int64_t net_wait_progress(const fd_block_state_t *st,
+                          int host_fd,
+                          short events,
+                          int msg_flags,
+                          uint64_t total)
+{
+    if (total > 0)
+        syscall_restart_forbid();
+    if (current_thread)
+        current_thread->io_continue_bytes = IO_CONT_VALID | total;
+    int64_t result = net_wait_or_interrupted(st, host_fd, events, msg_flags);
+    if (result != SYSCALL_PARKED && current_thread)
+        current_thread->io_continue_bytes = 0;
+    return result;
+}
+
+
 /* Is there anything for a zero-length receive to return, asked without
  * consuming it?
  *
@@ -261,37 +278,57 @@ static int64_t connect_nonblock_wait(int host_fd,
         if (backoff_rc < 0)
             return backoff_rc;
     }
-    if (rc == 0)
+    if (rc == 0) {
+        if (current_thread && current_thread->connect_inflight_fd == host_fd)
+            current_thread->connect_inflight_fd = -1;
         return 0;
+    }
 
     /* EALREADY is this same connect still in flight. Linux never reports it to
      * a blocking caller: __inet_stream_connect sets it, then falls through to
      * wait out TCP_SYN_SENT and returns 0. Waiting below does the same.
      *
-     * EISCONN is that connect having landed, and it is only swallowed for a
-     * restarted SVC. A guest that calls connect twice on a socket whose first
-     * connect returned is asking a different question and Linux answers EISCONN
-     * (sock->state is SS_CONNECTED by then). After a restart the guest never
-     * saw the first attempt return at all, so Linux would be in SS_CONNECTING
-     * and would answer 0; reporting EISCONN there would leak elfuse's own retry
-     * into a syscall the guest issued once. Measured with a connect loop under
-     * a sibling exec loop: 4000/4000 succeed on Linux, and without this gate
-     * about 60% came back EISCONN.
+     * EISCONN is that connect having landed. Swallow it when SoftNS is still
+     * driving this fd to completion: either an armed SVC restart
+     * (syscall_is_restarted), or a PARK_KIND_IO park_reissue remount after
+     * connect_nonblock_wait returned SYSCALL_PARKED (connection often completes
+     * while the worker is unmounted; the remount is a fresh dispatch so
+     * restarted is false). A guest that calls connect twice after the first
+     * returned success finds connect_inflight_fd cleared and still gets EISCONN
+     * (tests/test-socket.c). Measured with a connect loop under a sibling exec
+     * loop: 4000/4000 succeed on Linux, and without this gate about 60% came
+     * back EISCONN.
      */
     bool resuming = syscall_is_restarted();
-    if (errno != EINPROGRESS && errno != EINTR && errno != EALREADY &&
-        !(resuming && errno == EISCONN))
+    bool inflight =
+        current_thread && current_thread->connect_inflight_fd == host_fd;
+    if (errno == EISCONN && (resuming || inflight)) {
+        if (current_thread)
+            current_thread->connect_inflight_fd = -1;
+        return 0;
+    }
+    if (errno != EINPROGRESS && errno != EINTR && errno != EALREADY)
         return linux_errno();
 
+    if (current_thread)
+        current_thread->connect_inflight_fd = host_fd;
+
     int64_t waited = io_wait_fd_or_interrupted(host_fd, POLLOUT);
-    if (waited < 0)
-        return waited; /* EINTR: connect continues in the background per Linux
-                        */
+    if (waited < 0) {
+        /* SYSCALL_PARKED: leave inflight set for park_reissue remount. EINTR:
+         * keep inflight so a guest/SA_RESTART retry still swallows EISCONN if
+         * the handshake lands before the retry (signal.c notes the same race
+         * after an EL0 kick).
+         */
+        return waited;
+    }
 
     int soerr = 0;
     socklen_t slen = sizeof(soerr);
     if (getsockopt(host_fd, SOL_SOCKET, SO_ERROR, &soerr, &slen) < 0)
         soerr = errno;
+    if (current_thread && current_thread->connect_inflight_fd == host_fd)
+        current_thread->connect_inflight_fd = -1;
     if (soerr) {
         errno = soerr;
         return linux_errno();
@@ -1162,6 +1199,7 @@ int64_t sys_recvfrom(guest_t *g,
                      uint64_t src_gva,
                      uint64_t addrlen_gva)
 {
+    uint64_t prior = io_continue_take();
     if (fd_get_type(fd) == FD_NETLINK)
         return netlink_recv(fd, g, buf_gva, len, flags, src_gva, addrlen_gva);
 
@@ -1192,7 +1230,7 @@ int64_t sys_recvfrom(guest_t *g,
      * socket.
      */
     int64_t waited =
-        len > 0 ? net_wait_or_interrupted(&recv_st, host_ref.fd, POLLIN, flags)
+        len > 0 ? net_wait_progress(&recv_st, host_ref.fd, POLLIN, flags, prior)
                 : net_recv_zero_payload_gate(&recv_st, host_ref.fd, flags);
     if (waited < 0) {
         host_fd_ref_close(&host_ref);
@@ -1207,7 +1245,7 @@ int64_t sys_recvfrom(guest_t *g,
         mac_flags &= ~MSG_WAITALL;
 
     ssize_t ret;
-    uint64_t total = 0;
+    uint64_t total = prior <= len ? prior : 0;
     for (;;) {
         /* Reset per round: a recvfrom that failed may still have written it. */
         mac_len = sizeof(mac_sa);
@@ -1234,9 +1272,13 @@ int64_t sys_recvfrom(guest_t *g,
                 break;
 
             waited =
-                net_wait_or_interrupted(&recv_st, host_ref.fd, POLLIN, flags);
+                net_wait_progress(&recv_st, host_ref.fd, POLLIN, flags, total);
+            if (waited == SYSCALL_PARKED) {
+                host_fd_ref_close(&host_ref);
+                return waited;
+            }
             if (waited < 0)
-                break; /* interrupted after moving bytes: report the count */
+                break;
             continue;
         }
 
@@ -1247,7 +1289,11 @@ int64_t sys_recvfrom(guest_t *g,
             break;
         if (!net_recv_should_retry(&recv_st, host_ref.fd, flags, ret))
             break;
-        waited = net_wait_or_interrupted(&recv_st, host_ref.fd, POLLIN, flags);
+        waited = net_wait_progress(&recv_st, host_ref.fd, POLLIN, flags, total);
+        if (waited == SYSCALL_PARKED) {
+            host_fd_ref_close(&host_ref);
+            return waited;
+        }
         if (waited < 0) {
             if (total > 0)
                 break;

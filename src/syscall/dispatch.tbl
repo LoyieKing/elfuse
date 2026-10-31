@@ -133,7 +133,15 @@ SYS_clock_gettime sc_clock_gettime 0
 SYS_clock_getres sc_clock_getres 0
 SYS_clock_nanosleep sc_clock_nanosleep 1
 SYS_gettimeofday sc_gettimeofday 0
+SYS_adjtimex sc_adjtimex 1
+SYS_clock_adjtime sc_clock_adjtime 1
 SYS_times sc_times 0
+SYS_mq_open sc_mq_open 1
+SYS_mq_unlink sc_mq_unlink 1
+SYS_mq_timedsend sc_mq_timedsend 1
+SYS_mq_timedreceive sc_mq_timedreceive 1
+SYS_mq_notify sc_mq_notify 0
+SYS_mq_getsetattr sc_mq_getsetattr 1
 SYS_timerfd_create sc_timerfd_create 1
 SYS_timerfd_settime sc_timerfd_settime 1
 SYS_timerfd_gettime sc_timerfd_gettime 1
@@ -190,9 +198,13 @@ SYS_sched_yield sc_sched_yield 0
 SYS_sched_get_priority_max sc_sched_get_priority_max 0
 SYS_sched_get_priority_min sc_sched_get_priority_min 0
 SYS_sched_rr_get_interval sc_sched_rr_get_interval 0
+SYS_sched_setattr sc_sched_setattr 0
+SYS_sched_getattr sc_sched_getattr 1
 SYS_set_tid_address sc_set_tid_address 0
 SYS_capget sc_capget 1
 SYS_capset sc_capset 0
+SYS_unshare sc_unshare 0
+SYS_setns sc_setns 0
 SYS_personality sc_personality 0
 SYS_prctl sc_prctl 1
 

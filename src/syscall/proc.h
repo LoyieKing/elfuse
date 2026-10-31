@@ -24,6 +24,10 @@
 #include "core/guest.h"
 #include "core/elf.h"
 
+#include "runtime/sched/exec.h"
+
+struct thread_entry;
+
 /* Process state. */
 
 /* Initialize the process subsystem. */
@@ -36,6 +40,10 @@ int64_t proc_get_ppid(void);
 /* Linux child-subreaper state, published through the fork-family registry. */
 void proc_set_child_subreaper(bool enabled);
 bool proc_get_child_subreaper(void);
+
+/* Linux PR_SET/GET_DUMPABLE. pidfd_getfd refuses attach when dumpable==0. */
+void proc_set_dumpable(int value);
+int proc_get_dumpable(void);
 
 typedef struct {
     const char *path;
@@ -186,6 +194,13 @@ const void *proc_get_auxv(size_t *len_out);
 /* Set guest identity (called from fork_child_main). */
 void proc_set_identity(int64_t pid, int64_t ppid);
 
+/* Soft CLONE_NEWPID: this process is the init of a fake pid ns. Used so
+ * /proc/self/fdinfo NSpid reports 0 for pidfds of processes outside our ns
+ * (sibling NEWPID namespaces), matching Linux pidfs.
+ */
+void proc_set_soft_newpid(bool enabled);
+bool proc_in_soft_newpid(void);
+
 /* Session / process-group state. Accessors are lock-free (_Atomic); syscall
  * writers serialize with session_lock.
  */
@@ -257,16 +272,17 @@ void proc_set_ids(uint32_t uid,
                   uint32_t egid,
                   uint32_t sgid);
 
-/* Emulated nice value for setpriority/getpriority coherence. */
-int32_t proc_get_nice(void);
-void proc_set_nice(int32_t val);
 bool proc_pid_alive(int pid);
 
-/* setpriority/getpriority: only PRIO_PROCESS is modeled. getpriority accepts
- * any live task ID but reports the process-global emulated nice value.
- * setpriority is kept self-only until elfuse tracks per-task nice state.
- * setpriority clamps prio to [-20, 19]. getpriority returns 20-nice (always
- * > 0 per Linux convention).
+/* Emulated capability check used by scheduler permission rules. elfuse has no
+ * fine-grained capability sets; euid 0 is the modeled CAP_SYS_NICE holder,
+ * matching setgroups/prlimit and CAP_SYS_NICE probe behavior.
+ */
+bool proc_has_cap_sys_nice(void);
+
+/* PRIO_PROCESS supports task-directed remote control. PRIO_PGRP/PRIO_USER
+ * enumerate this VM's local tasks with Linux partial-success semantics. Nice is
+ * clamped to [-20, 19]; getpriority returns 20-nice.
  */
 int64_t proc_sys_setpriority(int which, int who, int prio);
 int64_t proc_sys_getpriority(int which, int who);
@@ -283,8 +299,29 @@ int rseq_try_abort(guest_t *g,
                    uint32_t rseq_signature,
                    uint64_t *pc);
 
+/* Update registered rseq cpu_id_start/cpu_id and, when rseq_len allows, node_id
+ * (offset 20) and mm_cid (offset 24). No-op if unregistered. Call on
+ * registration and whenever the thread mounts a different slot.
+ */
+void rseq_set_cpu_ids(guest_t *g,
+                      struct thread_entry *t,
+                      uint32_t cpu,
+                      uint32_t node);
+
 /* Allocate next guest PID (called from sys_clone). */
 int64_t proc_alloc_pid(void);
+
+/* SoftNS CLONE_THREAD registry: map guest tid -> host pid / tgid so a parent
+ * SoftNS process can pidfd_open(tid, PIDFD_THREAD). Process TGIDs stay in the
+ * lifecycle registry; only non-leader threads are published here.
+ */
+void proc_thread_publish(int64_t tid, int64_t tgid);
+void proc_thread_exit(int64_t tid, int exit_status);
+bool proc_thread_resolve(int64_t tid,
+                         pid_t *host_out,
+                         int64_t *tgid_out,
+                         bool *exited_out,
+                         int *status_out);
 
 /* Store the sysroot path for absolute guest path resolution. Pass NULL to
  * clear.
@@ -355,29 +392,43 @@ const char *proc_resolve_sysroot_create_path(const char *path,
  */
 #define SYSCALL_EXEC_HAPPENED (-0x10000)
 
-/* SVC restart across an execve handed to the group leader.
+/* Pool-managed blocking wait: handler enqueued an async park and returned
+ * without writing X0. The HVC #5 arm unmounts the worker so another READY
+ * thread can run; wakeup/deadline/signal completes the park and remount injects
+ * the result into X0 before the shim resumes.
+ */
+#define SYSCALL_PARKED (-0x10001)
+
+/* Linux SVC restart, shared by synchronous waits and parked ones.
  *
- * The leader is woken out of a blocking wait so its run loop can pick the
- * execve up, and the wait reports EINTR that no signal explains. The dispatch
- * epilogue arms a restart instead of reporting it: X0 keeps the argument the
- * guest passed and ELR_EL1 steps back over the SVC, so the ERET re-executes the
- * syscall once the handoff has been serviced.
+ * A wait that reports -EINTR without calling syscall_restart_forbid() has
+ * consumed nothing the guest can observe, so its errno is Linux's ERESTARTSYS:
+ * the dispatcher may re-execute it. Arming keeps X0 as the argument the guest
+ * passed and steps ELR_EL1 back over the SVC, so the ERET (or the rt_sigreturn
+ * that follows a handler) re-enters the syscall with the original arguments;
+ * the shim restores X1-X30, X8 included, from its own saved frame. A parked
+ * wait arms the same record on its owner at remount (proc_resume_task), because
+ * a waker on another host thread cannot touch the task's registers.
  *
- * A signal delivered before the guest resumes cancels it. Two reasons, and
- * either alone would be enough. The EINTR becomes one Linux can produce, since
- * a signal really did arrive. And the frame the handler returns through carries
- * the live X8, which by then is the TLBI wire value the shim epilogue wrote
- * rather than the syscall number the shim would have restored from its own
- * saved frame. A rewound PC makes rt_sigreturn re-execute that SVC as the call
- * the wire value names. Leaving the PC past the SVC narrows that rather than
- * closing it, because the instruction after an SVC can be another SVC; that
- * residue is described beside exec_drop_frame in core/shim.S, and out of reach
- * of this cancel. The drop-frame marker is the other value that displaces the
- * guest's X8, and signal.c keeps that one out of both the frame and the ERET on
- * its own.
+ * The signal actually delivered decides whether the rewind survives:
  *
- * Cancel is a no-op unless ELR_EL1 still holds the value the arm wrote, so a
- * later delivery on an unrelated path cannot disturb a guest that has moved on.
+ *   - A handler with SA_RESTART keeps it, and the sigframe records the rewound
+ *     PC plus the recorded syscall number in X8, so rt_sigreturn re-executes
+ *     the call.
+ *   - A handler without SA_RESTART cancels it. Cancel undoes only a rewind the
+ *     guest has not left (ELR_EL1 still equals the armed value) and writes the
+ *     EINTR result into X0, which the frame then carries to the handler.
+ *   - A signal delivery discards (SIG_IGN, default ignore/stop/continue)
+ *     commits no frame; the rewind stays and the syscall restarts, which is
+ *     Linux's ERESTARTNOINTR shape for an ERESTARTSYS that ran no handler.
+ *
+ * FUTEX_WAIT_REQUEUE_PI before CMP_REQUEUE_PI is ERESTARTNOINTR in the other
+ * direction: it rewinds without arming this record, so no SA_RESTART decision
+ * can cancel it, and its handler's rt_sigreturn always re-enters the wait.
+ *
+ * Only a signal the guest can observe may arm: an EINTR produced by teardown or
+ * by a host failure did not come from an interruptible wait and must be
+ * reported as the errno it is.
  */
 void syscall_restart_arm(hv_vcpu_t vcpu,
                          uint64_t elr_after_svc,
@@ -386,11 +437,16 @@ void syscall_restart_arm(hv_vcpu_t vcpu,
 void syscall_restart_cancel(hv_vcpu_t vcpu);
 
 /* Refuse an SVC restart for the syscall now running. Called by a wait that has
- * already consumed part of a deadline the guest supplied: re-running the
- * original arguments would restart that timeout from zero, and a guest whose
- * siblings hand off execve faster than the timeout would never see it expire.
- * Reporting EINTR there is what Linux does when it cannot resume from a
- * remainder, and libc retries with the remainder it was handed.
+ * already consumed part of a deadline the guest supplied, transferred bytes, or
+ * left host state behind: re-running the original arguments would restart that
+ * timeout from zero, redo the transfer, or re-send a request. Reporting EINTR
+ * there is what Linux does when it cannot resume from a remainder, and libc
+ * retries with the remainder it was handed.
+ *
+ * A parked wait may publish the same decision for its task instead of the
+ * current worker: syscall_restart_forbid() before the park is the handler's own
+ * opt-out (owner worker), and exec_restart_forbid_set() is the waker's
+ * (runtime/sched/exec.h). proc_resume_task consumes both.
  */
 void syscall_restart_forbid(void);
 
@@ -417,6 +473,11 @@ typedef struct {
     bool rusage_valid;
     bool rusage_accounted;
     bool host_waitable; /* false for a child adopted from another host parent */
+    /* Soft CLONE_NEWPID: no real ns, but pidfd fdinfo NSpid reports a nested
+     * level (pid\t1) so NEWPID kselftests can proceed.
+     */
+    bool newpid_ns;
+
     /* Terminal status was taken from the lifecycle registry before wait4()
      * could observe the zombie, so the host process still needs reaping. Set
      * only for host_waitable children; see proc_deferred_reap_poll().
@@ -437,6 +498,14 @@ int proc_reserve_child(int64_t guest_pid, int64_t pgid);
  * Returns 0 or a negative Linux errno if the reservation was lost or the
  * lifecycle registry could not be updated.
  */
+void proc_note_child_newpid(int64_t guest_pid);
+bool proc_child_in_newpid_ns(int64_t guest_pid);
+int proc_child_exit_status(int64_t guest_pid);
+
+/* Prefer the lifecycle-published Linux wait(2) word over a Darwin host
+ * wait/NOTE_EXIT status when the child has published one.
+ */
+int proc_linux_wait_status(int64_t guest_pid, int host_status);
 int proc_register_child(pid_t host_pid, int64_t guest_pid, int64_t pgid);
 
 /* Roll back a reservation (or a just-committed entry on final IPC failure). */
@@ -577,6 +646,8 @@ int proc_send_guest_signal(pid_t host_pid,
  * this process).
  */
 int proc_preempt_init(void);
+/* Fork child: restart the sigwait doorbell thread. */
+int proc_preempt_reinit_after_fork(void);
 
 /* Syscall handlers. */
 int64_t sys_pidfd_open(guest_t *g, int64_t pid, unsigned int flags);
@@ -616,12 +687,46 @@ int64_t sys_waitid(guest_t *g,
                    uint64_t infop_gva,
                    int options);
 
+/* Guest-internal job control published by the stopped/resumed process itself.
+ *
+ * A SoftNS child that stops internally is still a running host process, so the
+ * host wait4 cannot report WUNTRACED/WCONTINUED for it. These publish the state
+ * change into the fork-family lifecycle registry and ring the parent's SIGCHLD
+ * doorbell; sys_wait4/sys_waitid consume it as CLD_STOPPED / CLD_CONTINUED. The
+ * signal path calls them after the whole process has stopped or continued
+ * (queue time), not per delivery.
+ */
+void proc_notify_group_stop(int signum);
+void proc_notify_group_continue(void);
+
+/* Wait-driver park (PARK_KIND_WAIT) callbacks, invoked by the scheduler when a
+ * signal becomes deliverable or a parked wait's poll deadline expires. Both
+ * re-dispatch the wait's SVC; the handler then consumes a ready child event or
+ * returns EINTR. Called on the waker/timer thread, never the task's owner.
+ */
+void wait_park_on_interrupt(struct thread_entry *t);
+void wait_park_on_deadline(struct thread_entry *t);
+
+/* Fire expired wait-park deadlines from the pool slice timer (the scheduler
+ * does not dispatch PARK_KIND_WAIT) and re-dispatch every parked wait on a
+ * child state-change doorbell. Safe from any thread.
+ */
+void proc_wait_fire_expired(uint64_t now_ns);
+void proc_wait_wake_all(void);
+
 /* exit_group coordination. */
 
-/* Request process-wide exit and let worker loops observe the shared code. */
+/* Request process-wide exit and let worker loops observe the shared code.
+ * proc_request_exit_group_status also records the Linux wait(2) status word so
+ * fork-child / lifecycle publishers do not have to reverse the shell convention
+ * (128+sig) that exit_group_code uses for signal deaths.
+ */
 void proc_request_exit_group(int code);
+void proc_request_exit_group_status(int code, int wait_status);
 void proc_clear_exit_group(void);
 int proc_exit_group_requested(void);
+int proc_exit_group_code(void);
+int proc_exit_group_wait_status(void);
 
 /* vCPU run loop. */
 
@@ -652,10 +757,60 @@ void proc_request_hvc6_yield(void);
  */
 typedef int (*vcpu_run_loop_tick_fn)(guest_t *g, void *opaque);
 
+
 typedef struct vcpu_run_hooks {
     vcpu_run_loop_tick_fn tick;
     void *opaque;
 } vcpu_run_hooks_t;
+
+/* Disposition of one guest mount, decided only by the outer execution loop.
+ * Syscall handlers and exception arms publish requests; they never change the
+ * current task or the mounted registers themselves.
+ */
+typedef enum {
+    PROC_LEAVE_CONTINUE = 0, /* enter the guest at the current PC */
+    PROC_LEAVE_RESCHED,      /* completed return tail; deschedule and requeue */
+    PROC_LEAVE_PARK,         /* blocked continuation/stop; save and unmount */
+    PROC_LEAVE_EXIT,         /* task terminated; exit code/wait status valid */
+} proc_leave_t;
+
+/* Tick return sentinels. Any other nonzero value is an exit code, kept for the
+ * existing hook contract.
+ */
+#define VCPU_TICK_CONTINUE 0
+#define VCPU_TICK_RESCHED (-1)
+#define VCPU_TICK_EXIT_ZERO (-2)
+#define VCPU_TICK_PARK (-3)
+
+/* One outer-loop task execution: guest entry, exception arms, and the complete
+ * syscall return tail.
+ *
+ * Returns only when the task must leave the CPU. The caller saves the
+ * architectural state and publishes the scheduler state.
+ */
+proc_leave_t proc_run_task(hv_vcpu_t vcpu,
+                           hv_vcpu_exit_t *vexit,
+                           guest_t *g,
+                           bool verbose,
+                           int timeout_sec,
+                           const vcpu_run_hooks_t *hooks,
+                           int *exit_code,
+                           int *wait_status_out);
+
+/* Resume work after a mount restored guest_ctx and the tracer's saved
+ * adjustments. Runs exactly one of: plain entry, parked-result injection, SVC
+ * re-dispatch, or the deferred syscall tail; then the shared return tail.
+ */
+proc_leave_t proc_resume_task(hv_vcpu_t vcpu,
+                              guest_t *g,
+                              bool verbose,
+                              int *exit_code);
+
+/* Request that the current task leave the CPU after its handler returns. Used
+ * by stop/group-stop/wait drivers after they published the stop state. The
+ * outer loop saves guest_ctx, publishes BLOCKED, and picks another task.
+ */
+void exec_park_current(int park_kind, int park_resume);
 
 /* Run the vCPU execution loop.
  *

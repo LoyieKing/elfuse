@@ -31,6 +31,9 @@
  *                          register writes survive.
  *   #12  System instr trap cache maintenance logging (DC CVAU, IC IVAU, ...)
  *   #13  Ptrace interrupt  GPRs restored from HVC #5's saved SVC frame
+ *   #14  SYNC_CORE done  host-injected trampoline below executed the guest
+ *                        IC IALLU/DSB ISH/ISB; the host acknowledges the
+ *                        barrier generation. No registers are an input.
  *
  * X8 on return from #5, the post-syscall request:
  *   0  no flush
@@ -302,6 +305,19 @@
     b svc_handler
 .endm
 
+/* SYNC_CORE_VEC: host-injected trampoline entry. It occupies the AArch32
+ * lower-EL synchronous slot (0x600), which an AArch64-only guest never vectors
+ * through. The host redirects a vCPU here between hv_vcpu_run calls with
+ * ELR_EL1/SPSR_EL1 set to the interrupted PC/CPSR and CPSR set to EL1h+DAIF;
+ * sync_core_entry preserves every GPR and both registers, so the guest resumes
+ * exactly where it was. Used by MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE,
+ * where the I-cache invalidation is per-PE and a host ISB cannot perform it.
+ */
+.macro SYNC_CORE_VEC
+    .align 7
+    b sync_core_entry
+.endm
+
 .align 4
 .globl _start
 _start:
@@ -389,10 +405,36 @@ vectors:
     /* Lower EL, AArch32: 0x600 Sync, 0x680 IRQ,
      *                                          0x700 FIQ,  0x780 SError
      */
-    BAD_VEC 0x600
+    SYNC_CORE_VEC
     BAD_VEC 0x680
     BAD_VEC 0x700
     BAD_VEC 0x780
+
+/* sync_core_entry: guest-side core synchronization for a host-injected
+ * SYNC_CORE barrier. Runs on the target vCPU with interrupts masked, after the
+ * host redirected execution here and repurposed ELR_EL1/SPSR_EL1 for the
+ * interrupted PC/CPSR. HVC #14 overwrites both system registers, so save them
+ * in an extra 32-byte frame below the GPR frame; the host only acknowledges.
+ * TLBI is deliberately absent: the request orders a code change, not
+ * translations, and an IS-broadcast TLBI does not invalidate another PE's
+ * I-cache.
+ */
+sync_core_entry:
+    SAVE_GPRS
+    sub sp, sp, #32
+    mrs x9, elr_el1
+    mrs x10, spsr_el1
+    stp x9, x10, [sp]
+    ic iallu
+    dsb ish
+    isb
+    hvc #14
+    ldp x9, x10, [sp]
+    add sp, sp, #32
+    msr elr_el1, x9
+    msr spsr_el1, x10
+    RESTORE_GPRS
+    eret
 
 /* bad_exception: Report unexpected exception to host and halt */
 bad_exception:
@@ -571,6 +613,13 @@ getsid_fast:
  */
 futex_wait_fast:
     ldr w14, [sp, #8]                 /* op */
+
+    /* FUTEX_ROBUST_UNLOCK (512) and FUTEX_ROBUST_LIST32 (1024) need the host:
+     * the unlock path must clear the word and list_op_pending. A zero-waiter
+     * WAKE hit would otherwise return 0 without touching either.
+     */
+    tst w14, #0x600
+    b.ne futex_shape_bail
     and w15, w14, #0x7f               /* FUTEX_CMD_MASK, pinned in futex.c */
     cmp w15, #0                       /* FUTEX_WAIT */
     b.eq futex_wait_shape

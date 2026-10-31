@@ -48,6 +48,7 @@
 #include "debug/log.h"
 
 #include "runtime/thread.h"
+#include "runtime/sched/vcpu_pool.h"
 #include "syscall/linux-wire.h" /* linux_user_pt_regs_t, LINUX_* errno */
 
 /* Constants. */
@@ -756,17 +757,25 @@ static void handle_xfer_features(const char *pkt)
         rsp_reply_error(1);
 }
 
-/* Callback for thread_for_each to collect TIDs into an array. */
+/* Callback for thread_for_each to collect TIDs into a heap array. */
 typedef struct {
-    int64_t tids[MAX_THREADS];
+    int64_t *tids;
     int count;
+    int cap;
 } tid_collector_t;
 
 static void collect_tids_cb(thread_entry_t *t, void *c)
 {
     tid_collector_t *cc = c;
-    if (cc->count < MAX_THREADS)
-        cc->tids[cc->count++] = thread_tid(t);
+    if (cc->count >= cc->cap) {
+        int ncap = cc->cap ? cc->cap * 2 : 64;
+        int64_t *nt = realloc(cc->tids, (size_t) ncap * sizeof(*nt));
+        if (!nt)
+            return; /* drop extras rather than crash the stub */
+        cc->tids = nt;
+        cc->cap = ncap;
+    }
+    cc->tids[cc->count++] = thread_tid(t);
 }
 
 /* Handle qfThreadInfo / qsThreadInfo: list guest threads. */
@@ -777,24 +786,32 @@ static void handle_thread_info(int first)
         return;
     }
 
-    /* Build comma-separated hex thread ID list. Worst case: MAX_THREADS(64) x
-     * 17 chars (16 hex + comma) + 1 prefix + NUL.
-     */
-    char reply[2048];
+    tid_collector_t ctx = {.tids = NULL, .count = 0, .cap = 0};
+    thread_for_each(collect_tids_cb, &ctx);
+
+    /* ~17 chars per tid (16 hex + comma) + prefix + NUL. */
+    size_t need = (size_t) ctx.count * 17 + 2;
+    if (need < 16)
+        need = 16;
+    char *reply = malloc(need);
+    if (!reply) {
+        free(ctx.tids);
+        rsp_reply_error(1);
+        return;
+    }
     int pos = 0;
     reply[pos++] = 'm';
 
-    tid_collector_t ctx = {.count = 0};
-    thread_for_each(collect_tids_cb, &ctx);
-
     for (int i = 0; i < ctx.count; i++) {
-        if (i > 0 && pos < (int) sizeof(reply) - 20)
+        if (i > 0 && pos < (int) need - 20)
             reply[pos++] = ',';
-        pos += snprintf(reply + pos, sizeof(reply) - (size_t) pos, "%llx",
+        pos += snprintf(reply + pos, need - (size_t) pos, "%llx",
                         (unsigned long long) ctx.tids[i]);
     }
     reply[pos] = '\0';
     rsp_reply(reply);
+    free(reply);
+    free(ctx.tids);
 }
 
 /* Handle vCont: continue/step with per-thread control.
@@ -1360,8 +1377,9 @@ void gdb_stub_wait_for_attach(void)
      * by GDB during the initial attach (e.g., step sets a temp bp). The initial
      * sync in main.c ran before any breakpoints existed.
      */
-    if (current_thread)
-        gdb_stub_sync_debug_regs(current_thread->vcpu);
+    hv_vcpu_t vcpu;
+    if (current_thread && vcpu_pool_current_vcpu(&vcpu))
+        gdb_stub_sync_debug_regs(vcpu);
 
     log_info("GDB attached, starting guest");
 }
@@ -1444,8 +1462,9 @@ int gdb_stub_handle_stop(int stop_reason, uint64_t stop_addr)
         gdb_restore_vcpu(current_thread, tde);
 
     /* Re-sync debug registers before resuming */
-    if (current_thread)
-        gdb_stub_sync_debug_regs(current_thread->vcpu);
+    hv_vcpu_t vcpu;
+    if (current_thread && vcpu_pool_current_vcpu(&vcpu))
+        gdb_stub_sync_debug_regs(vcpu);
 
     return do_step;
 }

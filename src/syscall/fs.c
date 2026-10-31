@@ -1717,6 +1717,12 @@ static int64_t fcntl_flock_wait(guest_t *g,
         if (rc != -LINUX_EAGAIN && rc != -LINUX_EACCES)
             return rc;
 
+        /* Pool-managed: unmount instead of usleep-pinning a worker. The caller
+         * closes host_ref; remount reissues the whole F_SETLKW.
+         */
+        if (io_park_can_unmount())
+            return io_park_unmount(-1, 0, -1);
+
         int64_t wait_rc = io_retry_backoff(&backoff);
         if (wait_rc < 0)
             return wait_rc;

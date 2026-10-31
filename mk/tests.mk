@@ -19,7 +19,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-full test-multi-vcpu test-rwx test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-getdents64-overlong \
         test-sysroot-tmp-remove test-sysroot-host-fallback test-sysroot-case-exact \
-        test-sysroot-create-paths test-fork-ipc-protocol-host \
+        test-sysroot-create-paths \
         test-vcpu-run-hooks-host test-identity-override-host \
         test-dynamic-array-host test-string-builder-host test-gdbstub-host \
         test-config test-runner \
@@ -249,9 +249,10 @@ endef
 
 # The host unit binaries both suites run directly, as prerequisites.
 CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
-        test-tlbi-encoder-host test-fork-ipc-protocol-host \
+        test-tlbi-encoder-host \
         test-vcpu-run-hooks-host test-identity-override-host \
-        test-teardown-live-vcpu-host test-stdio-nonblock-host \
+        test-sched-fair-host \
+        test-stdio-nonblock-host \
         test-rlimit-unchanged-host test-casefold-host \
         test-casefold-walk-host test-absock-names-host \
         test-dynamic-array-host test-string-builder-host \
@@ -265,10 +266,9 @@ CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
 # explicit sequence rather than "whatever check happens to run".
 define CHECK_SHARED_LANES
 $(call run-host-unit,test-tlbi-encoder-host,TLBI RVAE1IS encoder unit test)
-$(call run-host-unit,test-fork-ipc-protocol-host,fork IPC protocol identity unit test)
 $(call run-host-unit,test-vcpu-run-hooks-host,vCPU run-loop hook API unit test)
 $(call run-host-unit,test-identity-override-host,identity override unit test)
-$(call run-host-unit,test-teardown-live-vcpu-host,teardown live-worker accounting unit test)
+$(call run-host-unit,test-sched-fair-host,fair scheduler math unit test)
 $(call run-host-unit,test-casefold-host,filename codec unit test)
 $(call run-host-unit,test-casefold-walk-host,case-exact path resolution unit test)
 $(call run-host-unit,test-absock-names-host,absock derived-name unit test)
@@ -1703,10 +1703,6 @@ test-multi-vcpu: $(BUILD_DIR)/test-multi-vcpu
 test-rwx: $(BUILD_DIR)/test-rwx
 	$(BUILD_DIR)/test-rwx
 
-# Fork IPC protocol identity regression
-## Run the fork IPC protocol identity unit test
-test-fork-ipc-protocol-host: $(BUILD_DIR)/test-fork-ipc-protocol-host
-	$(BUILD_DIR)/test-fork-ipc-protocol-host
 
 # String builder unit test
 ## Run the growable string builder host unit test

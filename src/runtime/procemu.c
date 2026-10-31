@@ -73,6 +73,7 @@
 #include "syscall/net-identity.h"
 #include "syscall/path.h"
 #include "syscall/proc.h"
+#include "syscall/proc-pidfd.h"
 #include "syscall/sys.h"
 
 /* Return the shared /dev/shm emulation directory, creating it on first call.
@@ -1582,13 +1583,21 @@ static syscpu_match_t syscpu_classify(const char *path, const char **suffix_out)
 typedef struct {
     int64_t *tids;
     int ntids;
+    int cap;
 } proc_task_collect_ctx_t;
 
 static void proc_task_collect_cb(thread_entry_t *t, void *arg)
 {
     proc_task_collect_ctx_t *c = arg;
-    if (c->ntids < MAX_THREADS)
-        c->tids[c->ntids++] = thread_tid(t);
+    if (c->ntids >= c->cap) {
+        int ncap = c->cap ? c->cap * 2 : 64;
+        int64_t *nt = realloc(c->tids, (size_t) ncap * sizeof(*nt));
+        if (!nt)
+            return;
+        c->tids = nt;
+        c->cap = ncap;
+    }
+    c->tids[c->ntids++] = thread_tid(t);
 }
 
 
@@ -1993,6 +2002,86 @@ static uint64_t proc_start_stack(const guest_t *g)
     return 0;
 }
 
+/* Linux state letter for a task. Group stop and ptrace stop are independent
+ * lifecycle states; a stopped task is reported before its run state.
+ */
+static char proc_task_state_char(const thread_entry_t *t)
+{
+    if (!t)
+        return 'R';
+    if (sched_task_group_stopped(t))
+        return 'T';
+    if (sched_task_trace_stopped(t))
+        return 't';
+    switch (sched_task_run_state(t)) {
+    case SCHED_STATE_NEW:
+    case SCHED_STATE_READY:
+    case SCHED_STATE_RUNNING:
+        return 'R';
+    case SCHED_STATE_BLOCKED:
+        return 'S';
+    case SCHED_STATE_DEAD:
+        return 'Z';
+    default:
+        return 'R';
+    }
+}
+
+static const char *proc_state_name(char state)
+{
+    switch (state) {
+    case 'S':
+        return "sleeping";
+    case 'T':
+        return "stopped";
+    case 't':
+        return "tracing stop";
+    case 'Z':
+        return "zombie";
+    default:
+        return "running";
+    }
+}
+
+/* /proc/<pid>/stat priority and nice, from the scheduling attributes selection
+ * actually uses. priority follows Linux task_prio(): p->prio - MAX_RT_PRIO, so
+ * fair tasks report 20+nice and RT tasks report the RT priority in the negative
+ * range Linux produces.
+ */
+static void proc_task_priority(const thread_entry_t *t,
+                               long *priority,
+                               long *nice)
+{
+    if (!t) {
+        *priority = 20;
+        *nice = 0;
+        return;
+    }
+    sched_task_attrs_t attr;
+    sched_task_get_attr(t, &attr);
+    *nice = attr.nice;
+    if (attr.policy == SCHED_POLICY_FIFO || attr.policy == SCHED_POLICY_RR)
+        *priority = -1 - (long) attr.rt_priority;
+    else if (attr.policy == SCHED_POLICY_DEADLINE)
+        *priority = -101; /* MAX_DL_PRIO - 1 - MAX_RT_PRIO */
+    else
+        *priority = 20 + attr.nice;
+}
+
+/* The thread-group leader carries the process-wide attributes (Linux reports
+ * the group leader's priority/nice for /proc/<pid>/stat).
+ */
+static thread_entry_t *proc_process_leader(void)
+{
+    thread_entry_t *t = thread_find_relaxed(proc_get_pid());
+    return t ? t : current_thread;
+}
+
+static long proc_ns_to_ticks(uint64_t ns)
+{
+    return (long) (ns / (1000000000ULL / 100)); /* USER_HZ */
+}
+
 static int proc_open_self_task_node(const guest_t *g,
                                     const char *path,
                                     int linux_flags)
@@ -2002,41 +2091,57 @@ static int proc_open_self_task_node(const guest_t *g,
     if (endp == path + 16 || tid <= 0)
         return PROC_NOT_INTERCEPTED;
 
-    /* Verify this TID is actually active */
-    if (!thread_tid_alive((int64_t) tid)) {
+    thread_entry_t *task = thread_acquire_tid((int64_t) tid);
+    if (!task) {
         errno = ENOENT;
         return -1;
     }
 
     if (!strcmp(endp, "/stat")) {
+        uint64_t user_ns, sys_ns, cutime_us = 0, cstime_us = 0;
+        sched_thread_cputime_split_ns(task, &user_ns, &sys_ns);
+        proc_children_cpu_us(&cutime_us, &cstime_us);
+        long priority, nice;
+        proc_task_priority(task, &priority, &nice);
+        char state = proc_task_state_char(task);
         uint64_t start_stack = proc_start_stack(g);
-        return proc_emit_fmt(
-            "%ld (%.15s) R %lld %lld %lld 0 0 0 "          /* 1-9 */
-            "0 0 0 0 0 0 0 0 "                             /* 10-17 */
-            "20 0 %d 0 0 0 0 "                             /* 18-24 */
+        int rc = proc_emit_fmt(
+            "%ld (%.15s) %c %lld %lld %lld 0 0 0 "         /* 1-9 */
+            "0 0 0 0 %ld %ld %ld %ld "                     /* 10-17 */
+            "%ld %ld %d 0 0 0 0 "                          /* 18-24 */
             "18446744073709551615 0 0 %llu 0 0 0 "         /* 25-31 */
             "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", /* 32-52 */
-            tid, proc_comm_name(), (long long) proc_get_ppid(),
+            tid, proc_comm_name(), state, (long long) proc_get_ppid(),
             (long long) proc_get_pid(), /* pgid */
-            (long long) proc_get_sid(), thread_active_count(),
-            (unsigned long long) start_stack);
+            (long long) proc_get_sid(), proc_ns_to_ticks(user_ns),
+            proc_ns_to_ticks(sys_ns), proc_ns_to_ticks(cutime_us * 1000ULL),
+            proc_ns_to_ticks(cstime_us * 1000ULL), priority, nice,
+            thread_active_count(), (unsigned long long) start_stack);
+        thread_release(task);
+        return rc;
     }
 
     if (!strcmp(endp, "/status")) {
-        return proc_emit_fmt(
+        char state = proc_task_state_char(task);
+        int rc = proc_emit_fmt(
             "Name:\t%.15s\n"
-            "State:\tR (running)\n"
+            "State:\t%c (%s)\n"
             "Tgid:\t%lld\n"
             "Pid:\t%ld\n"
             "PPid:\t%lld\n"
             "Uid:\t%u\t%u\t%u\t%u\n"
             "Gid:\t%u\t%u\t%u\t%u\n"
             "Threads:\t%d\n",
-            proc_comm_name(), (long long) proc_get_pid(), tid,
-            (long long) proc_get_ppid(), proc_get_uid(), proc_get_euid(),
-            proc_get_suid(), proc_get_euid(), proc_get_gid(), proc_get_egid(),
-            proc_get_sgid(), proc_get_egid(), thread_active_count());
+            proc_comm_name(), state, proc_state_name(state),
+            (long long) proc_get_pid(), tid, (long long) proc_get_ppid(),
+            proc_get_uid(), proc_get_euid(), proc_get_suid(), proc_get_euid(),
+            proc_get_gid(), proc_get_egid(), proc_get_sgid(), proc_get_egid(),
+            thread_active_count());
+        thread_release(task);
+        return rc;
     }
+
+    thread_release(task);
 
     /* /proc/self/task/<tid> directory itself: synthesize a dir with stat/status
      * placeholder entries. Persistent so getdents sees the entries on macOS
@@ -2323,6 +2428,35 @@ static int intercept_open_dispatch(const guest_t *g,
             return proc_intercept_open(g, alias, linux_flags, mode);
     }
 
+    /* /proc/<pid> for another known guest (live or unreaped zombie). Linux
+     * keeps the directory until wait reaps; historical pidfd_send_signal opens
+     * it with O_DIRECTORY before waiting, then expects ESRCH after.
+     */
+    {
+        char *endp = NULL;
+        if (!strncmp(path, "/proc/", 6)) {
+            long pid = strtol(path + 6, &endp, 10);
+            if (endp != path + 6 && *endp == '\0' && pid > 0) {
+                if (proc_guest_to_host_pid((int64_t) pid) <= 0) {
+                    errno = ENOENT;
+                    return -1;
+                }
+                const char *dir = ensure_proc_tmpdir(g);
+                if (!dir)
+                    return -1;
+                char piddir[128];
+                int n = snprintf(piddir, sizeof(piddir), "%s/%ld", dir, pid);
+                if (n < 0 || (size_t) n >= sizeof(piddir)) {
+                    errno = ENAMETOOLONG;
+                    return -1;
+                }
+                if (mkdir(piddir, 0755) < 0 && errno != EEXIST)
+                    return -1;
+                return proc_open_dir_fd(piddir, linux_flags);
+            }
+        }
+    }
+
     int oom_kind = proc_oom_path_kind(path);
     if (oom_kind == OOM_PATH_SCORE) {
         /* Mirror the non-root Linux open contract for the 0444 proc node:
@@ -2411,9 +2545,11 @@ static int intercept_open_dispatch(const guest_t *g,
         /* Linux uses the comm name (basename truncated to 15 chars). */
         const char *name = proc_comm_name();
         int threads = thread_active_count();
+        thread_entry_t *leader = proc_process_leader();
+        char state = proc_task_state_char(leader);
         return proc_emit_fmt(
             "Name:\t%.15s\n"
-            "State:\tR (running)\n"
+            "State:\t%c (%s)\n"
             "Tgid:\t%lld\n"
             "Pid:\t%lld\n"
             "PPid:\t%lld\n"
@@ -2423,12 +2559,12 @@ static int intercept_open_dispatch(const guest_t *g,
             "VmSize:\t%llu kB\n"
             "VmRSS:\t%llu kB\n"
             "Threads:\t%d\n",
-            name, (long long) proc_get_pid(), (long long) proc_get_pid(),
-            (long long) proc_get_ppid(), proc_get_uid(), proc_get_euid(),
-            proc_get_suid(), proc_get_euid(), proc_get_gid(), proc_get_egid(),
-            proc_get_sgid(), proc_get_egid(), (unsigned long long) vm_size_kb,
-            (unsigned long long) vm_size_kb, (unsigned long long) vm_rss_kb,
-            threads);
+            name, state, proc_state_name(state), (long long) proc_get_pid(),
+            (long long) proc_get_pid(), (long long) proc_get_ppid(),
+            proc_get_uid(), proc_get_euid(), proc_get_suid(), proc_get_euid(),
+            proc_get_gid(), proc_get_egid(), proc_get_sgid(), proc_get_egid(),
+            (unsigned long long) vm_size_kb, (unsigned long long) vm_size_kb,
+            (unsigned long long) vm_rss_kb, threads);
     }
 
     /* /proc/self/limits -> the guest rlimit table */
@@ -2482,15 +2618,15 @@ static int intercept_open_dispatch(const guest_t *g,
         if (!dir)
             return -1;
 
-        int64_t tids[MAX_THREADS];
-        proc_task_collect_ctx_t ctx = {tids, 0};
+        proc_task_collect_ctx_t ctx = {NULL, 0, 0};
         thread_for_each(proc_task_collect_cb, &ctx);
         for (int i = 0; i < ctx.ntids; i++) {
             char tidpath[128];
             snprintf(tidpath, sizeof(tidpath), "%s/%lld", dir,
-                     (long long) tids[i]);
+                     (long long) ctx.tids[i]);
             mkdir(tidpath, 0755);
         }
+        free(ctx.tids);
 
         int fd = proc_open_dir_fd(dir, linux_flags);
         proc_persistent_dir_release(&taskdir);
@@ -2635,6 +2771,12 @@ static int intercept_open_dispatch(const guest_t *g,
     if (!strcmp(path, "/proc/sys/kernel/randomize_va_space"))
         return proc_emit_literal("2\n");
 
+    /* /proc/sys/kernel/pid_max -> synthetic PID ceiling (matches typical Linux
+     * default). clone3_set_tid and friends read this before probing.
+     */
+    if (!strcmp(path, "/proc/sys/kernel/pid_max"))
+        return proc_emit_literal("32768\n");
+
     /* /proc/version -> synthetic banner in the kernel's proc_version_show
      * format; the builder and compiler fields are fixed strings.
      */
@@ -2742,6 +2884,38 @@ static int intercept_open_dispatch(const guest_t *g,
                          (long long) (interval_ns / 1000000000LL),
                          (long long) (interval_ns % 1000000000LL));
             }
+        } else if (snap.type == FD_PIDFD) {
+            int64_t pid;
+            bool newpid_ns = false;
+            if (pidfd_fdinfo_snapshot(n, &pid, &newpid_ns)) {
+                /* fs/pidfs.c: Pid and NSpid with tabs. Soft CLONE_NEWPID fakes
+                 * a nested level so NEWPID kselftests can proceed. Exited
+                 * targets report -1 for both.
+                 */
+                if (pid < 0) {
+                    snprintf(extra, sizeof(extra),
+                             "Pid:\t-1\n"
+                             "NSpid:\t-1\n");
+                } else if (proc_in_soft_newpid()) {
+                    /* Viewer is soft-NEWPID init: targets outside this ns
+                     * (siblings) report NSpid 0, matching Linux pidfs.
+                     */
+                    snprintf(extra, sizeof(extra),
+                             "Pid:\t%lld\n"
+                             "NSpid:\t0\n",
+                             (long long) pid);
+                } else if (newpid_ns) {
+                    snprintf(extra, sizeof(extra),
+                             "Pid:\t%lld\n"
+                             "NSpid:\t%lld\t1\n",
+                             (long long) pid, (long long) pid);
+                } else {
+                    snprintf(extra, sizeof(extra),
+                             "Pid:\t%lld\n"
+                             "NSpid:\t%lld\n",
+                             (long long) pid, (long long) pid);
+                }
+            }
         }
 
         int mnt_id = 0;
@@ -2790,19 +2964,20 @@ static int intercept_open_dispatch(const guest_t *g,
 
     /* /proc/self/stat -> single-line process stat (man 5 proc). Managed
      * runtimes read this for resource monitoring (utime, stime, rss, vsize).
-     * Format: pid (comm) state ppid pgrp session tty_nr tpgid flags ... Fields
-     * populated with meaningful values: pid, comm, state, ppid, utime(14),
-     * stime(15), vsize(23), rss(24). Rest are zero/defaults.
+     * CPU time and scheduling fields come from the scheduler ledger and the
+     * task attributes selection uses, including runtime retained for departed
+     * threads; guest-child CPU comes from the reap accumulator, never host
+     * getrusage.
      */
     if (!strcmp(path, "/proc/self/stat")) {
-        /* Get process CPU times for utime/stime fields */
-        struct rusage ru;
-        getrusage(RUSAGE_SELF, &ru);
-        /* Convert to clock ticks (Linux USER_HZ = 100) */
-        long utime_ticks =
-            ru.ru_utime.tv_sec * 100 + ru.ru_utime.tv_usec / 10000;
-        long stime_ticks =
-            ru.ru_stime.tv_sec * 100 + ru.ru_stime.tv_usec / 10000;
+        uint64_t user_ns, sys_ns, cutime_us = 0, cstime_us = 0;
+        thread_process_cputime_split_ns(&user_ns, &sys_ns);
+        proc_children_cpu_us(&cutime_us, &cstime_us);
+
+        thread_entry_t *leader = proc_process_leader();
+        long priority, nice;
+        proc_task_priority(leader, &priority, &nice);
+        char state = proc_task_state_char(leader);
 
         /* vsize and rss cover the regions VmSize and VmRSS count. */
         uint64_t vsize = 0, rss_pages = 0;
@@ -2825,29 +3000,31 @@ static int intercept_open_dispatch(const guest_t *g,
          *   starttime(22) vsize(23) rss(24) rsslim(25) ... (52 fields total)
          */
         /* tty_nr(7) and tpgid(8) follow the controlling-terminal state rather
-         * than the constants that stood here. elfuse models no specific tty
-         * device, so tty_nr reports the UNIX98 pts major with minor 0 when a
-         * terminal is held: readers such as ps only test it against zero to
-         * decide whether to print a tty at all. tpgid is the foreground process
-         * group, or -1 with no terminal, which is what Linux emits.
+         * than constants. elfuse models no specific tty device, so tty_nr
+         * reports the UNIX98 pts major with minor 0 when a terminal is held:
+         * readers such as ps only test it against zero to decide whether to
+         * print a tty at all. tpgid is the foreground process group, or -1 with
+         * no terminal, which is what Linux emits.
          */
         int has_ctty = proc_get_ctty();
         int tty_nr = has_ctty ? (136 << 8) : 0;
         long long tpgid = has_ctty ? (long long) proc_get_fg_pgrp() : -1;
 
         return proc_emit_fmt(
-            "%lld (%.15s) R %lld %lld %lld %d %lld 0 "     /* 1-9 */
-            "0 0 0 0 %ld %ld 0 0 "                         /* 10-17 */
-            "20 0 %d 0 0 %llu %llu "                       /* 18-24 */
+            "%lld (%.15s) %c %lld %lld %lld %d %lld 0 "    /* 1-9 */
+            "0 0 0 0 %ld %ld %ld %ld "                     /* 10-17 */
+            "%ld %ld %d 0 0 %llu %llu "                    /* 18-24 */
             "18446744073709551615 0 0 %llu 0 0 0 "         /* 25-31 */
             "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", /* 32-52 */
-            (long long) proc_get_pid(), proc_comm_name(),
+            (long long) proc_get_pid(), proc_comm_name(), state,
             (long long) proc_get_ppid(),
             (long long) proc_get_pid(), /* pgrp = pid */
             (long long) proc_get_pid(), /* session = pid */
-            tty_nr, tpgid, utime_ticks, stime_ticks, thread_active_count(),
-            (unsigned long long) vsize, (unsigned long long) rss_pages,
-            (unsigned long long) start_stack);
+            tty_nr, tpgid, proc_ns_to_ticks(user_ns), proc_ns_to_ticks(sys_ns),
+            proc_ns_to_ticks(cutime_us * 1000ULL),
+            proc_ns_to_ticks(cstime_us * 1000ULL), priority, nice,
+            thread_active_count(), (unsigned long long) vsize,
+            (unsigned long long) rss_pages, (unsigned long long) start_stack);
     }
 
     /* /proc/stat -> synthetic CPU statistics */
@@ -3087,6 +3264,19 @@ static int intercept_stat_dispatch(const char *path,
             return 0;
         }
     }
+    /* Unreaped foreign guests keep a /proc/<pid> directory like Linux zombies.
+     */
+    {
+        char *endp = NULL;
+        if (!strncmp(path, "/proc/", 6)) {
+            long pid = strtol(path + 6, &endp, 10);
+            if (endp != path + 6 && *endp == '\0' && pid > 0 &&
+                proc_guest_to_host_pid((int64_t) pid) > 0) {
+                stat_fill_proc_dir(st, 0555, 2, path);
+                return 0;
+            }
+        }
+    }
     if (!strcmp(path, "/proc/net") || !strcmp(path, "/proc/net/")) {
         stat_fill_proc_dir(st, 0555, 2, path);
         return 0;
@@ -3176,6 +3366,7 @@ static int intercept_stat_dispatch(const char *path,
         "/proc/filesystems",
         "/proc/sys/vm/mmap_min_addr",
         "/proc/sys/kernel/randomize_va_space",
+        "/proc/sys/kernel/pid_max",
         "/proc/net/tcp",
         "/proc/net/tcp6",
         "/proc/net/udp",

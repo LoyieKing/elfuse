@@ -4468,6 +4468,17 @@ void mem_cleanup_deferred_stack_unmaps(guest_t *g, thread_entry_t *t)
     if (nranges <= 0)
         return;
 
+    /* execve de_thread already dropped mmap_lock so siblings can reach a stop
+     * check; guest_reset will discard the old image. Do not re-acquire here or
+     * an exiting sibling can block behind another task still inside mmap and
+     * never leave the join window.
+     */
+    if (thread_exec_de_thread_active()) {
+        for (int i = 0; i < nranges; i++)
+            thread_drop_deferred_stack_unmap(t, starts[i], ends[i]);
+        return;
+    }
+
     mmap_lock_acquire();
     for (int i = 0; i < nranges; i++) {
         int rc = munmap_guest_range(g, starts[i], ends[i]);
@@ -4515,12 +4526,24 @@ int64_t sys_munmap(guest_t *g, uint64_t addr, uint64_t length)
         uint64_t unmap_off = addr - g->ipa_base;
         if (unmap_off <= g->guest_size && length <= g->guest_size - unmap_off) {
             uint64_t end = unmap_off + length;
-            thread_deferred_stack_unmap_txn_t txns[MAX_THREADS];
-            uint64_t ranges[MAX_THREADS][2];
-            int nranges = thread_collect_and_defer_stack_ranges(
-                unmap_off, end, txns, (int) ARRAY_SIZE(txns));
-            if (nranges < 0)
+            int tmax = thread_table_capacity();
+            if (tmax <= 0)
+                tmax = 1;
+            thread_deferred_stack_unmap_txn_t *txns =
+                calloc((size_t) tmax, sizeof(*txns));
+            uint64_t (*ranges)[2] = calloc((size_t) tmax, sizeof(*ranges));
+            if (!txns || !ranges) {
+                free(txns);
+                free(ranges);
                 return -LINUX_ENOMEM;
+            }
+            int nranges = thread_collect_and_defer_stack_ranges(unmap_off, end,
+                                                                txns, tmax);
+            if (nranges < 0) {
+                free(txns);
+                free(ranges);
+                return -LINUX_ENOMEM;
+            }
 
             for (int i = 0; i < nranges; i++) {
                 ranges[i][0] = txns[i].start;
@@ -4540,6 +4563,8 @@ int64_t sys_munmap(guest_t *g, uint64_t addr, uint64_t length)
                         g, cursor, keep_start < end ? keep_start : end);
                     if (rc < 0) {
                         thread_rollback_deferred_stack_ranges(txns, nranges);
+                        free(txns);
+                        free(ranges);
                         return rc;
                     }
                 }
@@ -4550,10 +4575,14 @@ int64_t sys_munmap(guest_t *g, uint64_t addr, uint64_t length)
                 int rc = munmap_guest_range(g, cursor, end);
                 if (rc < 0) {
                     thread_rollback_deferred_stack_ranges(txns, nranges);
+                    free(txns);
+                    free(ranges);
                     return rc;
                 }
             }
             thread_finish_deferred_stack_ranges(txns, nranges);
+            free(txns);
+            free(ranges);
         }
     }
     return 0;

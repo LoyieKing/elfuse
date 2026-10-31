@@ -31,9 +31,11 @@
 
 #include "core/shim-globals.h"
 #include "runtime/thread.h"
+#include "runtime/sched/sched.h"
 #include "syscall/linux-wire.h"
 #include "syscall/internal.h"
 #include "syscall/proc.h"
+#include "syscall/proc-pidfd.h"
 #include "syscall/signal.h"
 #include "syscall/sys.h"
 
@@ -50,7 +52,6 @@ static const linux_utsname_t cached_uname = {
     .machine = "aarch64",
     .domainname = "(none)",
 };
-static const uint8_t cached_affinity_mask[256] = {1}, zero_block[256] = {0};
 
 /* Physical memory to report when sysctl(HW_MEMSIZE) fails. Reporting zero is
  * not an option: a guest computing used = total - free - cached against a zero
@@ -289,140 +290,621 @@ int64_t sys_getcpu(guest_t *g,
 {
     (void) cache_gva;
 
-    /* elfuse models one online CPU and one NUMA node. glibc and tools such as
-     * file(1) only need a successful query here; the kernel cache pointer is
-     * obsolete and may be ignored.
+    /* CPU index matches the fair-scheduler pool slot (and rseq cpu_id). Single
+     * NUMA node 0. The obsolete third cache argument is ignored.
      */
-    uint32_t zero = 0;
-    if (cpu_gva && guest_write_small(g, cpu_gva, &zero, sizeof(zero)) < 0)
+    uint32_t cpu = (uint32_t) sched_thread_cpu(current_thread);
+    uint32_t node = 0;
+    if (cpu_gva && guest_write_small(g, cpu_gva, &cpu, sizeof(cpu)) < 0)
         return -LINUX_EFAULT;
-    if (node_gva && guest_write_small(g, node_gva, &zero, sizeof(zero)) < 0)
+    if (node_gva && guest_write_small(g, node_gva, &node, sizeof(node)) < 0)
         return -LINUX_EFAULT;
     return 0;
 }
 
-int64_t sys_sched_getaffinity(guest_t *g,
-                              int pid,
-                              uint64_t size,
-                              uint64_t mask_gva)
-{
-    /* Return a 1-CPU affinity mask for simplicity. sched_setaffinity is not
-     * implemented; all threads see CPU 0.
-     */
-    if (pid < 0)
-        return -LINUX_EINVAL;
-    if (!proc_pid_alive(pid))
-        return -LINUX_ESRCH;
-    if (size < 8)
-        return -LINUX_EINVAL;
+/* Linux scheduling ABI
+ *
+ * The kernel ABI is per-task: the pid argument names a TID, and pid 0 means the
+ * calling task. All state lives in the task's embedded sched_task_state_t and
+ * is read/written only through runtime/sched (sched_task_*). Queries read the
+ * same base attributes the selector uses; the execution backend consumes
+ * reschedule requests after the syscall return path.
+ *
+ * Task-directed control of a fork backend uses the pidfd scheduler RPC; unknown
+ * TIDs return ESRCH. Group/user priority sweeps stay within the calling VM's
+ * scheduling domain.
+ */
 
-    if (size <= 256) {
-        if (guest_write_small(g, mask_gva, cached_affinity_mask,
-                              (size_t) size) < 0)
-            return -LINUX_EFAULT;
-        return 8; /* Returns size of written mask */
+static bool sched_policy_is_fair(int policy)
+{
+    return policy == LINUX_SCHED_NORMAL || policy == LINUX_SCHED_BATCH;
+}
+
+static bool sched_policy_is_rt(int policy)
+{
+    return policy == LINUX_SCHED_FIFO || policy == LINUX_SCHED_RR;
+}
+
+static bool sched_policy_is_dl(int policy)
+{
+    return policy == LINUX_SCHED_DEADLINE;
+}
+
+static bool sched_policy_supported(int policy)
+{
+    return sched_policy_is_fair(policy) || sched_policy_is_rt(policy) ||
+           sched_policy_is_dl(policy) || policy == LINUX_SCHED_IDLE;
+}
+
+/* RLIMIT_NICE expresses permission as 20 - nice (1..40). CAP_SYS_NICE is
+ * modeled by euid 0, matching the rest of elfuse's privilege checks.
+ */
+static bool sched_nice_reduction_allowed(int nice)
+{
+    return (uint64_t) (20 - nice) <= sys_rlimit_cur(LINUX_RLIMIT_NICE);
+}
+
+/* Linux __checkparam_dl: runtime >= 1<<DL_SCALE (1024 ns), deadline nonzero,
+ * runtime <= deadline <= period (period 0 means deadline), and the effective
+ * period inside the sysctl range 100 us .. 4 s.
+ */
+static bool sched_dl_params_valid(const sched_task_attrs_t *a)
+{
+    if (a->deadline == 0 || a->runtime < 1024)
+        return false;
+    if (a->runtime > a->deadline)
+        return false;
+    if ((a->deadline | a->period) >> 63)
+        return false;
+    uint64_t period = a->period ? a->period : a->deadline;
+    if (a->deadline > period)
+        return false;
+    return period >= 100000ULL && period <= 4000000000ULL;
+}
+
+/* Look up the task named by a Linux scheduler pid argument. pid 0 is the
+ * caller. A nonzero result is reference-held and must be thread_release()d.
+ */
+static thread_entry_t *sched_lookup(int pid)
+{
+    if (pid == 0)
+        return current_thread;
+    return thread_acquire_tid(pid);
+}
+
+/* Read sched_attr from the guest with Linux 6.18 size negotiation:
+ * - size 0 means SCHED_ATTR_SIZE_VER0 (48);
+ * - size outside [48, PAGE_SIZE] writes the required 56 and returns E2BIG;
+ * - a nonzero tail beyond 56 is E2BIG with the same writeback;
+ * - a short struct zero-fills the unavailable tail;
+ * - nice is clamped to [-20, 19].
+ */
+static int64_t sched_attr_from_guest(guest_t *g,
+                                     uint64_t attr_gva,
+                                     linux_sched_attr_t *out)
+{
+    uint32_t size;
+    if (guest_read_small(g, attr_gva, &size, sizeof(size)) < 0)
+        return -LINUX_EFAULT;
+    if (size == 0)
+        size = LINUX_SCHED_ATTR_SIZE_VER0;
+    if (size < LINUX_SCHED_ATTR_SIZE_VER0 ||
+        size > (uint32_t) GUEST_PAGE_SIZE) {
+        uint32_t required = LINUX_SCHED_ATTR_SIZE_VER1;
+        (void) guest_write_small(g, attr_gva, &required, sizeof(required));
+        return -LINUX_E2BIG;
     }
 
-    if (guest_write_small(g, mask_gva, cached_affinity_mask,
-                          sizeof(cached_affinity_mask)) < 0)
+    memset(out, 0, sizeof(*out));
+    size_t head = size < sizeof(*out) ? size : sizeof(*out);
+    if (guest_read_small(g, attr_gva, out, head) < 0)
         return -LINUX_EFAULT;
 
-    /* Linux zeroes remaining bytes past the fixed mask. Use guest_write in
-     * chunks for bounds safety.
-     */
-    if (size > sizeof(cached_affinity_mask)) {
-        uint64_t off = sizeof(cached_affinity_mask);
-        uint64_t rem = size - sizeof(cached_affinity_mask);
-        while (rem > 0) {
-            size_t chunk =
-                (rem > sizeof(zero_block)) ? sizeof(zero_block) : (size_t) rem;
-            if (guest_write(g, mask_gva + off, zero_block, chunk) < 0)
+    if (size > sizeof(*out)) {
+        uint8_t chunk[64];
+        for (uint64_t off = sizeof(*out); off < size;) {
+            size_t n = size - off < sizeof(chunk) ? (size_t) (size - off)
+                                                  : sizeof(chunk);
+            if (guest_read_small(g, attr_gva + off, chunk, n) < 0)
                 return -LINUX_EFAULT;
-            off += chunk;
-            rem -= chunk;
+            for (size_t i = 0; i < n; i++) {
+                if (chunk[i] != 0) {
+                    uint32_t required = LINUX_SCHED_ATTR_SIZE_VER1;
+                    (void) guest_write_small(g, attr_gva, &required,
+                                             sizeof(required));
+                    return -LINUX_E2BIG;
+                }
+            }
+            off += n;
         }
     }
 
-    return 8; /* Returns size of written mask */
+    /* SCHED_FLAG_UTIL_CLAMP needs VER1 fields. */
+    if ((out->sched_flags & LINUX_SCHED_FLAG_UTIL_CLAMP) &&
+        size < LINUX_SCHED_ATTR_SIZE_VER1)
+        return -LINUX_EINVAL;
+
+    if (out->sched_nice < SCHED_NICE_MIN)
+        out->sched_nice = SCHED_NICE_MIN;
+    if (out->sched_nice > SCHED_NICE_MAX)
+        out->sched_nice = SCHED_NICE_MAX;
+    return 0;
 }
 
-/* Scheduler policy stubs.
- *
- * elfuse models a single SCHED_OTHER thread group. Linux scheduler syscalls are
- * per-thread: the pid argument is actually a TID, and a worker calling
- * sched_getscheduler(gettid()) must reach its own thread entry, not just the
- * thread-group leader. Live TIDs are matched via proc_pid_alive(); pid 0 means
- * "the calling thread" and is always accepted.
- *
- * Any policy transition away from SCHED_OTHER is rejected unless the stub can
- * model it faithfully. Callers branch on the apparent policy, and silently
- * accepting BATCH/IDLE/RT classes while still reporting SCHED_OTHER would hide
- * guest bugs. SCHED_DEADLINE through legacy sched_setscheduler is -EINVAL
- * because the legacy syscall cannot supply the deadline attributes (real Linux
- * requires sched_setattr).
- *
- * Errno ordering follows Linux 6.x kernel/sched/syscalls.c:
- *   1. pid < 0 or NULL param pointer -> EINVAL
- *   2. copy_from_user (setters) -> EFAULT before pid lookup
- *   3. find_process_by_pid -> ESRCH
- *   4. policy/priority validation -> EINVAL or EPERM
- * Getters that only write back leave EFAULT for the final copy_to_user step,
- * matching the kernel's order.
- */
-/* Validate a sched_param for the named policy.
- *
- * Returns 0 if accepted by the stub, or a negative Linux errno. EPERM is
- * reserved for "request would be valid on Linux but the stub refuses to honor
- * it" -- RT priority elevation and BATCH/IDLE class transitions away from
- * SCHED_OTHER. EINVAL covers every other out-of-spec input (bad priority range,
- * SCHED_DEADLINE through the legacy entry point, unknown policy bits).
- */
-static int sched_check_policy_param(int policy, int prio)
+static void sched_attr_from_wire(const linux_sched_attr_t *w,
+                                 sched_task_attrs_t *a)
 {
-    int base_policy = policy & ~LINUX_SCHED_RESET_ON_FORK;
+    a->policy = (int) w->sched_policy;
+    a->nice = w->sched_nice;
+    a->rt_priority = w->sched_priority;
+    a->flags = (unsigned) w->sched_flags;
+    a->runtime = w->sched_runtime;
+    a->deadline = w->sched_deadline;
+    a->period = w->sched_period;
+}
 
-    /* Reject any unknown high bit. The mask 0x7 covers every base policy id the
-     * dispatcher recognizes (NORMAL=0, FIFO=1, RR=2, BATCH=3, IDLE=5,
-     * DEADLINE=6); the unused 4 and 7 fall through to the default switch arm
-     * below.
+/* Fill the wire struct from the base attributes. For non-DEADLINE classes Linux
+ * reports zero priority for fair tasks, zero nice for RT/DEADLINE, and only the
+ * fields that class uses. Fair tasks also report their current slice
+ * (se.slice), which the core derives when no custom slice is stored.
+ */
+static void sched_attr_to_wire(const sched_task_attrs_t *a,
+                               uint64_t rr_interval_ns,
+                               linux_sched_attr_t *w)
+{
+    memset(w, 0, sizeof(*w));
+    w->size = LINUX_SCHED_ATTR_SIZE_VER1;
+    w->sched_policy = (uint32_t) a->policy;
+
+    /* KEEP_POLICY/KEEP_PARAMS are request modifiers; Linux reports only the
+     * persistent flags. RECLAIM/DL_OVERRUN are DEADLINE flags.
      */
-    if (policy & ~(LINUX_SCHED_RESET_ON_FORK | 0x7))
+    w->sched_flags = a->flags & LINUX_SCHED_FLAG_RESET_ON_FORK;
+    if (sched_policy_is_dl(a->policy))
+        w->sched_flags |=
+            a->flags & (LINUX_SCHED_FLAG_RECLAIM | LINUX_SCHED_FLAG_DL_OVERRUN);
+    if (sched_policy_is_rt(a->policy)) {
+        w->sched_priority = a->rt_priority;
+    } else if (sched_policy_is_dl(a->policy)) {
+        w->sched_runtime = a->runtime;
+        w->sched_deadline = a->deadline;
+        w->sched_period = a->period;
+    } else {
+        w->sched_nice = a->nice;
+        w->sched_runtime = a->runtime ? a->runtime : rr_interval_ns;
+    }
+}
+
+/* Linux permission rules from user_check_sched_setscheduler. Structural
+ * validation runs first in sched_apply_attr; this function only decides whether
+ * the transition needs CAP_SYS_NICE.
+ */
+static bool sched_transition_needs_cap(const sched_task_attrs_t *cur,
+                                       const sched_task_attrs_t *eff)
+{
+    if (sched_policy_is_fair(eff->policy) && eff->nice < cur->nice &&
+        !sched_nice_reduction_allowed(eff->nice))
+        return true;
+
+    if (sched_policy_is_rt(eff->policy)) {
+        uint64_t rlim = sys_rlimit_cur(LINUX_RLIMIT_RTPRIO);
+        if (eff->policy != cur->policy && rlim == 0)
+            return true;
+        if (eff->rt_priority > cur->rt_priority &&
+            (uint64_t) eff->rt_priority > rlim)
+            return true;
+    }
+
+    /* Unprivileged tasks cannot enter or change SCHED_DEADLINE. */
+    if (sched_policy_is_dl(eff->policy))
+        return true;
+
+    /* Linux treats SCHED_IDLE as nice 20: leaving it needs RLIMIT_NICE. */
+    if (cur->policy == LINUX_SCHED_IDLE && eff->policy != LINUX_SCHED_IDLE &&
+        !sched_nice_reduction_allowed(cur->nice))
+        return true;
+
+    /* Normal users cannot clear RESET_ON_FORK. */
+    if ((cur->flags & LINUX_SCHED_FLAG_RESET_ON_FORK) &&
+        !(eff->flags & LINUX_SCHED_FLAG_RESET_ON_FORK))
+        return true;
+
+    return false;
+}
+
+/* Apply one request after Linux structural validation and permissions.
+ * KEEP_POLICY / KEEP_PARAMS are resolved twice: here for permission checks and
+ * by the core for the committed transition. The core owns admission (EBUSY) and
+ * requeue/migration requests; this never switches context.
+ */
+static int64_t sched_apply_attr_with_cap(thread_entry_t *t,
+                                         sched_task_attrs_t *req,
+                                         bool cap)
+{
+    sched_task_attrs_t cur;
+    sched_task_get_attr(t, &cur);
+
+    sched_task_attrs_t eff = *req;
+    if (req->flags & LINUX_SCHED_FLAG_KEEP_PARAMS) {
+        eff.nice = cur.nice;
+        eff.rt_priority = cur.rt_priority;
+        eff.runtime = cur.runtime;
+        eff.deadline = cur.deadline;
+        eff.period = cur.period;
+    }
+    if (req->flags & LINUX_SCHED_FLAG_KEEP_POLICY) {
+        eff.policy = cur.policy;
+        eff.flags = (eff.flags & ~LINUX_SCHED_FLAG_RESET_ON_FORK) |
+                    (cur.flags & LINUX_SCHED_FLAG_RESET_ON_FORK);
+        req->flags = eff.flags;
+        req->policy = -1;
+    }
+
+    /* Known flag namespace: RESET_ON_FORK, RECLAIM, DL_OVERRUN, KEEP_POLICY and
+     * KEEP_PARAMS are implemented by the core; UTIL_CLAMP needs capacity
+     * selection this backend does not provide (reported after the permission
+     * checks, like a kernel built without CONFIG_UCLAMP_TASK); every other bit
+     * is invalid, including the kernel-internal SUGOV flag.
+     */
+    if (req->flags & ~(LINUX_SCHED_FLAG_ALL | LINUX_SCHED_FLAG_SUGOV))
+        return -LINUX_EINVAL;
+    if (req->flags & LINUX_SCHED_FLAG_SUGOV)
         return -LINUX_EINVAL;
 
-    switch (base_policy) {
-    case LINUX_SCHED_NORMAL:
-        return prio == 0 ? 0 : -LINUX_EINVAL;
-    case LINUX_SCHED_BATCH:
-    case LINUX_SCHED_IDLE:
-        return prio == 0 ? -LINUX_EPERM : -LINUX_EINVAL;
-    case LINUX_SCHED_FIFO:
-    case LINUX_SCHED_RR:
-        if (prio < 1 || prio > 99)
+    if (!sched_policy_supported(eff.policy))
+        return -LINUX_EINVAL;
+    if (eff.rt_priority > SCHED_RT_PRIO_MAX)
+        return -LINUX_EINVAL;
+    if (sched_policy_is_dl(eff.policy)) {
+        if (!sched_dl_params_valid(&eff))
             return -LINUX_EINVAL;
-        return -LINUX_EPERM;
-    case LINUX_SCHED_DEADLINE:
-        return -LINUX_EINVAL;
-    default:
-        return -LINUX_EINVAL;
+    } else {
+        if (sched_policy_is_rt(eff.policy) != (eff.rt_priority != 0))
+            return -LINUX_EINVAL;
+        req->deadline = 0;
+        req->period = 0;
+
+        /* Linux 6.12+ accepts sched_runtime as a fair custom slice; the core
+         * clamps it to [100 us, 100 ms]. For RT it is ignored.
+         */
+        if (!sched_policy_is_fair(eff.policy))
+            req->runtime = 0;
     }
+
+    if (sched_transition_needs_cap(&cur, &eff) && !cap)
+        return -LINUX_EPERM;
+
+    if (eff.flags & LINUX_SCHED_FLAG_UTIL_CLAMP)
+        return -LINUX_EOPNOTSUPP;
+
+    return sched_task_set_attr(t, req);
+}
+
+/* Linux sets one task's nice. A reduction (new nice < current nice) needs
+ * RLIMIT_NICE (20 - nice <= rlim) or CAP_SYS_NICE; failure is EACCES, not
+ * EPERM. The caller's error accumulator starts at -ESRCH and a success clears
+ * it only in that state, so a later failure overrides an earlier success.
+ */
+static int64_t prio_set_one(thread_entry_t *t, int nice, int64_t error)
+{
+    sched_task_attrs_t a;
+    sched_task_get_attr(t, &a);
+    if (nice < a.nice && !proc_has_cap_sys_nice() &&
+        (uint64_t) (20 - nice) > sys_rlimit_cur(LINUX_RLIMIT_NICE))
+        return -LINUX_EACCES;
+
+    int rc = sched_task_set_nice(t, nice);
+    if (rc == -LINUX_EINVAL) {
+        /* sched_task_set_nice is the fair-weight path. RT/DEADLINE tasks still
+         * carry a Linux nice value; store it without changing class parameters
+         * or re-admitting the task.
+         */
+        a.nice = nice;
+        rc = sched_task_set_attr(t, &a);
+    }
+    if (rc < 0)
+        return rc;
+    return error == -LINUX_ESRCH ? 0 : error;
+}
+
+typedef struct prio_tid_snapshot {
+    int64_t *tids;
+    int count;
+    int cap;
+} prio_tid_snapshot_t;
+
+static void prio_collect_tid(thread_entry_t *t, void *ctx)
+{
+    prio_tid_snapshot_t *s = ctx;
+    int64_t tid = thread_tid(t);
+    if (tid == 0 || s->count >= s->cap)
+        return;
+    s->tids[s->count++] = tid;
+}
+
+/* Snapshot local TIDs without calling scheduler code under thread_lock.
+ * Returns the count, or -1 when the snapshot cannot be allocated.
+ */
+static int prio_snapshot_local(int64_t **out)
+{
+    *out = NULL;
+    int cap = thread_table_capacity();
+    if (cap <= 0)
+        return 0;
+    int64_t *tids = malloc((size_t) cap * sizeof(*tids));
+    if (!tids)
+        return -1;
+    prio_tid_snapshot_t s = {.tids = tids, .count = 0, .cap = cap};
+    thread_for_each(prio_collect_tid, &s);
+    *out = tids;
+    return s.count;
+}
+
+static bool prio_group_matches(int who)
+{
+    int64_t target = who ? (int64_t) who : proc_get_pgid();
+    return target == proc_get_pgid();
+}
+
+static bool prio_user_matches(int who)
+{
+    /* PRIO_USER 0 means the caller's real UID, not its effective UID. */
+    uint32_t target = who ? (uint32_t) who : proc_get_uid();
+    return who >= 0 && target == proc_get_uid();
+}
+
+int64_t proc_sys_setpriority(int which, int who, int prio)
+{
+    if (which < LINUX_PRIO_PROCESS || which > LINUX_PRIO_USER)
+        return -LINUX_EINVAL;
+    if (prio < -20)
+        prio = -20;
+    if (prio > 19)
+        prio = 19;
+
+    int64_t error = -LINUX_ESRCH;
+    if (which == LINUX_PRIO_PROCESS) {
+        thread_entry_t *t =
+            who ? thread_acquire_tid((int64_t) who) : current_thread;
+        if (!t) {
+            /* Another fork backend: control-plane RPC, not a local lie. */
+            if (who == 0)
+                return -LINUX_ESRCH;
+            return pidfd_sched_set_nice((int64_t) who, prio, proc_get_euid());
+        }
+        error = prio_set_one(t, prio, error);
+        if (who)
+            thread_release(t);
+        return error;
+    }
+
+    bool matches = which == LINUX_PRIO_PGRP ? prio_group_matches(who)
+                                            : prio_user_matches(who);
+    if (!matches)
+        return -LINUX_ESRCH;
+
+    int64_t *tids;
+    int count = prio_snapshot_local(&tids);
+    if (count < 0)
+        return -LINUX_ENOMEM;
+    for (int i = 0; i < count; i++) {
+        thread_entry_t *t = thread_acquire_tid(tids[i]);
+        if (!t)
+            continue;
+        error = prio_set_one(t, prio, error);
+        thread_release(t);
+    }
+    free(tids);
+    return error;
+}
+
+int64_t proc_sys_getpriority(int which, int who)
+{
+    if (which < LINUX_PRIO_PROCESS || which > LINUX_PRIO_USER)
+        return -LINUX_EINVAL;
+
+    if (which == LINUX_PRIO_PROCESS) {
+        thread_entry_t *t =
+            who ? thread_acquire_tid((int64_t) who) : current_thread;
+        if (!t) {
+            if (who == 0)
+                return -LINUX_ESRCH;
+            pidfd_sched_state_t st;
+            int64_t rc = pidfd_sched_query((int64_t) who, &st);
+            if (rc < 0)
+                return rc;
+            return 20 - st.attrs.nice;
+        }
+        sched_task_attrs_t a;
+        sched_task_get_attr(t, &a);
+        if (who)
+            thread_release(t);
+        return 20 - a.nice;
+    }
+
+    bool matches = which == LINUX_PRIO_PGRP ? prio_group_matches(who)
+                                            : prio_user_matches(who);
+    if (!matches)
+        return -LINUX_ESRCH;
+
+    int64_t *tids;
+    int count = prio_snapshot_local(&tids);
+    if (count < 0)
+        return -LINUX_ENOMEM;
+
+    /* Linux starts at -ESRCH and replaces it with the maximum nice_to_rlimit
+     * value seen. No local member (for example, only remote fork backends in
+     * the group) stays -ESRCH instead of inventing a value.
+     */
+    int64_t ret = -LINUX_ESRCH;
+    for (int i = 0; i < count; i++) {
+        thread_entry_t *t = thread_acquire_tid(tids[i]);
+        if (!t)
+            continue;
+        sched_task_attrs_t a;
+        sched_task_get_attr(t, &a);
+        int64_t niceval = 20 - a.nice;
+        if (niceval > ret)
+            ret = niceval;
+        thread_release(t);
+    }
+    free(tids);
+    return ret;
+}
+
+static int64_t sched_apply_attr(thread_entry_t *t, sched_task_attrs_t *req)
+{
+    return sched_apply_attr_with_cap(t, req, proc_has_cap_sys_nice());
+}
+
+/* Remote backend control-plane entry points (called by proc-pidfd.c on the
+ * target process). Same owner check as Linux: caller euid must equal target
+ * euid or uid, or the caller has the modeled CAP_SYS_NICE (euid 0).
+ */
+static bool sched_remote_owner_ok(uint32_t requester_euid)
+{
+    return requester_euid == 0 || requester_euid == proc_get_euid() ||
+           requester_euid == proc_get_uid();
+}
+
+int64_t sys_sched_remote_query(int64_t tid,
+                               sched_task_attrs_t *attrs,
+                               uint32_t *uid,
+                               uint32_t *euid,
+                               uint64_t *rr_interval_ns,
+                               uint64_t *rlimit_nice,
+                               uint64_t *rlimit_rtprio)
+{
+    if (!attrs || !uid || !euid || !rr_interval_ns || !rlimit_nice ||
+        !rlimit_rtprio)
+        return -LINUX_EINVAL;
+    thread_entry_t *t = sched_lookup((int) tid);
+    if (!t)
+        return -LINUX_ESRCH;
+    sched_task_get_attr(t, attrs);
+    *rr_interval_ns = sched_task_rr_interval_ns(t);
+    thread_release(t);
+    *uid = proc_get_uid();
+    *euid = proc_get_euid();
+    *rlimit_nice = sys_rlimit_cur(LINUX_RLIMIT_NICE);
+    *rlimit_rtprio = sys_rlimit_cur(LINUX_RLIMIT_RTPRIO);
+    return 0;
+}
+
+int64_t sys_sched_remote_set_attr(int64_t tid,
+                                  const sched_task_attrs_t *req,
+                                  uint32_t requester_euid)
+{
+    thread_entry_t *t = sched_lookup((int) tid);
+    if (!t)
+        return -LINUX_ESRCH;
+    if (!sched_remote_owner_ok(requester_euid)) {
+        thread_release(t);
+        return -LINUX_EPERM;
+    }
+    sched_task_attrs_t copy = *req;
+    int64_t rc = sched_apply_attr_with_cap(t, &copy, requester_euid == 0);
+    thread_release(t);
+    return rc;
+}
+
+int64_t sys_sched_remote_set_nice(int64_t tid,
+                                  int nice,
+                                  uint32_t requester_euid)
+{
+    thread_entry_t *t = sched_lookup((int) tid);
+    if (!t)
+        return -LINUX_ESRCH;
+    if (!sched_remote_owner_ok(requester_euid)) {
+        thread_release(t);
+        return -LINUX_EPERM;
+    }
+    if (nice < SCHED_NICE_MIN)
+        nice = SCHED_NICE_MIN;
+    if (nice > SCHED_NICE_MAX)
+        nice = SCHED_NICE_MAX;
+    sched_task_attrs_t a;
+    sched_task_get_attr(t, &a);
+    if (nice < a.nice && requester_euid != 0 &&
+        (uint64_t) (20 - nice) > sys_rlimit_cur(LINUX_RLIMIT_NICE)) {
+        thread_release(t);
+        return -LINUX_EACCES;
+    }
+    int rc = sched_task_set_nice(t, nice);
+    thread_release(t);
+    return rc;
+}
+
+int64_t sys_sched_remote_get_affinity(int64_t tid, uint8_t *buf, size_t len)
+{
+    thread_entry_t *t = sched_lookup((int) tid);
+    if (!t)
+        return -LINUX_ESRCH;
+    int rc = sched_task_get_affinity(t, buf, len);
+    thread_release(t);
+    return rc;
+}
+
+int64_t sys_sched_remote_set_affinity(int64_t tid,
+                                      const uint8_t *mask,
+                                      size_t len,
+                                      uint32_t requester_euid)
+{
+    thread_entry_t *t = sched_lookup((int) tid);
+    if (!t)
+        return -LINUX_ESRCH;
+    if (!sched_remote_owner_ok(requester_euid)) {
+        thread_release(t);
+        return -LINUX_EPERM;
+    }
+    int rc = sched_task_set_affinity(t, mask, len);
+    thread_release(t);
+    return rc;
 }
 
 int64_t sys_sched_getscheduler(int pid)
 {
     if (pid < 0)
         return -LINUX_EINVAL;
-    if (!proc_pid_alive(pid))
-        return -LINUX_ESRCH;
-    return LINUX_SCHED_NORMAL;
+    thread_entry_t *t = sched_lookup(pid);
+    sched_task_attrs_t a;
+    if (!t) {
+        pidfd_sched_state_t st;
+        int64_t rc = pidfd_sched_query(pid, &st);
+        if (rc < 0)
+            return rc;
+        a = st.attrs;
+    } else {
+        sched_task_get_attr(t, &a);
+        if (pid != 0)
+            thread_release(t);
+    }
+    int64_t ret = a.policy;
+    if (a.flags & LINUX_SCHED_FLAG_RESET_ON_FORK)
+        ret |= LINUX_SCHED_RESET_ON_FORK;
+    return ret;
 }
 
 int64_t sys_sched_getparam(guest_t *g, int pid, uint64_t param_gva)
 {
     if (pid < 0 || param_gva == 0)
         return -LINUX_EINVAL;
-    if (!proc_pid_alive(pid))
-        return -LINUX_ESRCH;
+    thread_entry_t *t = sched_lookup(pid);
+    sched_task_attrs_t a;
+    if (!t) {
+        pidfd_sched_state_t st;
+        int64_t rc = pidfd_sched_query(pid, &st);
+        if (rc < 0)
+            return rc;
+        a = st.attrs;
+    } else {
+        sched_task_get_attr(t, &a);
+        if (pid != 0)
+            thread_release(t);
+    }
     linux_sched_param_t param = {0};
+    if (sched_policy_is_rt(a.policy))
+        param.sched_priority = (int32_t) a.rt_priority;
     if (guest_write_small(g, param_gva, &param, sizeof(param)) < 0)
         return -LINUX_EFAULT;
     return 0;
@@ -433,45 +915,170 @@ int64_t sys_sched_setscheduler(guest_t *g,
                                int policy,
                                uint64_t param_gva)
 {
+    if (policy < 0)
+        return -LINUX_EINVAL;
     if (pid < 0 || param_gva == 0)
         return -LINUX_EINVAL;
+
     linux_sched_param_t param;
     if (guest_read_small(g, param_gva, &param, sizeof(param)) < 0)
         return -LINUX_EFAULT;
-    if (!proc_pid_alive(pid))
-        return -LINUX_ESRCH;
-    return sched_check_policy_param(policy, param.sched_priority);
+
+    thread_entry_t *t = sched_lookup(pid);
+    sched_task_attrs_t cur;
+    if (!t) {
+        pidfd_sched_state_t st;
+        int64_t rc = pidfd_sched_query(pid, &st);
+        if (rc < 0)
+            return rc;
+        cur = st.attrs;
+    } else {
+        sched_task_get_attr(t, &cur);
+    }
+    sched_task_attrs_t req = {
+        .policy = policy & ~LINUX_SCHED_RESET_ON_FORK,
+        .nice = cur.nice,
+        .rt_priority = (unsigned) param.sched_priority,
+        .runtime = cur.runtime,
+        .flags = (policy & LINUX_SCHED_RESET_ON_FORK)
+                     ? LINUX_SCHED_FLAG_RESET_ON_FORK
+                     : 0,
+    };
+    int64_t ret = t ? sched_apply_attr(t, &req)
+                    : pidfd_sched_set_attr(pid, &req, proc_get_euid());
+    if (t && pid != 0)
+        thread_release(t);
+    return ret;
 }
 
 int64_t sys_sched_setparam(guest_t *g, int pid, uint64_t param_gva)
 {
     if (pid < 0 || param_gva == 0)
         return -LINUX_EINVAL;
+
     linux_sched_param_t param;
     if (guest_read_small(g, param_gva, &param, sizeof(param)) < 0)
         return -LINUX_EFAULT;
-    if (!proc_pid_alive(pid))
-        return -LINUX_ESRCH;
 
-    /* Current policy is SCHED_OTHER, so only priority 0 is valid. Any other
-     * value mirrors the kernel's EINVAL for non-RT priority changes.
-     */
-    if (param.sched_priority != 0)
+    thread_entry_t *t = sched_lookup(pid);
+    sched_task_attrs_t cur;
+    if (!t) {
+        pidfd_sched_state_t st;
+        int64_t rc = pidfd_sched_query(pid, &st);
+        if (rc < 0)
+            return rc;
+        cur = st.attrs;
+    } else {
+        sched_task_get_attr(t, &cur);
+    }
+    sched_task_attrs_t req = {
+        .policy = cur.policy,
+        .nice = cur.nice,
+        .rt_priority = (unsigned) param.sched_priority,
+        .runtime = cur.runtime,
+        .flags = cur.flags & LINUX_SCHED_FLAG_RESET_ON_FORK,
+    };
+    int64_t ret = t ? sched_apply_attr(t, &req)
+                    : pidfd_sched_set_attr(pid, &req, proc_get_euid());
+    if (t && pid != 0)
+        thread_release(t);
+    return ret;
+}
+
+int64_t sys_sched_setattr(guest_t *g,
+                          int pid,
+                          uint64_t attr_gva,
+                          unsigned int flags)
+{
+    if (attr_gva == 0 || pid < 0 || flags != 0)
         return -LINUX_EINVAL;
+
+    linux_sched_attr_t wire;
+    int64_t ret = sched_attr_from_guest(g, attr_gva, &wire);
+    if (ret < 0)
+        return ret;
+    if ((int32_t) wire.sched_policy < 0)
+        return -LINUX_EINVAL;
+
+    thread_entry_t *t = sched_lookup(pid);
+    bool high_flags = (wire.sched_flags >> 32) != 0;
+    if (!t) {
+        /* The RPC carries 32 flag bits; a high bit cannot be forwarded. A
+         * successful query first preserves Linux's ESRCH-before-EINVAL order
+         * for an unknown target.
+         */
+        if (high_flags) {
+            pidfd_sched_state_t st;
+            int64_t rc = pidfd_sched_query(pid, &st);
+            return rc < 0 ? rc : -LINUX_EINVAL;
+        }
+        sched_task_attrs_t req;
+        sched_attr_from_wire(&wire, &req);
+        return pidfd_sched_set_attr(pid, &req, proc_get_euid());
+    }
+
+    /* A high flag is an unknown flag and must not be truncated into success. */
+    if (high_flags) {
+        if (pid != 0)
+            thread_release(t);
+        return -LINUX_EINVAL;
+    }
+
+    sched_task_attrs_t req;
+    sched_attr_from_wire(&wire, &req);
+    ret = sched_apply_attr(t, &req);
+    if (pid != 0)
+        thread_release(t);
+    return ret;
+}
+
+int64_t sys_sched_getattr(guest_t *g,
+                          int pid,
+                          uint64_t attr_gva,
+                          unsigned int size,
+                          unsigned int flags)
+{
+    if (attr_gva == 0 || pid < 0 || flags != 0 ||
+        size < LINUX_SCHED_ATTR_SIZE_VER0 || size > (unsigned) GUEST_PAGE_SIZE)
+        return -LINUX_EINVAL;
+
+    thread_entry_t *t = sched_lookup(pid);
+    sched_task_attrs_t a;
+    uint64_t rr_interval_ns;
+    if (!t) {
+        pidfd_sched_state_t st;
+        int64_t rc = pidfd_sched_query(pid, &st);
+        if (rc < 0)
+            return rc;
+        a = st.attrs;
+        rr_interval_ns = st.rr_interval_ns;
+    } else {
+        sched_task_get_attr(t, &a);
+        rr_interval_ns = sched_task_rr_interval_ns(t);
+        if (pid != 0)
+            thread_release(t);
+    }
+    linux_sched_attr_t wire;
+    sched_attr_to_wire(&a, rr_interval_ns, &wire);
+    wire.size =
+        size < LINUX_SCHED_ATTR_SIZE_VER1 ? size : LINUX_SCHED_ATTR_SIZE_VER1;
+    if (guest_write_small(g, attr_gva, &wire, wire.size) < 0)
+        return -LINUX_EFAULT;
     return 0;
 }
 
 int64_t sys_sched_get_priority_min(int policy)
 {
     switch (policy) {
+    case LINUX_SCHED_DEADLINE:
     case LINUX_SCHED_NORMAL:
     case LINUX_SCHED_BATCH:
     case LINUX_SCHED_IDLE:
-    case LINUX_SCHED_DEADLINE:
+    case LINUX_SCHED_EXT:
         return 0;
     case LINUX_SCHED_FIFO:
     case LINUX_SCHED_RR:
-        return 1;
+        return SCHED_RT_PRIO_MIN;
     default:
         return -LINUX_EINVAL;
     }
@@ -480,14 +1087,15 @@ int64_t sys_sched_get_priority_min(int policy)
 int64_t sys_sched_get_priority_max(int policy)
 {
     switch (policy) {
+    case LINUX_SCHED_DEADLINE:
     case LINUX_SCHED_NORMAL:
     case LINUX_SCHED_BATCH:
     case LINUX_SCHED_IDLE:
-    case LINUX_SCHED_DEADLINE:
+    case LINUX_SCHED_EXT:
         return 0;
     case LINUX_SCHED_FIFO:
     case LINUX_SCHED_RR:
-        return 99;
+        return SCHED_RT_PRIO_MAX;
     default:
         return -LINUX_EINVAL;
     }
@@ -497,21 +1105,94 @@ int64_t sys_sched_rr_get_interval(guest_t *g, int pid, uint64_t ts_gva)
 {
     if (pid < 0)
         return -LINUX_EINVAL;
-    if (!proc_pid_alive(pid))
-        return -LINUX_ESRCH;
+    thread_entry_t *t = sched_lookup(pid);
+    uint64_t slice;
+    if (!t) {
+        pidfd_sched_state_t st;
+        int64_t rc = pidfd_sched_query(pid, &st);
+        if (rc < 0)
+            return rc;
+        slice = st.rr_interval_ns;
+    } else {
+        slice = sched_task_rr_interval_ns(t);
+        if (pid != 0)
+            thread_release(t);
+    }
     if (ts_gva == 0)
         return -LINUX_EFAULT;
 
-    /* Linux's fair_sched_class.get_rr_interval returns a CFS-derived slice for
-     * SCHED_OTHER tasks whenever the runqueue carries load. Reporting 100 ms
-     * (the sched_rr_timeslice default and a typical CFS quantum) gives querying
-     * tools a plausible non-zero value without pretending the guest is actually
-     * under SCHED_RR.
-     */
-    linux_timespec_t ts = {.tv_sec = 0, .tv_nsec = 100 * 1000 * 1000L};
+    linux_timespec_t ts = {
+        .tv_sec = (int64_t) (slice / 1000000000ULL),
+        .tv_nsec = (int64_t) (slice % 1000000000ULL),
+    };
     if (guest_write_small(g, ts_gva, &ts, sizeof(ts)) < 0)
         return -LINUX_EFAULT;
     return 0;
+}
+
+int64_t sys_sched_getaffinity(guest_t *g,
+                              int pid,
+                              uint64_t size,
+                              uint64_t mask_gva)
+{
+    if (pid < 0)
+        return -LINUX_EINVAL;
+    size_t cpuset_bytes = sched_affinity_cpuset_bytes();
+    if (size < cpuset_bytes || (size & (sizeof(uint64_t) - 1)) != 0)
+        return -LINUX_EINVAL;
+
+    thread_entry_t *t = sched_lookup(pid);
+    uint8_t mask[SCHED_CPUSET_BYTES];
+    int n;
+    if (!t) {
+        pidfd_sched_state_t st;
+        int64_t rc = pidfd_sched_query(pid, &st);
+        if (rc < 0)
+            return rc;
+        n = (int) st.mask_len;
+        if (n < 0 || (size_t) n > sizeof(mask))
+            return -LINUX_EIO;
+        memcpy(mask, st.mask, (size_t) n);
+    } else {
+        n = sched_task_get_affinity(t, mask, cpuset_bytes);
+        if (pid != 0)
+            thread_release(t);
+        if (n < 0)
+            return -LINUX_EINVAL;
+    }
+
+    size_t copy_n = (size_t) n < (size_t) size ? (size_t) n : (size_t) size;
+    if (guest_write_small(g, mask_gva, mask, copy_n) < 0)
+        return -LINUX_EFAULT;
+    return (int64_t) copy_n;
+}
+
+int64_t sys_sched_setaffinity(guest_t *g,
+                              int pid,
+                              uint64_t size,
+                              uint64_t mask_gva)
+{
+    if (pid < 0)
+        return -LINUX_EINVAL;
+
+    /* Linux get_user_cpu_mask copies min(len, cpumask_size) bytes and pads an
+     * undersized mask with zeros; the empty result then fails EINVAL below.
+     */
+    uint8_t mask[SCHED_CPUSET_BYTES];
+    memset(mask, 0, sizeof(mask));
+    size_t cpuset_bytes = sched_affinity_cpuset_bytes();
+    size_t copy = size < cpuset_bytes ? (size_t) size : cpuset_bytes;
+    if (copy != 0 && guest_read_small(g, mask_gva, mask, copy) < 0)
+        return -LINUX_EFAULT;
+
+    thread_entry_t *t = sched_lookup(pid);
+    if (!t)
+        return pidfd_sched_set_affinity(pid, mask, cpuset_bytes,
+                                        proc_get_euid());
+    int ret = sched_task_set_affinity(t, mask, cpuset_bytes);
+    if (pid != 0)
+        thread_release(t);
+    return ret;
 }
 
 int64_t sys_getgroups(guest_t *g, int size, uint64_t list_gva)
@@ -570,9 +1251,31 @@ int64_t sys_getrusage(guest_t *g, int who, uint64_t usage_gva)
     if (who != 0 && who != -1 && who != 1)
         return -LINUX_EINVAL;
 
+    /* Event counters and max RSS come from the host, but the CPU fields are the
+     * guest scheduling ledger: host worker/helper threads must never appear in
+     * them, and CPU time of departed guest threads must remain.
+     */
     struct rusage mac_usage;
     if (getrusage(who, &mac_usage) < 0)
         return linux_errno();
+
+    uint64_t user_ns = 0, sys_ns = 0;
+    if (who == 1) {
+        sched_thread_cputime_split_ns(current_thread, &user_ns, &sys_ns);
+    } else if (who == 0) {
+        sched_process_cputime_split_ns(&user_ns, &sys_ns);
+    } else {
+        uint64_t utime_us = 0, stime_us = 0;
+        proc_children_cpu_us(&utime_us, &stime_us);
+        user_ns = utime_us * 1000ULL;
+        sys_ns = stime_us * 1000ULL;
+    }
+    mac_usage.ru_utime.tv_sec = (time_t) (user_ns / 1000000000ULL);
+    mac_usage.ru_utime.tv_usec =
+        (suseconds_t) ((user_ns % 1000000000ULL) / 1000ULL);
+    mac_usage.ru_stime.tv_sec = (time_t) (sys_ns / 1000000000ULL);
+    mac_usage.ru_stime.tv_usec =
+        (suseconds_t) ((sys_ns % 1000000000ULL) / 1000ULL);
 
     if (write_rusage_to_guest(g, usage_gva, &mac_usage) < 0)
         return -LINUX_EFAULT;

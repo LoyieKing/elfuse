@@ -1,14 +1,15 @@
 """Fail when a syscall path can hand the guest EINTR without saying whether the
 dispatcher may restart it.
 
-The dispatcher restarts an interrupted SVC when the only thing that broke the
-wait was an execve handed to the thread group leader (see syscall_restart_arm
-in src/syscall/proc.h). Restarting re-executes the syscall with the guest's
-original arguments, which is right for a wait that consumed nothing and wrong
-for one that did: a relative timeout starts again from zero, and a request
-already on the wire is sent twice. Both failure modes were shipped and then
-found by review rather than by a test, twice, which is why this is a gate
-rather than a convention.
+The dispatcher implements Linux's ERESTARTSYS: an interrupted SVC whose wait
+consumed nothing is re-executed with the guest's original arguments, and the
+signal actually delivered decides whether the rewind survives (SA_RESTART
+keeps it, a handler without it gets EINTR). Restarting is right for a wait
+that consumed nothing and wrong for one that did: a relative timeout starts
+again from zero, a partial transfer re-reads bytes already given up, and a
+request already on the wire is sent twice. Both failure modes were shipped and
+then found by review rather than by a test, twice, which is why this is a gate
+rather than a convention. See syscall_restart_arm in src/syscall/proc.h.
 
 Nothing in C makes that decision visible. A new interruptible wait is
 restartable by default simply because the epilogue arms on any EINTR, so the
@@ -17,15 +18,26 @@ compiler can see. This script writes it down: every function that can hand the
 guest EINTR is classified here, and the classification is checked against the
 source rather than trusted.
 
+A wait that can also *park* (return SYSCALL_PARKED) publishes the decision
+through the task rather than the worker: syscall_restart_forbid() before the
+park is the handler's own opt-out, and exec_restart_forbid_set() is the
+waker's, because a waker on another host thread cannot touch the sleeper's
+per-worker state. Both spellings count as a forbid here; proc_resume_task
+consumes them and arms the same ERESTARTSYS record on the owner.
+
 Three classifications:
 
-  forbids     The function calls syscall_restart_forbid(). Verified against the
-              body, so the claim cannot go stale while the call is deleted.
+  forbids     The function calls syscall_restart_forbid() or publishes the
+              task-owned exec_restart_forbid_set(). Verified against the body,
+              so the claim cannot go stale while the call is deleted. A
+              conditional forbid (a finite timeout, a partial transfer) still
+              belongs here, with the condition in the reason.
   restartable Re-executing the syscall is harmless: the wait reports EINTR
               before transferring anything, consuming a deadline, or leaving
               host state behind. Needs a reason.
   not-a-wait  The EINTR does not come from a blocking wait at all (a teardown
-              refusal, or handoff bookkeeping). Needs a reason.
+              refusal, or a resume path applying someone else's decision).
+              Needs a reason.
 
 Adding an interruptible wait therefore fails the build until its restart
 behaviour is stated. Deleting one fails it too, so the inventory cannot rot
@@ -65,25 +77,54 @@ INVENTORY = {
     ),
     "syscall/poll.c::sys_ppoll": (
         "forbids",
-        "A finite poll has spent part of the guest's timeout.",
+        "Linux never restarts the poll family, finite timeout or not "
+        "(signal(7)), so every EINTR exit forbids. A finite wait has also "
+        "spent part of the guest's timeout.",
     ),
     "syscall/poll.c::sys_pselect6": (
         "forbids",
-        "A finite select has spent part of the guest's timeout.",
+        "Same never-restarted poll family, and a finite select has spent part "
+        "of the guest's timeout.",
     ),
     "syscall/poll.c::sys_epoll_pwait": (
         "forbids",
-        "A finite epoll wait has spent part of the guest's timeout, and ready "
-        "events outrank leader work because kqueue consumes the edge.",
+        "epoll_wait/epoll_pwait are in the never-restarted family, and ready "
+        "events outrank the signal because kqueue consumes the edge.",
     ),
     "runtime/futex.c::futex_wait_inner": (
+        "restartable",
+        "The only EINTR literal here is the clock_gettime failure before a "
+        "waiter is queued, so re-executing re-reads the same futex word. A "
+        "relative FUTEX_WAIT's spent timeout is decided by the waker that "
+        "completes the park instead; see futex_async_cancel_seq_locked.",
+    ),
+    "runtime/futex.c::futex_async_cancel_seq_locked": (
         "forbids",
-        "Relative FUTEX_WAIT has spent part of its timeout; FUTEX_WAIT_BITSET "
-        "is absolute and stays restartable.",
+        "Waker or timer context for a parked FUTEX_WAIT. A relative wait "
+        "publishes exec_restart_forbid_set() on the target task, because the "
+        "waker cannot touch the sleeper's worker-local restart state. Untimed "
+        "and absolute waits stay restartable, and the owner's resume tail "
+        "arms them under the delivered handler's SA_RESTART.",
+    ),
+    "runtime/futex.c::futex_requeue_pi_signal_result_locked": (
+        "restartable",
+        "Reports EINTR only before CMP_REQUEUE_PI, and the waker marks the "
+        "park with async_futex_requeue_pi_restart: Linux ERESTARTNOINTR, so "
+        "the resume tail rewinds without asking SA_RESTART. After the requeue "
+        "the result is EWOULDBLOCK, and a teardown EINTR belongs to a task "
+        "that never remounts.",
+    ),
+    "runtime/futex.c::futex_wait_requeue_pi": (
+        "restartable",
+        "The literal is the clock_gettime failure before the park; no waiter "
+        "is published, so a retry is harmless. The signal result of a parked "
+        "requeue-PI wait is decided by futex_requeue_pi_signal_result_locked.",
     ),
     "syscall/signal.c::signal_rt_sigtimedwait": (
         "forbids",
-        "The timeout is spent in 1 ms chunks before this reports EINTR.",
+        "The timeout is spent in 1 ms chunks, and Linux converts "
+        "do_sigtimedwait's ERESTARTSYS to EINTR even when no timeout was "
+        "supplied, so every EINTR exit leaves the original request spent.",
     ),
     "syscall/io.c::tty_drain_interruptible": (
         "forbids",
@@ -102,6 +143,20 @@ INVENTORY = {
         "Same shape as copy_fd_range, and a pipe is the usual splice input. "
         "This is the drain sys_splice runs per chunk; the forbid lives here "
         "because only this loop knows how much of the chunk never left.",
+    ),
+    "syscall/time.c::sleep_park_on_deadline": (
+        "forbids",
+        "Waker/timer context for a parked nanosleep. The remaining interval "
+        "is recorded and the task-owned forbid published, because only the "
+        "owner may write the guest's timespec and the in-place completion has "
+        "no absolute deadline to re-derive.",
+    ),
+    "syscall/time.c::sleep_park_on_interrupt": (
+        "forbids",
+        "Same shape as sleep_park_on_deadline: the signal completes the park "
+        "in place with the residual interval recorded for the owner, so "
+        "re-running the original request would hand the guest the whole "
+        "interval again.",
     ),
     "syscall/fuse.c::fuse_request_locked": (
         "forbids",
@@ -122,16 +177,23 @@ INVENTORY = {
         "(devio.c:2116-2117), so the dispatcher must not re-enter the wait "
         "as if the guest had asked again.",
     ),
+    "syscall/fuse.c::fuse_wait_for_init_locked": (
+        "restartable",
+        "Cancellation while waiting for session initialization commits no request.",
+    ),
+    "syscall/fuse.c::fuse_file_acquire": (
+        "restartable",
+        "Cancellation before exclusive offset ownership commits no transfer.",
+    ),
+    "syscall/net.c::net_wait_progress": (
+        "forbids",
+        "A partial stream transfer forbids replay; callers return its count "
+        "on interruption and retain it across readiness re-dispatch.",
+    ),
     # Waits that report EINTR before doing anything the guest can observe.
     "syscall/io.c::io_retry_backoff": (
         "restartable",
         "Polled retry helper; reports before the operation it guards runs.",
-    ),
-    "syscall/io.c::copy_past_fsize": (
-        "restartable",
-        "Waits for a byte in an empty pipe before the write path can refuse "
-        "it, and only while the copy has moved nothing. It reads nothing "
-        "itself, so a restart re-runs the call over the same input.",
     ),
     "syscall/io.c::io_wait_fd_or_interrupted": (
         "restartable",
@@ -141,13 +203,25 @@ INVENTORY = {
         "to write a chunk they have already read. Those decide for themselves "
         "and are listed above.",
     ),
-    "syscall/io.c::io_wait_fd_timed_or_interrupted": (
+    "syscall/io.c::io_wait_fd_timed_ex": (
         "restartable",
         "The bounded spelling of the wait above, and restartable for the same "
         "reason: it transfers nothing. The deadline is the caller's, not its "
         "own, so the caller that supplied one -- today only the SO_RCVTIMEO "
         "receive in nl_wait_readable_locked -- is the one that must forbid "
         "the restart.",
+    ),
+    "syscall/io.c::io_wait_fd_timed_or_interrupted": (
+        "restartable",
+        "Forwards io_wait_fd_timed_ex and transfers nothing; the caller that "
+        "supplied a deadline owns the forbid decision.",
+    ),
+    "syscall/io.c::io_park_unmount_multi": (
+        "restartable",
+        "Checks teardown and a claimed waking signal before registering the "
+        "park, and transfers nothing itself. Once armed, the result belongs "
+        "to the waker that completes it: io_park_on_interrupt publishes "
+        "EINTR, and an in-place partial count is published instead of EINTR.",
     ),
     "syscall/fs.c::open_nonblocking_writer": (
         "restartable",
@@ -250,9 +324,12 @@ INVENTORY = {
         "restartable",
         "io_xfer returns EINTR only before it has transferred a byte.",
     ),
-    "syscall/io.c::sys_write": (
+    "syscall/io.c::sys_write_cont": (
         "restartable",
-        "io_xfer returns EINTR only before it has transferred a byte.",
+        "A resumed write starts from the accumulated count, and io_xfer "
+        "returns that count instead of EINTR once anything moved. EINTR "
+        "reaches the guest only on a first round that sent nothing, so a "
+        "restart cannot re-send bytes.",
     ),
     "syscall/io.c::sys_writev": (
         "restartable",
@@ -280,21 +357,43 @@ INVENTORY = {
         "The nonblocking flock probe changes nothing before the backoff waits.",
     ),
     "syscall/sysvipc.c::sys_semop": (
-        "restartable",
-        "A failed IPC_NOWAIT probe applies none of the semaphore operations "
-        "before the backoff waits.",
+        "forbids",
+        "A refused IPC_NOWAIT probe applies none of the operations, but the "
+        "blocking path parks after calling syscall_restart_forbid(): a signal "
+        "completes that park in place with EINTR, and only a local change "
+        "reissues the probe.",
     ),
     "syscall/sysvipc.c::sys_msgsnd": (
-        "restartable",
-        "A refused IPC_NOWAIT send queues nothing before the backoff waits. "
-        "Linux answers ERESTARTNOHAND, so a handler sees EINTR whatever its "
-        "SA_RESTART, and only a wake that ran no handler restarts, which is "
-        "the leader-handoff case the dispatcher restarts here.",
+        "forbids",
+        "A refused IPC_NOWAIT send queues nothing, and the blocking path "
+        "installs the forbid before parking. Linux answers ERESTARTNOHAND, "
+        "so a handler sees EINTR whatever its SA_RESTART; the parked forbid "
+        "delivers exactly that and a queue wake takes the reissue path.",
     ),
     "syscall/sysvipc.c::sys_msgrcv": (
-        "restartable",
-        "A failed IPC_NOWAIT receive dequeues nothing before the backoff "
-        "waits. Restart semantics match sys_msgsnd (ERESTARTNOHAND).",
+        "forbids",
+        "A failed IPC_NOWAIT receive dequeues nothing, and the blocking path "
+        "installs the forbid before parking. Restart semantics match "
+        "sys_msgsnd (ERESTARTNOHAND).",
+    ),
+    "syscall/mqueue.c::mqueue_park_on_interrupt": (
+        "forbids",
+        "Waker context: publishes the task-owned forbid for a signal-caused "
+        "completion, so the owner's resume tail delivers EINTR instead of "
+        "arming a restart. A teardown skips the flag because the task will "
+        "never remount.",
+    ),
+    "syscall/mqueue.c::sys_mq_timedsend": (
+        "forbids",
+        "A full queue parks only after the handler installs the forbid: a "
+        "signal completes that park in place with EINTR, and only a queue "
+        "state change re-dispatches the SVC that re-checks it.",
+    ),
+    "syscall/mqueue.c::sys_mq_timedreceive": (
+        "forbids",
+        "Same shape as sys_mq_timedsend: the empty queue parks behind the "
+        "forbid, the message copy-out stays in the handler on the target, and "
+        "the guest's libc owns the retry.",
     ),
     "syscall/netlink.c::nl_wait_readable_locked": (
         "forbids",
@@ -304,11 +403,8 @@ INVENTORY = {
         "part of it, and a restart would hand the guest the whole timeout a "
         "second time, so that branch forbids like every other spent deadline "
         "in this table. Narrowed once more to the guest-visible half of the "
-        "EINTR: the dispatcher's leader-only execve handoff also reports "
-        "EINTR here, carries no signal, and is restarted by design, so the "
-        "forbid is gated on !thread_stop_is_leader_work_only() and the "
-        "restarted attempt resumes the deadline rather than taking a fresh "
-        "one -- restart_block's job.",
+        "EINTR: a teardown on the infinite path reports it without a signal, "
+        "and the epilogue's signal gate leaves that one as the errno it is.",
     ),
     "syscall/inotify.c::inotify_read": (
         "restartable",
@@ -318,14 +414,24 @@ INVENTORY = {
         "restartable",
         "The queue is empty by the loop condition; no request is dequeued.",
     ),
-    "syscall/proc.c::sys_wait4": (
+    "syscall/proc.c::proc_wait_park": (
         "restartable",
-        "Every reapable outcome returns earlier; no child is removed and no "
-        "status or rusage is written.",
+        "Parking happens only after every reapable outcome and the WNOHANG "
+        "answers returned, and the EINTR it publishes for a signal comes from "
+        "signal_pending_interruption(). No child is reaped for it, and the "
+        "owner's resume tail decides SA_RESTART.",
+    ),
+    "syscall/proc.c::proc_resume_task": (
+        "not-a-wait",
+        "Applies a parked wait's task-owned classification on the owner: it "
+        "either arms the ERESTARTSYS rewind or injects the published result. "
+        "It produces no EINTR of its own.",
     ),
     "syscall/proc.c::sys_waitid": (
-        "restartable",
-        "Same shape as sys_wait4: the reap and WNOHANG answers precede this.",
+        "not-a-wait",
+        "The only literal here is the execve/exit_group teardown refusal "
+        "after the reap and WNOHANG answers. A blocking waitid parks through "
+        "proc_wait_park, which owns the restart classification.",
     ),
     "runtime/futex.c::futex_lock_pi_inner": (
         "restartable",
@@ -339,14 +445,11 @@ INVENTORY = {
     ),
     # Not blocking waits.
     "syscall/signal.c::signal_rt_sigsuspend": (
-        "not-a-wait",
-        "Returns the EINTR sigsuspend is defined to return; the mask is "
-        "restored on the way out.",
-    ),
-    "syscall/exec.c::exec_handoff_to_leader": (
-        "not-a-wait",
-        "Handoff bookkeeping: the requester is being reaped, or the slot never "
-        "reported back.",
+        "forbids",
+        "Linux implements sigsuspend as ERESTARTNOHAND: a handler that runs "
+        "sees EINTR whatever its SA_RESTART. This wait only breaks for a "
+        "signal the guest can observe, so the handler case is the one that "
+        "can reach the return, and the mask is restored on the way out.",
     ),
     "syscall/mem.c::hvf_apply_file_overlay": (
         "not-a-wait",
@@ -373,16 +476,27 @@ INVENTORY = {
 
 # Anything on these lines is the mechanism itself, not a site that reports to a
 # guest.
-SELF = {"syscall/syscall.c::syscall_restart_forbid"}
+SELF = {
+    "syscall/syscall.c::syscall_restart_forbid",
+    "syscall/syscall.c::syscall_restart_consider",
+}
 
 EINTR_RE = re.compile(r"(return\s+-LINUX_EINTR|=\s*-LINUX_EINTR|errno\s*=\s*EINTR)\b")
 
 # A function can also decide the restart question without naming EINTR itself:
 # it forwards a wait helper's errno and calls syscall_restart_forbid() over the
-# top. Those are deciders by the definition above and have to be classified, or
-# the one class of caller the helper's own entry cannot describe -- the caller
-# that consumed something before the wait -- stays invisible to this gate.
-FORBID_MARKER = "syscall_restart_forbid()"
+# top, or it completes another task's parked wait and publishes the same
+# decision with exec_restart_forbid_set(). Those are deciders by the definition
+# above and have to be classified, or the one class of caller the helper's own
+# entry cannot describe -- the caller that consumed something before the wait --
+# stays invisible to this gate.
+#
+# Both spellings name the *mechanism*, so they are matched as calls, not as a
+# free-text mention, and either one makes the function a 'forbids' site. The
+# task-owned writer path is deliberately included even though its caller may
+# only forbid on one branch (a relative timeout, a partial transfer): the entry
+# records the condition.
+FORBID_MARKERS = ("syscall_restart_forbid()", "exec_restart_forbid_set(")
 
 # A wait routed through a shared helper reports the helper's EINTR without ever
 # naming it. That is precisely the refactor this tree keeps making -- four
@@ -403,6 +517,7 @@ FORBID_MARKER = "syscall_restart_forbid()"
 EINTR_HELPERS = (
     "io_wait_fd_or_interrupted",
     "io_wait_fd_timed_or_interrupted",
+    "io_wait_fd_timed_ex",
     "net_wait_or_interrupted",
     "net_recv_zero_payload_gate",
     "connect_nonblock_wait",
@@ -480,7 +595,7 @@ def scan():
         text = path.read_text(errors="ignore").split("\n")
         for name, first, last in functions(path):
             body = code_only("\n".join(text[first - 1 : last]))
-            forbids = FORBID_MARKER in body
+            forbids = any(marker in body for marker in FORBID_MARKERS)
             if not EINTR_RE.search(body) and not forbids and not HELPER_RE.search(body):
                 continue
             found[f"{rel}::{name}"] = forbids

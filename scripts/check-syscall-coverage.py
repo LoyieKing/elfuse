@@ -27,6 +27,7 @@ ALIASES: dict[str, set[str]] = {
     "rt_sigprocmask": {"sigprocmask"},
     "rt_sigtimedwait": {"sigwait", "sigwaitinfo", "sigtimedwait"},
     "signalfd4": {"signalfd"},
+    "mq_getsetattr": {"mq_getattr", "mq_setattr"},
 }
 
 # Keep only syscalls that genuinely lack a direct test reference. main() rejects

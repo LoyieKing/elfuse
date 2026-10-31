@@ -30,6 +30,10 @@ SRCS := \
     core/rosetta.c \
     core/sysroot.c \
     runtime/thread.c \
+    runtime/sched/fair.c \
+    runtime/sched/sched.c \
+    runtime/sched/vcpu_pool.c \
+    runtime/sched/guest_ctx.c \
     runtime/futex.c \
     runtime/forkipc.c \
     runtime/fork-state.c \
@@ -73,6 +77,7 @@ SRCS := \
     syscall/netlink.c \
     syscall/usbdev.c \
     syscall/sysvipc.c \
+    syscall/mqueue.c \
     debug/crashreport.c \
     debug/gdbstub.c \
     debug/gdbstub-reg.c \
@@ -194,13 +199,6 @@ $(BUILD_DIR)/test-tlbi-encoder-host: $(BUILD_DIR)/test-tlbi-encoder-host.o \
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
-## Build the fork IPC protocol identity unit test (native macOS binary).
-# Pure C; no HVF entitlement needed. Pins the first header word as the
-# cross-version protocol discriminator after IPC_VERSION removal.
-$(BUILD_DIR)/test-fork-ipc-protocol-host: \
-		$(BUILD_DIR)/test-fork-ipc-protocol-host.o | $(BUILD_DIR)
-	@echo "  LD      $@"
-	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
 ## Build the vCPU run-loop hook API compile test (native macOS binary).
 $(BUILD_DIR)/test-vcpu-run-hooks-host: \
@@ -236,16 +234,6 @@ $(BUILD_DIR)/test-elf-headers-host: $(BUILD_DIR)/test-elf-headers-host.o \
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
-## Build the teardown live-worker accounting host unit test (native macOS binary)
-# Links the in-tree thread.o so the real thread_destroy_all_vcpus logic runs.
-# It drives only the worker branches (main vCPU passed as not-valid), so no
-# hv_vcpu_destroy is ever called and no HVF entitlement is needed; the framework
-# is linked only to resolve thread.o's hv_* references.
-$(BUILD_DIR)/test-teardown-live-vcpu-host: \
-		$(BUILD_DIR)/test-teardown-live-vcpu-host.o \
-		$(BUILD_DIR)/runtime/thread.o | $(BUILD_DIR)
-	@echo "  LD      $@"
-	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(HVF_LDFLAGS)
 
 ## Build the fair-scheduler pure-math host unit test (no HVF entitlement).
 $(BUILD_DIR)/test-sched-fair-host: $(BUILD_DIR)/test-sched-fair-host.o \
@@ -566,7 +554,7 @@ $(BUILD_DIR)/test-sigsuspend: tests/test-sigsuspend.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -Itests -o $@ $< -lpthread
 
-# test-thread-churn creates >64 threads to force thread-table slot reuse.
+# test-thread-churn creates >64 threads (reuse + concurrent growth past old cap).
 $(BUILD_DIR)/test-thread-churn: tests/test-thread-churn.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
