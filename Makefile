@@ -247,6 +247,13 @@ $(BUILD_DIR)/test-teardown-live-vcpu-host: \
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(HVF_LDFLAGS)
 
+## Build the fair-scheduler pure-math host unit test (no HVF entitlement).
+$(BUILD_DIR)/test-sched-fair-host: $(BUILD_DIR)/test-sched-fair-host.o \
+		$(BUILD_DIR)/runtime/sched/fair.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+
 ## Build the buffered GDB session host regression
 $(BUILD_DIR)/test-gdbstub-host: $(BUILD_DIR)/test-gdbstub-host.o \
 		$(BUILD_DIR)/debug/gdbstub-reg.o | $(BUILD_DIR)
