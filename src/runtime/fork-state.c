@@ -837,6 +837,10 @@ static int fork_ipc_send_backing_fds(int ipc_sock,
     int backing_fds[GUEST_MAX_REGIONS];
     uint32_t nbacking = 0;
 
+    /* DONTFORK regions send their fd too: the child consumes this bundle before
+     * it drops them, so count and order stay tied to the serialized region
+     * table.
+     */
     for (uint32_t i = 0; i < num_guest_regions; i++) {
         if (regions_snapshot[i].backing_fd >= 0) {
             if (fcntl(regions_snapshot[i].backing_fd, F_GETFD) < 0) {
@@ -1026,6 +1030,44 @@ static int fork_ipc_recv_backing_fds(int ipc_fd,
     return 0;
 }
 
+/* Backing fds have been received, but shared overlays are not installed yet.
+ * Clear child PTEs and metadata without writing snapshot bytes or shared files.
+ */
+static bool fork_ipc_drop_dontfork_regions(guest_t *g)
+{
+    mmap_lock_acquire();
+    for (int i = 0; i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (r->dontfork && guest_invalidate_ptes(g, r->start, r->end) < 0) {
+            mmap_lock_release();
+            log_error(
+                "fork-child: cannot invalidate DONTFORK range [0x%llx, 0x%llx)",
+                (unsigned long long) r->start, (unsigned long long) r->end);
+            return false;
+        }
+    }
+    int kept = 0;
+    for (int i = 0; i < g->nregions; i++) {
+        if (g->regions[i].dontfork) {
+            if (g->regions[i].backing_fd >= 0)
+                close(g->regions[i].backing_fd);
+            continue;
+        }
+        if (kept != i)
+            g->regions[kept] = g->regions[i];
+        kept++;
+    }
+    g->nregions = kept;
+    mmap_lock_release();
+
+    /* The child's VM has no TLB history, so the ranges accumulated for the
+     * copied page tables need no flush before entry. Drop them rather than
+     * making the first syscall return issue them.
+     */
+    tlbi_request_clear();
+    return true;
+}
+
 int fork_ipc_recv_process_state(int ipc_fd,
                                 guest_t *g,
                                 signal_state_snapshot_t *sig)
@@ -1167,8 +1209,9 @@ int fork_ipc_recv_process_state(int ipc_fd,
      * fields. parent_had_fd lets recv_backing_fds iterate in the same order the
      * sender used (regions with backing_fd >= 0); the parent_ovl_* arrays let
      * mmap_fork_restore_overlays know which regions to re-install, with what
-     * overlay span. Heap-allocated to avoid pushing hundreds of KiB onto the
-     * recv stack frame.
+     * overlay span. They are re-indexed past the DONTFORK regions below, none
+     * of which may receive an overlay in the child. Heap-allocated to avoid
+     * pushing hundreds of KiB onto the recv stack frame.
      */
     bool *parent_had_fd = NULL;
     bool *parent_active = NULL;
@@ -1218,10 +1261,36 @@ int fork_ipc_recv_process_state(int ipc_fd,
         return -1;
     }
 
-    /* Re-install MAP_SHARED overlays for every region the parent had as
-     * overlay_active and that now carries a backing fd. Failures here fall back
-     * to snapshot semantics for the affected region; the child still boots and
-     * can run.
+    /* Compact the overlay arrays to the regions that survive the DONTFORK drop.
+     * The flag rides on whole regions (madvise splits at its bounds), so this
+     * keeps the arrays aligned with the table the restore helper walks after
+     * removal shifts the survivors down.
+     */
+    int kept = 0;
+    for (int i = 0; i < g->nregions; i++) {
+        if (g->regions[i].dontfork)
+            continue;
+        parent_active[kept] = parent_active[i];
+        parent_ovl_start[kept] = parent_ovl_start[i];
+        parent_ovl_end[kept] = parent_ovl_end[i];
+        kept++;
+    }
+
+    if (!fork_ipc_drop_dontfork_regions(g) || g->nregions != kept) {
+        log_error("fork-child: DONTFORK drop failed (survivors %d/%d)",
+                  g->nregions, kept);
+        free(parent_had_fd);
+        free(parent_active);
+        free(parent_ovl_start);
+        free(parent_ovl_end);
+        return -1;
+    }
+
+    /* Re-install MAP_SHARED overlays for every retained region the parent had
+     * as overlay_active and that now carries a backing fd. An excluded page is
+     * only ever covered by an overlay when a retained neighbor shares its host
+     * page. Failures here fall back to snapshot semantics for the affected
+     * region; the child still boots and can run.
      */
     if (g->nregions > 0)
         (void) mmap_fork_restore_overlays(g, parent_active, parent_ovl_start,

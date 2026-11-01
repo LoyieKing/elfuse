@@ -722,6 +722,25 @@ attempts. No blocked stack was captured; the isolated timeout remains
 unexplained and is not evidence of a resolved teardown race.
 
 
+## Fork inheritance advice
+
+`tests/test-madvise-fork.c` checks `MADV_DONTFORK` and `MADV_DOFORK` on
+private and shared file mappings, partial restoration, protection splits,
+mremap moves and growth, repeated/nested fork, address reuse, `CLONE_VM`,
+alignment, zero lengths and ranges containing holes. Child reads must fault
+with `SIGSEGV/SEGV_MAPERR` on excluded pages. The test also checks parent data,
+shared backing contents and the `dc` flag in `smaps`.
+
+Build and run the focused case with:
+
+```sh
+make elfuse build/test-madvise-fork
+build/elfuse build/test-madvise-fork
+bash tests/qemu-runner.sh exec /mnt/host/build/test-madvise-fork
+```
+
+The normal aarch64 matrices include the case for both elfuse and Linux.
+
 ## Validation Strategy By Change Type
 
 Suggested minimum validation:

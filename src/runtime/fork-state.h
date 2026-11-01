@@ -21,7 +21,7 @@
 /* Fork IPC protocol identity. Bump this whenever the header layout or ordered
  * fork payload changes incompatibly.
  */
-#define FORK_IPC_PROTOCOL_MAGIC 0x454C4654U /* "ELFT" */
+#define FORK_IPC_PROTOCOL_MAGIC 0x454C4655U /* "ELFU" */
 
 #define IPC_HDR_SOFT_NEWPID 0x1u
 

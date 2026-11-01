@@ -268,6 +268,7 @@ typedef struct {
     int backing_fd;    /* Duplicated host fd for file-backed mappings, or -1 */
     bool shared;       /* MAP_SHARED (writes should propagate) */
     bool noreserve;    /* MAP_NORESERVE: PTEs deferred until fault */
+    bool dontfork;     /* MADV_DONTFORK: omit this range from a fork child. */
     bool backing_ro;   /* MAP_SHARED region whose backing_fd was opened
                         * without write access, so its Linux max_prot is
                         * capped to PROT_READ. sys_mprotect must reject any
@@ -1294,8 +1295,8 @@ int guest_region_add_elf_segment(guest_t *g,
 
 /* Like guest_region_add_ex, but consumes owned_backing_fd on success or
  * failure. inherited_at_fork identifies bytes copied from the latest fork
- * snapshot. vma_id preserves logical-VMA provenance across tracker splits and
- * mremap moves; pass 0 for a new VMA.
+ * snapshot; dontfork excludes the range from future fork children. vma_id
+ * preserves logical-VMA provenance across splits and moves; 0 creates a VMA.
  */
 int guest_region_add_ex_owned(guest_t *g,
                               uint64_t start,
@@ -1306,6 +1307,7 @@ int guest_region_add_ex_owned(guest_t *g,
                               const char *name,
                               int owned_backing_fd,
                               bool inherited_at_fork,
+                              bool dontfork,
                               uint64_t vma_id);
 int guest_region_add_ex_owned_gpa(guest_t *g,
                                   uint64_t start,
@@ -1317,6 +1319,7 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
                                   const char *name,
                                   int owned_backing_fd,
                                   bool inherited_at_fork,
+                                  bool dontfork,
                                   uint64_t vma_id);
 
 /* Re-seed the logical-VMA allocator from a restored region snapshot. Fork IPC

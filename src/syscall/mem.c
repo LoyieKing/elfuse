@@ -113,6 +113,7 @@ typedef struct {
     uint64_t overlay_end;
     bool backing_ro;
     bool inherited_at_fork;
+    bool dontfork;
     char name[sizeof(((guest_region_t *) 0)->name)];
 } region_snapshot_t;
 
@@ -366,6 +367,7 @@ static int find_mremap_source(const guest_t *g,
                 previous->flags != r->flags || previous->shared != r->shared ||
                 previous->noreserve != r->noreserve ||
                 previous->backing_ro != r->backing_ro ||
+                previous->dontfork != r->dontfork ||
                 strcmp(previous->name, r->name) != 0 ||
                 !mremap_backings_match(previous, r))
                 goto invalid;
@@ -459,6 +461,7 @@ typedef struct {
     uint64_t offset;
     uint64_t inherited_size;
     uint64_t vma_id;
+    bool dontfork;
     int backing_fd;
     int tail_backing_fd;
     char name[sizeof(((guest_region_t *) 0)->name)];
@@ -505,6 +508,7 @@ static bool mremap_track_init(mremap_track_t *track,
     track->offset = src_reg->offset + (old_off - src_reg->start);
     track->inherited_size = src_reg->inherited_at_fork ? inherited_size : 0;
     track->vma_id = vma_id;
+    track->dontfork = src_reg->dontfork;
     track->tail_backing_fd = -1;
     track->backing_fd = dup_region_backing_fd(src_reg);
     if (src_reg->backing_fd >= 0 && track->backing_fd < 0)
@@ -553,15 +557,15 @@ static int add_mremap_region(guest_t *g,
         }
         if (guest_region_add_ex_owned(g, start, start + inherited_size, prot,
                                       flags, offset, name, backing_fd, true,
-                                      vma_id) < 0) {
+                                      track->dontfork, vma_id) < 0) {
             if (tail_backing_fd >= 0)
                 close(tail_backing_fd);
             return -1;
         }
-        if (guest_region_add_ex_owned(g, start + inherited_size,
-                                      start + new_size, prot, flags,
-                                      offset + inherited_size, name,
-                                      tail_backing_fd, false, vma_id) < 0) {
+        if (guest_region_add_ex_owned(
+                g, start + inherited_size, start + new_size, prot, flags,
+                offset + inherited_size, name, tail_backing_fd, false,
+                track->dontfork, vma_id) < 0) {
             guest_region_remove(g, start, start + inherited_size);
             return -1;
         }
@@ -572,7 +576,8 @@ static int add_mremap_region(guest_t *g,
         close(tail_backing_fd);
     return guest_region_add_ex_owned(
         g, start, start + new_size, prot, flags, offset, name, backing_fd,
-        inherited_size == new_size && inherited_size > 0, vma_id);
+        inherited_size == new_size && inherited_size > 0, track->dontfork,
+        vma_id);
 }
 
 static void region_clip_overlay(guest_region_t *r)
@@ -1288,7 +1293,7 @@ populate_existing:
     }
     if (guest_region_add_ex_owned_gpa(g, addr, addr + length, gpa_base, prot,
                                       flags, offset, NULL, track_backing_fd,
-                                      false, 0) < 0)
+                                      false, false, 0) < 0)
         goto fail;
 
     /* Ownership of track_backing_fd is now held by the new region. The fail
@@ -1839,6 +1844,7 @@ static int capture_region_snapshots(guest_t *g,
         snap->overlay_end = r->overlay_end;
         snap->backing_ro = r->backing_ro;
         snap->inherited_at_fork = r->inherited_at_fork;
+        snap->dontfork = r->dontfork;
         str_copy_trunc(snap->name, r->name, sizeof(snap->name));
     }
 
@@ -1958,7 +1964,8 @@ static int restore_region_snapshots(guest_t *g, region_snapshot_t *snaps, int n)
         if (guest_region_add_ex_owned_gpa(
                 g, snap->start, snap->end, snap->gpa_base, snap->prot,
                 snap->flags, snap->offset, snap->name[0] ? snap->name : NULL,
-                snap->backing_fd, snap->inherited_at_fork, snap->vma_id) < 0) {
+                snap->backing_fd, snap->inherited_at_fork, snap->dontfork,
+                snap->vma_id) < 0) {
             snap->backing_fd = -1;
             close_region_snapshots(snaps, n);
             return -LINUX_ENOMEM;
@@ -2563,8 +2570,9 @@ static bool heap_piece_is_plain(const guest_region_t *r)
     return r->end > r->start && r->gpa_base == r->start &&
            r->prot == (LINUX_PROT_READ | LINUX_PROT_WRITE) &&
            r->flags == heap_flags && r->backing_fd < 0 && !r->shared &&
-           !r->noreserve && !r->backing_ro && !r->inherited_at_fork &&
-           !region_has_live_overlay(r) && !strcmp(r->name, "[heap]");
+           !r->noreserve && !r->dontfork && !r->backing_ro &&
+           !r->inherited_at_fork && !region_has_live_overlay(r) &&
+           !strcmp(r->name, "[heap]");
 }
 
 
@@ -2758,7 +2766,7 @@ int64_t sys_brk(guest_t *g, uint64_t addr)
             if (guest_region_add_ex_owned(
                     g, old_brk, new_off, LINUX_PROT_READ | LINUX_PROT_WRITE,
                     LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, 0, "[heap]", -1,
-                    false, heap_vma) < 0) {
+                    false, false, heap_vma) < 0) {
                 /* A full table. The break already moved, so only the tracker is
                  * behind: an mprotect over a heap the table does not describe
                  * would find vacuously uniform prot and skip the PTE work.
@@ -3541,7 +3549,8 @@ int64_t sys_mmap(guest_t *g,
     fresh.track_backing_fd = -1;
     if (guest_region_add_ex_owned(g, result_off, result_off + length, prot,
                                   track_flags, is_anon ? 0 : (uint64_t) offset,
-                                  NULL, owned_backing_fd, false, 0) < 0) {
+                                  NULL, owned_backing_fd, false, false,
+                                  0) < 0) {
         /* Region table was full: undo any host overlay we just installed so the
          * file is not left mmap'd at host_base+ipa with no tracking. Without
          * this, a later operation in that range would memset zeros directly
@@ -4252,7 +4261,10 @@ int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
      * ENOMEM trips the guest's CHECK_EQ(0, ret) on the madvise return.
      */
     bool in_primary = (off <= g->guest_size && length <= g->guest_size - off);
-    if (!in_primary && !madvise_range_mapped(g, off, length))
+    if (addr < g->ipa_base || length > UINT64_MAX - off)
+        return -LINUX_ENOMEM;
+    if (!in_primary && advice != LINUX_MADV_DONTFORK &&
+        advice != LINUX_MADV_DOFORK && !madvise_range_mapped(g, off, length))
         return -LINUX_ENOMEM;
 
     /* Defensive guard against destructive advice on infrastructure ranges (page
@@ -4265,6 +4277,34 @@ int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
         return -LINUX_EINVAL;
 
     switch (advice) {
+    case LINUX_MADV_DONTFORK:
+    case LINUX_MADV_DOFORK: {
+        uint64_t end = off + length;
+        bool covered = madvise_range_mapped(g, off, length);
+        bool dontfork = advice == LINUX_MADV_DONTFORK;
+        bool changed = false;
+        for (int i = guest_region_first_end_above(g, off); i < g->nregions;
+             i++) {
+            if (g->regions[i].start >= end)
+                break;
+            changed |= g->regions[i].dontfork != dontfork;
+        }
+        if (!changed)
+            return covered ? 0 : -LINUX_ENOMEM;
+        region_split_undo_t splits[2];
+        int err = split_regions_at_bounds(g, off, end, splits);
+        if (err < 0)
+            return err;
+        for (int i = guest_region_first_end_above(g, off); i < g->nregions;
+             i++) {
+            guest_region_t *r = &g->regions[i];
+            if (r->start >= end)
+                break;
+            r->dontfork = dontfork;
+        }
+        return covered ? 0 : -LINUX_ENOMEM;
+    }
+
     case LINUX_MADV_DONTNEED: {
         /* MADV_DONTNEED: zero anon pages so next access sees zero-fill, restore
          * file-backed pages from the current backing file contents. Linux

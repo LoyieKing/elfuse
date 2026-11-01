@@ -1985,6 +1985,8 @@ static bool regions_mergeable_layout(const guest_region_t *a,
      */
     if (a->noreserve != b->noreserve)
         return false;
+    if (a->dontfork != b->dontfork)
+        return false;
     if (a->backing_ro != b->backing_ro)
         return false;
     if (a->inherited_at_fork != b->inherited_at_fork)
@@ -2106,7 +2108,7 @@ int guest_region_add_ex(guest_t *g,
 
     return guest_region_add_ex_owned_gpa(g, start, end, start, prot, flags,
                                          offset, name, owned_backing_fd, false,
-                                         0);
+                                         false, 0);
 }
 
 int guest_region_add_ex_gpa(guest_t *g,
@@ -2128,7 +2130,7 @@ int guest_region_add_ex_gpa(guest_t *g,
 
     return guest_region_add_ex_owned_gpa(g, start, end, gpa_base, prot, flags,
                                          offset, name, owned_backing_fd, false,
-                                         0);
+                                         false, 0);
 }
 
 int guest_region_add_elf_segment(guest_t *g,
@@ -2180,11 +2182,12 @@ int guest_region_add_ex_owned(guest_t *g,
                               const char *name,
                               int owned_backing_fd,
                               bool inherited_at_fork,
+                              bool dontfork,
                               uint64_t vma_id)
 {
     return guest_region_add_ex_owned_gpa(g, start, end, start, prot, flags,
                                          offset, name, owned_backing_fd,
-                                         inherited_at_fork, vma_id);
+                                         inherited_at_fork, dontfork, vma_id);
 }
 
 int guest_region_add_ex_owned_gpa(guest_t *g,
@@ -2197,6 +2200,7 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
                                   const char *name,
                                   int owned_backing_fd,
                                   bool inherited_at_fork,
+                                  bool dontfork,
                                   uint64_t vma_id)
 {
     if (g->nregions >= GUEST_MAX_REGIONS) {
@@ -2232,6 +2236,7 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
     r->backing_fd = owned_backing_fd;
     r->shared = (flags & LINUX_MAP_SHARED) != 0;
     r->noreserve = (flags & LINUX_MAP_NORESERVE) != 0;
+    r->dontfork = dontfork;
     r->backing_ro = false;
     r->inherited_at_fork = inherited_at_fork;
     guest_region_clear_overlay(r);

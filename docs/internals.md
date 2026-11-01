@@ -778,6 +778,19 @@ forks fall back to the legacy IPC copy path.
 macOS rejects `MAP_PRIVATE` on `shm_open` fds (`EINVAL`), so the backing
 file is created via `mkstemp` + `unlink`.
 
+`madvise(MADV_DONTFORK)` marks page-aligned mapping ranges for exclusion from
+fork children. `MADV_DOFORK` restores inheritance. Partial ranges split the
+region metadata; protection changes and mremap moves/growth retain the flag.
+An unmapped hole returns `ENOMEM` after applying advice to mapped fragments.
+The parent retains its mapping and data. `CLONE_VM` shares the address space
+and does not apply fork exclusion.
+
+The fork child clears copied PTEs and removes excluded region records before
+restoring shared overlays or entering guest code. It consumes and closes the
+excluded backing descriptors without zeroing shared files. The same rule
+applies to snapshot-backed and copied memory. Excluded pages fault with
+`SIGSEGV/SEGV_MAPERR` in the child; parent `smaps` reports `VmFlags: dc`.
+
 ### Legacy IPC Copy Path
 
 When `g->shm_fd < 0`, the parent serializes used memory regions in 1 MiB
@@ -1593,9 +1606,9 @@ other numeric counter, including `THPeligible`, is emitted as a stable zero.
 `ProtectionKey` (a Linux pkeys field added in Linux 4.9) is intentionally
 omitted because the macOS host has no equivalent; consumers comparing against a
 real Linux kernel should treat it as optional. `VmFlags` is evidence-based and
-contains only the permission/sharing flags represented by the tracked VMA
-(`rd`, `wr`, `ex`, `sh`, and `nr` when applicable); no untracked kernel flags
-are invented. A VMA with no such evidence (for example `PROT_NONE`) still
+contains only the permission, sharing and inheritance flags represented by the
+tracked VMA (`rd`, `wr`, `ex`, `sh`, `nr`, and `dc` when applicable); no
+untracked kernel flags are invented. A VMA with no such evidence still
 prints the field's separating space as `VmFlags: `.
 These are coarse VMA-level values, not host page-residency, dirty-bit, or
 proportional-sharing accounting, so they are suitable for fork-safety checks

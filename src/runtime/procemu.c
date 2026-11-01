@@ -105,6 +105,7 @@ typedef struct {
     int prot, flags;
     uint64_t offset;
     bool inherited_at_fork;
+    bool dontfork;
     char name[64];
 } maps_entry_t;
 
@@ -133,7 +134,8 @@ static int maps_entries_append_entry(maps_entries_t *entries,
                                      int flags,
                                      uint64_t offset,
                                      const char *name,
-                                     bool inherited_at_fork)
+                                     bool inherited_at_fork,
+                                     bool dontfork)
 {
     if (end <= start)
         return 0;
@@ -152,6 +154,7 @@ static int maps_entries_append_entry(maps_entries_t *entries,
         .flags = flags,
         .offset = offset,
         .inherited_at_fork = inherited_at_fork,
+        .dontfork = dontfork,
     };
     if (name && name[0])
         str_copy_trunc(value.name, name, sizeof(value.name));
@@ -1642,13 +1645,13 @@ static int proc_build_maps_entries(const guest_t *g,
         if (last && last->end == start && last->prot == r->prot &&
             last->flags == r->flags && last->offset == r->offset &&
             last->inherited_at_fork == r->inherited_at_fork &&
-            !strcmp(last->name, r->name)) {
+            last->dontfork == r->dontfork && !strcmp(last->name, r->name)) {
             last->end = end;
             continue;
         }
         if (maps_entries_append_entry(&entries, start, end, r->prot, r->flags,
-                                      r->offset, r->name,
-                                      r->inherited_at_fork) < 0)
+                                      r->offset, r->name, r->inherited_at_fork,
+                                      r->dontfork) < 0)
             goto out_unlock;
     }
 
@@ -1837,6 +1840,8 @@ static int proc_open_self_smaps(const guest_t *g)
             APPEND_VMFLAG("sh");
         if (noreserve)
             APPEND_VMFLAG("nr");
+        if (e->dontfork)
+            APPEND_VMFLAG("dc");
 #undef APPEND_VMFLAG
         vmflags[vmflags_len] = '\0';
 

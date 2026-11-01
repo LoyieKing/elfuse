@@ -962,6 +962,9 @@ run_unit_tests()
     printf "\nmadvise MADV_DONTNEED\n"
     test_rc "$runner" "test-madvise" 0 "$bindir/test-madvise"
 
+    printf "\nmadvise MADV_DONTFORK/DOFORK\n"
+    test_rc "$runner" "test-madvise-fork" 0 "$bindir/test-madvise-fork"
+
     printf "\nScatter-gather I/O\n"
     test_check "$runner" "test-readv-writev" "PASS" "$bindir/test-readv-writev"
     test_check "$runner" "test-writev-huge-iovec" "0 failed" \
