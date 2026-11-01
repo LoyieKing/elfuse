@@ -410,6 +410,12 @@ static void slot_cpu_port_init(struct vcpu_slot *slot)
 
 static uint64_t slot_cpu_ns(struct vcpu_slot *slot)
 {
+    /* The public owner clock avoids a Mach message on every phase boundary.
+     * Remote readers still need the cached port; both clocks sum user/system
+     * CPU time, excluding time descheduled or blocked on the host.
+     */
+    if (slot == owner_slot)
+        return clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
     mach_port_t port =
         atomic_load_explicit(&slot->cpu_port, memory_order_acquire);
     if (port == MACH_PORT_NULL)
