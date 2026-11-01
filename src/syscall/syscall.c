@@ -934,6 +934,8 @@ static int64_t sc_exit_group(guest_t *g,
      * returns, before guest teardown.
      */
     proc_request_exit_group((int) x0);
+    /* Idle scheduler owners are outside HVF and must leave their queue wait. */
+    sched_request_shutdown();
     wakeup_pipe_signal();
     vcpu_pool_kick_all_mounted();
 

@@ -10,8 +10,8 @@
  * timeline per logical CPU, a CPU-wide fair period, and per-task activation
  * budgets that survive blocking and migration.
  *
- * The fair period/activation/timeslice model and the augmented run-queue
- * selection are derived from the Zircon fair scheduler at the pinned commit
+ * Fair activation, augmented queue selection, runtime estimation, CPU placement
+ * and idle stealing derive from the Zircon fair scheduler at the pinned commit
  * 966c936b56d8d117a26ecbf2c583ec350b2325c8 (zircon/kernel/kernel/scheduler.rs).
  * Zircon is distributed under a MIT-style license; see docs/scheduler.md for
  * the pinned reference.
@@ -55,6 +55,9 @@
 /* DL runtime must be at least 1 << DL_SCALE nanoseconds (Linux). */
 #define SCHED_DL_MIN_RUNTIME_NS 1024ULL
 
+/* Zircon find_target_cpu's same-cluster queue-time early-out threshold. */
+#define SCHED_INTRA_CLUSTER_THRESHOLD_NS 25000ULL
+
 typedef struct sched_cpu_state {
     sched_tree_t fair; /* keyed by activation start, augmented by finish */
     sched_tree_t dl;   /* keyed by absolute deadline (EDF) */
@@ -67,6 +70,9 @@ typedef struct sched_cpu_state {
     uint32_t slope_q10;    /* virtual timeline speed, Zircon Affine slope */
     uint64_t virtual_ns;   /* fair virtual timeline */
     uint64_t snap_count;   /* idle timeline snaps (diagnostic) */
+    uint64_t total_expected_runtime_ns; /* queued and running tasks, Zircon */
+    pthread_cond_t
+        work_cond; /* host equivalent of target CPU reschedule wake */
 
     thread_entry_t *current;
     int current_class;
@@ -300,6 +306,38 @@ static bool dmask_allows(const uint8_t *mask, size_t len, int cpu)
     return SCHED_BIT_TEST(mask, cpu) != 0;
 }
 
+static int find_fair_target_cpu_locked(const thread_entry_t *t)
+{
+    int start = CTS(t)->placement_cpu;
+    if (start < 0 || start >= sched_ncpu)
+        start = 0;
+    int best = -1;
+    uint64_t best_queue = UINT64_MAX;
+    uint64_t best_dl = UINT64_MAX;
+
+    /* Zircon find_target_cpu / CandidatePlacement in one equal-capacity
+     * cluster: last CPU first, then least queue time and deadline utilization.
+     */
+    for (int offset = 0; offset < sched_ncpu; offset++) {
+        int cpu = (start + offset) % sched_ncpu;
+        if (!affinity_allows(t, cpu))
+            continue;
+        const sched_cpu_state_t *candidate = &sched_cpus[cpu];
+        uint64_t queue = candidate->total_expected_runtime_ns;
+        uint64_t dl = candidate->dl_running_bw;
+        if (best < 0 || queue < best_queue ||
+            (queue == best_queue && dl < best_dl)) {
+            best = cpu;
+            best_queue = queue;
+            best_dl = dl;
+            if (queue <= SCHED_INTRA_CLUSTER_THRESHOLD_NS &&
+                dl <= SCHED_DL_BW_ONE)
+                break;
+        }
+    }
+    return best;
+}
+
 static int cpu_load_score(int cpu)
 {
     sched_cpu_state_t *c = &sched_cpus[cpu];
@@ -315,6 +353,8 @@ static int pick_cpu_locked(thread_entry_t *t)
     if (placement >= 0 && placement < sched_ncpu &&
         affinity_allows(t, placement))
         return placement;
+    if (task_eff_class(t) == SCHED_CLASS_FAIR)
+        return find_fair_target_cpu_locked(t);
 
     int best = -1;
     int best_load = 0;
@@ -433,20 +473,28 @@ static void fair_migrate_transform_locked(thread_entry_t *t, int target_cpu)
         return;
     }
     if (s->fair_cpu >= 0 && s->fair_cpu != target_cpu) {
-        /* Activation values are in the source CPU's virtual timeline. Keep the
-         * consumed fraction of the budget and rebase it on the target timeline;
-         * this is the explicit migration transform.
+        /* Zircon steal_work carries source variable time through monotonic time
+         * before target insertion. HVF CPUs use equal processing rates; each
+         * CPU's current virtual time is the common instant's anchor.
          */
-        uint64_t full = fair_slice_for(t, cpu);
-        uint64_t used = s->fair_used_ns;
-        if (used > s->fair_slice_ns)
-            used = s->fair_slice_ns;
-        uint64_t scaled =
-            (uint64_t) (((__uint128_t) used * full) / s->fair_slice_ns);
-        s->fair_slice_ns = full;
-        s->fair_used_ns = scaled;
-        s->fair_start_ns = now;
-        s->fair_finish_ns = now + SCHED_DEFAULT_FAIR_PERIOD_NS;
+        const sched_cpu_state_t *source = &sched_cpus[s->fair_cpu];
+        uint32_t from =
+            source->slope_q10 ? source->slope_q10 : SCHED_FAIR_SLOPE_ONE;
+        uint32_t to = cpu->slope_q10 ? cpu->slope_q10 : SCHED_FAIR_SLOPE_ONE;
+        __int128 start = (__int128) s->fair_start_ns - source->virtual_ns;
+        __int128 finish = (__int128) s->fair_finish_ns - source->virtual_ns;
+        start = (__int128) now + start * to / from;
+        finish = (__int128) now + finish * to / from;
+        s->fair_start_ns = start < 0            ? 0
+                           : start > UINT64_MAX ? UINT64_MAX
+                                                : (uint64_t) start;
+        s->fair_finish_ns = finish < 0            ? 0
+                            : finish > UINT64_MAX ? UINT64_MAX
+                                                  : (uint64_t) finish;
+        s->fair_slice_ns =
+            (uint64_t) ((__uint128_t) s->fair_slice_ns * to / from);
+        s->fair_used_ns =
+            (uint64_t) ((__uint128_t) s->fair_used_ns * to / from);
         s->fair_cpu = target_cpu;
         return;
     }
@@ -953,6 +1001,7 @@ static void task_remove_from_queue_locked(thread_entry_t *t)
         return;
     }
     sched_cpu_state_t *cpu = &sched_cpus[cpu_index];
+    cpu->total_expected_runtime_ns -= s->expected_runtime_ns;
 
     switch (s->queued_class) {
     case SCHED_CLASS_FAIR:
@@ -1034,6 +1083,7 @@ static bool task_insert_into_queue_locked(thread_entry_t *t,
     }
 
     if (ok) {
+        cpu->total_expected_runtime_ns += s->expected_runtime_ns;
         s->on_rq = true;
         s->queued_class = cls;
         s->queued_cpu = cpu_index;
@@ -1041,6 +1091,22 @@ static bool task_insert_into_queue_locked(thread_entry_t *t,
         s->placement_cpu = cpu_index;
     }
     return ok;
+}
+
+static void place_fair_wakeup_locked(thread_entry_t *t)
+{
+    if (task_eff_class(t) == SCHED_CLASS_FAIR) {
+        int target = find_fair_target_cpu_locked(t);
+        TS(t)->placement_cpu = target;
+
+        /* Zircon insert(Placement::Insertion) resets the activation window
+         * before bandwidth adjustment when new-wakeup accounting is disabled.
+         */
+        TS(t)->fair_start_ns = sched_cpus[target].virtual_ns;
+        TS(t)->fair_finish_ns =
+            TS(t)->fair_start_ns + SCHED_DEFAULT_FAIR_PERIOD_NS;
+        TS(t)->fair_cpu = target;
+    }
 }
 
 static int enqueue_ready_locked(thread_entry_t *t,
@@ -1069,6 +1135,7 @@ static int enqueue_ready_locked(thread_entry_t *t,
     if (cpu_index < 0 || cpu_index >= sched_ncpu ||
         !affinity_allows(t, cpu_index))
         cpu_index = pick_cpu_locked(t);
+
     if (cpu_index < 0)
         cpu_index = 0;
 
@@ -1098,7 +1165,8 @@ static int enqueue_ready_locked(thread_entry_t *t,
         if (preempt)
             cpu_need_resched_locked(&sched_cpus[cpu_index], cpu_index, a);
     }
-    pthread_cond_broadcast(&sched_cond);
+    pthread_cond_signal(&sched_cpus[cpu_index].work_cond);
+    pthread_cond_broadcast(&sched_cond); /* waiters without a CPU binding */
     return 1;
 }
 
@@ -1238,6 +1306,9 @@ static void account_locked(thread_entry_t *t,
         s->runtime_sys_ns += ns;
     else
         s->runtime_user_ns += ns;
+    s->banked_runtime_ns = UINT64_MAX - s->banked_runtime_ns < ns
+                               ? UINT64_MAX
+                               : s->banked_runtime_ns + ns;
 
     int cpu_index = s->current_cpu;
     if (cpu_index < 0)
@@ -1381,6 +1452,43 @@ static thread_entry_t *pick_locked(sched_cpu_state_t *cpu,
     return next;
 }
 
+static bool steal_affinity_allows(const sched_tree_node_t *node, void *arg)
+{
+    const thread_entry_t *t = task_from_node((sched_tree_node_t *) node);
+    int cpu = *(const int *) arg;
+    return affinity_allows(t, cpu) &&
+           atomic_load_explicit(&CTS(t)->stop_reasons, memory_order_relaxed) ==
+               0;
+}
+
+/* Zircon steal_work: search remote queues in CPU-search order, snap the source
+ * eligibility timeline, and take the earliest eligible FAIR task. Linux RT
+ * order and DL admission remain local; neither queue is stolen.
+ */
+static bool steal_fair_work_locked(int target, uint64_t now, sched_actions_t *a)
+{
+    for (int offset = 1; offset < sched_ncpu; offset++) {
+        int source = (target + offset) % sched_ncpu;
+        sched_cpu_state_t *cpu = &sched_cpus[source];
+        sched_tree_node_t *front = sched_tree_first(&cpu->fair);
+        if (!front)
+            continue;
+        if (cpu->virtual_ns < front->key_time) {
+            cpu->virtual_ns = front->key_time;
+            cpu->snap_count++;
+        }
+        sched_tree_node_t *node = sched_tree_pick_eligible_if(
+            &cpu->fair, cpu->virtual_ns, steal_affinity_allows, &target);
+        if (!node)
+            continue;
+        thread_entry_t *t = task_from_node(node);
+        task_remove_from_queue_locked(t);
+        TS(t)->placement_cpu = target;
+        return task_insert_into_queue_locked(t, target, now, a);
+    }
+    return false;
+}
+
 /* Public: host services and domain lifecycle */
 
 void sched_set_host_ops(const sched_host_ops_t *ops)
@@ -1444,6 +1552,15 @@ int sched_domain_init(int ncpu)
     sched_shutdown_flag = false;
     sched_frozen = false;
     for (int i = 0; i < want; i++) {
+        int err = pthread_cond_init(&sched_cpus[i].work_cond, NULL);
+        if (err != 0) {
+            for (int j = 0; j < i; j++)
+                pthread_cond_destroy(&sched_cpus[j].work_cond);
+            free(sched_cpus);
+            sched_cpus = NULL;
+            pthread_mutex_unlock(&sched_lock);
+            return -SCHED_ERR_EBUSY;
+        }
         sched_tree_init(&sched_cpus[i].fair);
         sched_tree_init(&sched_cpus[i].dl);
         sched_cpus[i].slope_q10 = SCHED_FAIR_SLOPE_ONE;
@@ -1477,6 +1594,8 @@ int sched_domain_ncpu(void)
 static void sched_init_defaults_locked(thread_entry_t *t)
 {
     sched_task_state_t *s = TS(t);
+    s->expected_runtime_ns = SCHED_MIN_FAIR_CAPACITY_NS;
+    s->banked_runtime_ns = 0;
 
     s->state = SCHED_STATE_NEW;
     s->queued_class = SCHED_CLASS_NONE;
@@ -1572,6 +1691,7 @@ void sched_attach_thread(thread_entry_t *t)
         cpu_index = 0;
 
     sched_cpu_state_t *cpu = &sched_cpus[cpu_index];
+    cpu->total_expected_runtime_ns += s->expected_runtime_ns;
     s->state = SCHED_STATE_RUNNING;
     s->current_cpu = cpu_index;
     s->placement_cpu = cpu_index;
@@ -1638,6 +1758,7 @@ void sched_detach_thread(thread_entry_t *t)
     if (s->current_cpu >= 0 && s->current_cpu < sched_ncpu) {
         sched_cpu_state_t *cpu = &sched_cpus[s->current_cpu];
         if (cpu->current == t) {
+            cpu->total_expected_runtime_ns -= s->expected_runtime_ns;
             if (s->run_class == SCHED_CLASS_FAIR) {
                 if (cpu->weight_total >= s->eff_weight)
                     cpu->weight_total -= s->eff_weight;
@@ -1730,6 +1851,7 @@ void sched_unblock(thread_entry_t *t)
     } else if (s->state == SCHED_STATE_BLOCKED) {
         s->state = SCHED_STATE_READY;
         s->wake_pending = false;
+        place_fair_wakeup_locked(t);
         enqueue_ready_locked(t, now, &a);
     } else if (s->state == SCHED_STATE_NEW) {
         s->state = SCHED_STATE_READY;
@@ -1788,6 +1910,7 @@ void sched_wake_stop(thread_entry_t *t)
     } else if (s->state == SCHED_STATE_BLOCKED) {
         s->stop_blocked = false;
         s->state = SCHED_STATE_READY;
+        place_fair_wakeup_locked(t);
         enqueue_ready_locked(t, now, &a);
     }
     a.timer = true;
@@ -1890,6 +2013,7 @@ void sched_resume_task(thread_entry_t *t, unsigned reasons)
         s->state = SCHED_STATE_READY;
         s->stop_blocked = false;
         s->wake_pending = false;
+        place_fair_wakeup_locked(t);
         enqueue_ready_locked(t, now, &a);
     }
     a.timer = true;
@@ -2017,6 +2141,21 @@ void sched_put_current(thread_entry_t *t, sched_put_disposition_t how)
     bool rr_quantum_expired = old_class == SCHED_CLASS_RT &&
                               s->eff_policy == SCHED_POLICY_RR &&
                               s->rr_remaining_ns == 0;
+    bool fair_expired =
+        old_class == SCHED_CLASS_FAIR && s->fair_used_ns >= s->fair_slice_ns;
+    bool inactive =
+        how == SCHED_PUT_BLOCKED || how == SCHED_PUT_DEAD ||
+        atomic_load_explicit(&s->stop_reasons, memory_order_relaxed);
+    cpu->total_expected_runtime_ns -= s->expected_runtime_ns;
+    if (fair_expired || rr_quantum_expired || inactive) {
+        /* Zircon peak_decay_delta: beta=1 for peaks, alpha=1/4 for decay. */
+        uint64_t sample = s->banked_runtime_ns;
+        if (sample >= s->expected_runtime_ns)
+            s->expected_runtime_ns = sample;
+        else
+            s->expected_runtime_ns -= (s->expected_runtime_ns - sample) / 4;
+        s->banked_runtime_ns = 0;
+    }
 
     cpu->current = NULL;
     cpu->current_class = SCHED_CLASS_NONE;
@@ -2113,6 +2252,7 @@ void sched_put_current(thread_entry_t *t, sched_put_disposition_t how)
     }
 
     /* READY, or BLOCKED with a wake that completed first. */
+    bool waking = s->wake_pending;
     s->wake_pending = false;
     s->state = SCHED_STATE_READY;
     s->block_requested = false;
@@ -2148,6 +2288,8 @@ void sched_put_current(thread_entry_t *t, sched_put_disposition_t how)
     if (target < 0)
         target = cpu_index;
     s->placement_cpu = target;
+    if (waking)
+        place_fair_wakeup_locked(t);
     enqueue_ready_locked(t, now, &a);
     if (how == SCHED_PUT_PREEMPTED && !rr_quantum_expired)
         rt_requeue_head_locked(t);
@@ -2182,6 +2324,8 @@ thread_entry_t *sched_worker_pick(int cpu_index)
         return NULL;
     }
     thread_entry_t *next = pick_locked(cpu, cpu_index, now, &a);
+    if (!next && steal_fair_work_locked(cpu_index, now, &a))
+        next = pick_locked(cpu, cpu_index, now, &a);
     pthread_mutex_unlock(&sched_lock);
     sched_dispatch(&a);
     return next;
@@ -2210,7 +2354,10 @@ void sched_worker_wait(int cpu_index)
         }
         if (ready)
             break;
-        pthread_cond_wait(&sched_cond, &sched_lock);
+        pthread_cond_t *cond = cpu_index >= 0 && cpu_index < sched_ncpu
+                                   ? &sched_cpus[cpu_index].work_cond
+                                   : &sched_cond;
+        pthread_cond_wait(cond, &sched_lock);
     }
     pthread_mutex_unlock(&sched_lock);
 }
@@ -2708,6 +2855,8 @@ void sched_request_shutdown(void)
     pthread_mutex_lock(&sched_lock);
     sched_shutdown_flag = true;
     pthread_cond_broadcast(&sched_cond);
+    for (int i = 0; i < sched_ncpu; i++)
+        pthread_cond_broadcast(&sched_cpus[i].work_cond);
     pthread_mutex_unlock(&sched_lock);
 
     pthread_mutex_lock(&sched_lock);
@@ -2727,6 +2876,8 @@ void sched_clear_shutdown(void)
     pthread_mutex_lock(&sched_lock);
     sched_shutdown_flag = false;
     pthread_cond_broadcast(&sched_cond);
+    for (int i = 0; i < sched_ncpu; i++)
+        pthread_cond_broadcast(&sched_cpus[i].work_cond);
     pthread_mutex_unlock(&sched_lock);
 }
 
@@ -2753,6 +2904,8 @@ void sched_domain_freeze(bool frozen)
     pthread_mutex_lock(&sched_lock);
     sched_frozen = frozen;
     pthread_cond_broadcast(&sched_cond);
+    for (int i = 0; i < sched_ncpu; i++)
+        pthread_cond_broadcast(&sched_cpus[i].work_cond);
     if (!frozen) {
         for (int i = 0; i < sched_ncpu; i++)
             SCHED_BIT_SET(a.wake, i);
@@ -3278,6 +3431,8 @@ int sched_task_inherit_attr(const thread_entry_t *parent, thread_entry_t *child)
     pthread_mutex_lock(&sched_lock);
     const sched_task_state_t *ps = CTS(parent);
     sched_task_state_t *cs = TS(child);
+    cs->expected_runtime_ns = SCHED_MIN_FAIR_CAPACITY_NS;
+    cs->banked_runtime_ns = 0;
 
     bool reset = (ps->flags & SCHED_FLAG_RESET_ON_FORK) != 0;
     if (ps->policy == SCHED_POLICY_DEADLINE && !reset) {
@@ -3736,6 +3891,7 @@ static void park_publish_ready_locked(thread_entry_t *t,
         s->wake_pending = true;
     } else if (s->state == SCHED_STATE_BLOCKED) {
         s->state = SCHED_STATE_READY;
+        place_fair_wakeup_locked(t);
         enqueue_ready_locked(t, now, a);
     }
     a->timer = true;

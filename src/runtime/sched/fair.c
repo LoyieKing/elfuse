@@ -548,8 +548,11 @@ bool sched_tree_has_eligible(const sched_tree_t *tree, uint64_t eligible_time)
     return first && first->key_time <= eligible_time;
 }
 
-sched_tree_node_t *sched_tree_pick_eligible(const sched_tree_t *tree,
-                                            uint64_t eligible_time)
+sched_tree_node_t *sched_tree_pick_eligible_if(
+    const sched_tree_t *tree,
+    uint64_t eligible_time,
+    bool (*predicate)(const sched_tree_node_t *, void *),
+    void *arg)
 {
     if (!tree || !tree->root)
         return NULL;
@@ -582,15 +585,16 @@ sched_tree_node_t *sched_tree_pick_eligible(const sched_tree_t *tree,
     }
 
     if (!subtree)
-        return path;
+        return path && (!predicate || predicate(path, arg)) ? path : NULL;
 
-    if (path && subtree->min_finish >= path->finish)
+    if (path && subtree->min_finish >= path->finish &&
+        (!predicate || predicate(path, arg)))
         return path;
 
     uint64_t target = subtree->min_finish;
     node = subtree;
     while (node) {
-        if (node->finish == target)
+        if (node->finish == target && (!predicate || predicate(node, arg)))
             return node;
         if (node->left && node->left->min_finish == target)
             node = node->left;
@@ -600,6 +604,12 @@ sched_tree_node_t *sched_tree_pick_eligible(const sched_tree_t *tree,
             break;
     }
     return NULL;
+}
+
+sched_tree_node_t *sched_tree_pick_eligible(const sched_tree_t *tree,
+                                            uint64_t eligible_time)
+{
+    return sched_tree_pick_eligible_if(tree, eligible_time, NULL, NULL);
 }
 
 /* Validation */

@@ -813,6 +813,35 @@ settled budget when its live sample is zero. Quiet pinned-spinner runs passed
 FIFO yield ordering, DEADLINE throttle/yield and exited-thread CPU accounting
 passed with guest scheduling privilege enabled by `--fakeroot`.
 
+`test-sched-wake-balance` parks two FAIR threads on one CPU, expands their
+affinity to two CPUs, and wakes them together. Both CPUs must execute work;
+a pinned control must remain on its single allowed CPU. Three allowed CPUs
+are required so the controller cannot occupy a worker CPU. The test fails
+on the shared-placement implementation and passes on aarch64 Linux.
+
+The standalone ART throughput DEX (SHA256
+`017df7544809a2227910c2bdcb69fff8cd0cb5564bea117d93f5ae41748eaf5c`)
+uses independent xorshift64 work with checksum validation. On an M4 Pro,
+three JIT processes, each with three 1-second warmups and five 1-second
+samples per thread count, measured median throughput of 0.738, 1.430,
+2.616 and 5.167 billion rounds/s at 1, 2, 4 and 8 threads with the pinned
+Zircon placement and stealing paths. The earlier shared-placement process
+medians were 0.741, 0.367, 0.717 and 0.701 billion rounds/s. These are workload
+measurements, not an Android application score or a host-independent test
+threshold. Eight-thread sample variation was 0.63%; 1- and 4-thread samples
+retained occasional stalls. CPU placement does not resolve every latency outlier.
+
+`test-sched-placement-host` drives the scheduler without HVF timing and checks
+estimated-load selection with every CPU busy, the 25 us early-out boundary,
+deadline-demand ties, affinity-predicate stealing, exact demand transfer,
+source/target virtual-time conversion, peak/quarter decay, retirement and
+exclusion of Linux RT/DL queues from stealing. Per-CPU worker condition
+variables map Zircon target-CPU notifications; freeze and shutdown still wake
+all owners. The existing pipe-bulk performance ceilings remain unchanged.
+`test-exit-group-teardown wait` covers a bootstrap owner idle while another
+CPU exits the group; scheduler shutdown must release its condition wait.
+Wait, stopped-tracee and fork-barrier cases retain exit status 42.
+
 ## Validation Strategy By Change Type
 
 Suggested minimum validation:

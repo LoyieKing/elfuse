@@ -149,6 +149,15 @@ bool sched_tree_has_eligible(const sched_tree_t *tree, uint64_t eligible_time);
 sched_tree_node_t *sched_tree_pick_eligible(const sched_tree_t *tree,
                                             uint64_t eligible_time);
 
+/* Zircon's predicate-aware selection for work stealing; the predicate runs
+ * under the owning queue lock and may reject affinity-ineligible candidates.
+ */
+sched_tree_node_t *sched_tree_pick_eligible_if(
+    const sched_tree_t *tree,
+    uint64_t eligible_time,
+    bool (*predicate)(const sched_tree_node_t *, void *),
+    void *arg);
+
 /* Recompute the augmented invariants and red-black properties.
  *
  * Returns true when the tree is well formed; used by host unit tests and debug

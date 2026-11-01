@@ -251,7 +251,7 @@ endef
 CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
         test-tlbi-encoder-host \
         test-vcpu-run-hooks-host test-identity-override-host \
-        test-sched-fair-host \
+        test-sched-fair-host test-sched-placement-host \
         test-stdio-nonblock-host \
         test-rlimit-unchanged-host test-casefold-host \
         test-casefold-walk-host test-absock-names-host \
@@ -269,6 +269,7 @@ $(call run-host-unit,test-tlbi-encoder-host,TLBI RVAE1IS encoder unit test)
 $(call run-host-unit,test-vcpu-run-hooks-host,vCPU run-loop hook API unit test)
 $(call run-host-unit,test-identity-override-host,identity override unit test)
 $(call run-host-unit,test-sched-fair-host,fair scheduler math unit test)
+$(call run-host-unit,test-sched-placement-host,scheduler CPU placement and stealing)
 $(call run-host-unit,test-casefold-host,filename codec unit test)
 $(call run-host-unit,test-casefold-walk-host,case-exact path resolution unit test)
 $(call run-host-unit,test-absock-names-host,absock derived-name unit test)
@@ -2157,7 +2158,7 @@ classic-tests: $(ELFUSE_BIN)
 	@bash tests/classic/run.sh
 
 .PHONY: scheduler-tests-build scheduler-tests ltp-tests-build ltp-tests
-scheduler-tests-build: $(addprefix $(BUILD_DIR)/,test-sched-task-state test-sched-fork-domain test-sched-attr-abi test-sched-policy test-sched-policy-rt test-sched-policy-dl test-sched-preempt test-futex-pi-inherit test-threaded-exec test-thread-leader-exit test-eintr-restart test-mqueue test-sched-capabilities)
+scheduler-tests-build: $(addprefix $(BUILD_DIR)/,test-sched-task-state test-sched-fork-domain test-sched-attr-abi test-sched-policy test-sched-policy-rt test-sched-policy-dl test-sched-preempt test-sched-wake-balance test-futex-pi-inherit test-threaded-exec test-thread-leader-exit test-eintr-restart test-mqueue test-sched-capabilities)
 
 scheduler-tests: $(ELFUSE_BIN) scheduler-tests-build
 	@bash tests/scheduler/run.sh --elfuse

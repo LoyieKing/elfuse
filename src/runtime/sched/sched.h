@@ -264,6 +264,11 @@ typedef struct sched_task_state {
     uint64_t runtime_sys_ns;  /* host syscall service */
     uint64_t run_start_ns;    /* host mono ns at pick (live cputime) */
 
+    /* Zircon peak-decay estimate: full peak, quarter decay; CPU-time samples.
+     */
+    uint64_t expected_runtime_ns;
+    uint64_t banked_runtime_ns;
+
     /* CPU affinity: bit i permits logical CPU i. Bits outside the domain are
      * always clear. All-zero is never stored.
      */

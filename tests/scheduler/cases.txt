@@ -32,6 +32,7 @@ test-sched-policy-dl affinity-migrate
 
 # Forced fair preemption, PI donation, and threaded/leader-exit lifecycle.
 test-sched-preempt -
+test-sched-wake-balance -
 test-futex-pi-inherit -
 test-threaded-exec -
 test-threaded-exec worker

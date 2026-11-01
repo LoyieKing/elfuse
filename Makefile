@@ -246,6 +246,12 @@ $(BUILD_DIR)/test-sched-fair-host: $(BUILD_DIR)/test-sched-fair-host.o \
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
+# Scheduler placement and steal invariants without HVF timing.
+$(BUILD_DIR)/test-sched-placement-host: tests/test-sched-placement-host.c \
+		src/runtime/sched/sched.c $(BUILD_DIR)/runtime/sched/fair.o | $(BUILD_DIR)
+	@echo "  CC      $<"
+	$(Q)$(CC) $(CFLAGS) -Isrc -Itests -o $@ $< $(BUILD_DIR)/runtime/sched/fair.o
+
 
 ## Build the buffered GDB session host regression
 $(BUILD_DIR)/test-gdbstub-host: $(BUILD_DIR)/test-gdbstub-host.o \
@@ -631,6 +637,11 @@ $(BUILD_DIR)/test-tgkill-directed: tests/test-tgkill-directed.c | $(BUILD_DIR)
 # parked waiter's deadline; the starvation case and its sender need pthreads.
 $(BUILD_DIR)/test-sigtimedwait: tests/test-sigtimedwait.c tests/test-harness.h \
 		| $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# Blocked waiters share a CPU before their affinity expands at wakeup.
+$(BUILD_DIR)/test-sched-wake-balance: tests/test-sched-wake-balance.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 

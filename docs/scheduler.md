@@ -26,6 +26,36 @@ RT and FAIR classes. Local PI changes effective selection attributes while
 preserving base attributes. Fair queues use a start-time ordered augmented
 tree and a CPU-wide period.
 
+FAIR wakeup follows the pinned Zircon `find_target_cpu` and
+`CandidatePlacement` same-cluster path: start at the last logical CPU,
+compare estimated queue time then deadline utilization, and stop searching
+when the selected queue is at most 25 us and capacity is admissible.
+`expected_runtime_ns` starts at 1 ms. Peaks follow the full sample; lower
+samples decay by one quarter (`peak_decay_delta`, beta=1, alpha=1/4).
+Samples use settled guest plus host-service CPU time, excluding host waits.
+Insertion and removal transfer estimated demand once per active task.
+
+An idle owner calls the pinned `steal_work` FAIR path before sleeping:
+search remote queues, snap source eligibility, and select earliest eligible
+finish through the affinity predicate. Start/finish offsets and consumed
+budget convert between source and target virtual timelines. Normal wakeups
+use the pinned legacy insertion activation reset. Host notification wakes
+only the target CPU's condition variable; freeze and shutdown wake the domain.
+
+The HVF backend supplies one equal-capacity logical cluster. Logical CPU
+numbers do not identify physical cache clusters, and Darwin controls worker
+placement. Consequently physical topology search, energy-model comparisons,
+power-level demand caching and CPU hotplug are not transplanted. The existing
+global scheduler mutex serializes queue moves instead of Zircon chain locks
+and per-CPU spinlocks. Linux FIFO/RR queues and DEADLINE admission/GRUB remain
+local and are not stolen; Zircon's deadline and critical-deadline policies
+are not substitutes for those Linux contracts. All current wakes use normal
+placement, not Zircon synchronous handoff placement.
+
+Linux `exit_group` requests scheduler shutdown after publishing the process
+exit status. This reaches idle owners outside HVF as well as mounted tasks;
+the outer execution layer remains the sole owner of joins and VM destruction.
+
 A task owns guest registers, signal state, syscall continuation and restart
 state. An HVF worker owns its vCPU handle, host pthread and architectural
 scratch. Only the outer execution loop changes the current task. Yield and

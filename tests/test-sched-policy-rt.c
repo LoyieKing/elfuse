@@ -90,6 +90,8 @@ static void waitw(_Atomic int *p, int v, int ms)
     while (atomic_load_explicit(p, memory_order_acquire) != v && mono() < end) {
         struct timespec ts = {.tv_sec = 0, .tv_nsec = 5 * MS};
         int seen = atomic_load_explicit(p, memory_order_relaxed);
+        if (seen == v)
+            continue;
         (void) raw_syscall6(__NR_futex, (long) p,
                             FUTEX_WAIT | FUTEX_PRIVATE_FLAG, seen, (long) &ts,
                             0, 0);
@@ -267,7 +269,7 @@ static int sc_preempt(void)
 
 /* fifo-yield-order */
 static _Atomic int f_ready, f_ago, f_bgo, f_cgo, f_yielded;
-static _Atomic int f_bran, f_cran, f_early, f_first, f_before, f_after;
+static _Atomic int f_bran, f_cran, f_early, f_first, f_before, f_after, f_done;
 static void *f_a(void *arg)
 {
     (void) arg;
@@ -286,6 +288,7 @@ static void *f_a(void *arg)
     atomic_store(&f_yielded, 1);
     (void) raw_syscall0(__NR_sched_yield);
     atomic_store(&f_after, f_bran && f_cran);
+    atomic_store_explicit(&f_done, 1, memory_order_release);
     return NULL;
 }
 static void *f_peer(void *arg)
@@ -294,7 +297,8 @@ static void *f_peer(void *arg)
     _Atomic int *gate = id == 1 ? &f_bgo : &f_cgo;
     if (rt_ready(SCHED_FIFO, 50, &f_ready))
         return NULL;
-    waitw(gate, 1, 3000);
+    while (!atomic_load_explicit(gate, memory_order_acquire))
+        (void) raw_futex_wait((int *) gate, 0);
     if (id == 1)
         atomic_store(&f_bran, 1);
     else
@@ -320,6 +324,7 @@ static int sc_yield(void)
     setw(&f_ago, 1);
     (void) waitge(&f_bran, 1, 1000);
     (void) waitge(&f_cran, 1, 1000);
+    (void) waitge(&f_done, 1, 1000);
     TEST("FIFO wake tail and yield order");
     if (!f_before && f_after && !f_early && f_first == 1)
         PASS();

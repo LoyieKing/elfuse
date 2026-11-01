@@ -25,6 +25,7 @@ bash tests/scheduler/run.sh --filter deadline-throttle
 bash tests/scheduler/run.sh --filter deadline-yield
 bash tests/scheduler/run.sh --filter affinity-migrate
 bash tests/scheduler/run.sh --filter test-sched-preempt
+bash tests/scheduler/run.sh --filter test-sched-wake-balance
 bash tests/scheduler/run.sh --filter test-futex-pi-inherit
 bash tests/scheduler/run.sh --filter test-threaded-exec
 bash tests/scheduler/run.sh --filter test-thread-leader-exit
@@ -46,6 +47,14 @@ case classification below for cutover decisions. Filter required cases
 individually using the commands above. The script commands use the existing
 build/elfuse. Do not overlap timing-sensitive test runs.
 
+`make check` also runs `test-sched-placement-host` against the scheduler core
+without HVF timing. It covers busy-CPU load selection, the 25 us early-out,
+deadline-demand tie breaking, affinity-filtered stealing, demand transfer,
+virtual timeline migration, peak/quarter-decay estimation and Linux RT/DL
+queue exclusion. `test-sched-policy-rt` waits for the FIFO runner's post-yield
+observation before the controller asserts ordering; peer waits have no timer
+that could change the FIFO queue order.
+
 ## Linux reference
 
 Build on the reference Linux host with its own compiler:
@@ -59,6 +68,7 @@ cc -D_GNU_SOURCE -O2 -pthread -o build/native/test-sched-policy tests/test-sched
 cc -D_GNU_SOURCE -O2 -pthread -o build/native/test-sched-policy-rt tests/test-sched-policy-rt.c
 cc -D_GNU_SOURCE -O2 -pthread -o build/native/test-sched-policy-dl tests/test-sched-policy-dl.c
 cc -D_GNU_SOURCE -O2 -pthread -o build/native/test-sched-preempt tests/test-sched-preempt.c
+cc -D_GNU_SOURCE -O2 -pthread -o build/native/test-sched-wake-balance tests/test-sched-wake-balance.c
 cc -D_GNU_SOURCE -O2 -pthread -o build/native/test-futex-pi-inherit tests/test-futex-pi-inherit.c
 cc -D_GNU_SOURCE -O2 -pthread -o build/native/test-threaded-exec tests/test-threaded-exec.c
 cc -D_GNU_SOURCE -O2 -pthread -o build/native/test-thread-leader-exit tests/test-thread-leader-exit.c
@@ -104,6 +114,7 @@ unsupported namespace surface and are not Linux equivalence assertions.
 | policy-dl / deadline-yield | deadline yield discards the remaining runtime until replenishment | required |
 | policy-dl / affinity-migrate | remote setaffinity moves a running task and preserves its CPU-time ledger | required with two CPUs |
 | preempt | fair spinners outnumber slots and every worker advances | required |
+| wake-balance | simultaneous FAIR wakeups use idle allowed CPUs; pinned tasks retain affinity | required with three CPUs |
 | futex-pi-inherit | PI donation lets a boosted owner release the lock during RT contention | required |
 | threaded-exec (main/worker) | exec tears down live siblings; the new image is single-threaded | required for supported pthread exec |
 | thread-leader-exit | leader exit then fork and non-leader exec preserve pid/tid and child waitability | required |
