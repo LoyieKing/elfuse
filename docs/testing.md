@@ -788,6 +788,15 @@ an OSR `Jumping to` transition, collection of 128 large objects and JIT
 shutdown. Android framework, Binder services, zygote and applications are
 outside this standalone fixture.
 
+`test-sched-affinity` exercises eight compute threads pinned to one logical
+CPU. The slice timer rejects wait snapshots invalidated by notifications
+received during unlocked deadline sampling. FAIR dispatch renews an activation
+whose finish or budget expired while queued; the owner safe point also checks
+settled budget when its live sample is zero. Quiet pinned-spinner runs passed
+10 consecutive times after these changes. RR rotation and interrupted quantum,
+FIFO yield ordering, DEADLINE throttle/yield and exited-thread CPU accounting
+passed with guest scheduling privilege enabled by `--fakeroot`.
+
 ## Validation Strategy By Change Type
 
 Suggested minimum validation:

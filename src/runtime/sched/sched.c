@@ -1135,8 +1135,6 @@ static bool task_live_budget_expired_locked(const thread_entry_t *t,
     if (cpu->current != t)
         return false;
 
-    if (live_ns == 0)
-        return false;
 
     /* Both live phases feed the same runtime budgets that settlement charges,
      * so the caller sums them into one pending delta.
@@ -1371,8 +1369,14 @@ static thread_entry_t *pick_locked(sched_cpu_state_t *cpu,
     s->placement_cpu = cpu_index;
     a->timer = true;
 
-    if (cls == SCHED_CLASS_FAIR)
+    if (cls == SCHED_CLASS_FAIR) {
         fair_note_change_locked(cpu);
+
+        /* The CPU timeline may pass this activation while it waits in the
+         * queue. Do not mount a task with an already exhausted budget.
+         */
+        fair_activation_prepare_locked(next, cpu, cpu_index);
+    }
 
     return next;
 }
@@ -2333,8 +2337,9 @@ bool sched_take_resched(thread_entry_t *t)
                       sample_cpu == cpu_index &&
                       sched_cpus[sample_cpu].current == t &&
                       sched_cpus[sample_cpu].account_seq == sample_seq;
-    if (!requested && live_valid)
-        requested = task_live_budget_expired_locked(t, live_ns);
+    if (!requested)
+        requested =
+            task_live_budget_expired_locked(t, live_valid ? live_ns : 0);
     pthread_mutex_unlock(&sched_lock);
     return requested;
 }

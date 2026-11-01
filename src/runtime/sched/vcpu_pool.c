@@ -390,6 +390,11 @@ static bool slice_shutdown;
 static pthread_mutex_t slice_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t slice_cond = PTHREAD_COND_INITIALIZER;
 
+/* Incremented by notifiers under slice_lock while deadline sampling is
+ * unlocked.
+ */
+static uint64_t slice_notify_seq;
+
 static uint64_t slice_mono_ns(void)
 {
     struct timespec ts;
@@ -569,6 +574,7 @@ static void slot_arm_slice(struct vcpu_slot *slot)
     pthread_mutex_lock(&slice_lock);
     slot->slice_deadline_ns = now + slice;
     slot->slice_armed = true;
+    slice_notify_seq++;
     pthread_cond_signal(&slice_cond);
     pthread_mutex_unlock(&slice_lock);
 }
@@ -580,6 +586,7 @@ static void slot_disarm_slice(struct vcpu_slot *slot)
     pthread_mutex_lock(&slice_lock);
     slot->slice_deadline_ns = 0;
     slot->slice_armed = false;
+    slice_notify_seq++;
     pthread_cond_signal(&slice_cond);
     pthread_mutex_unlock(&slice_lock);
 }
@@ -587,6 +594,7 @@ static void slot_disarm_slice(struct vcpu_slot *slot)
 void vcpu_pool_wake_timer(void)
 {
     pthread_mutex_lock(&slice_lock);
+    slice_notify_seq++;
     pthread_cond_signal(&slice_cond);
     pthread_mutex_unlock(&slice_lock);
 }
@@ -661,6 +669,7 @@ static void *slice_timer_main(void *arg)
             return NULL;
         }
 
+        uint64_t notify_seq = slice_notify_seq;
         uint64_t now = slice_mono_ns();
         uint64_t nearest = UINT64_MAX;
         for (int i = 0; i < slot_count; i++) {
@@ -689,6 +698,13 @@ static void *slice_timer_main(void *arg)
         pthread_mutex_lock(&slice_lock);
         if (slice_shutdown)
             continue;
+
+        /* A notifier may run while scheduler/park deadlines are sampled. Its
+         * signal precedes this wait, so re-sample instead of losing it.
+         */
+        if (notify_seq != slice_notify_seq && nearest > slice_mono_ns())
+            continue;
+        now = slice_mono_ns();
 
         if (nearest == UINT64_MAX) {
             pthread_cond_wait(&slice_cond, &slice_lock);
