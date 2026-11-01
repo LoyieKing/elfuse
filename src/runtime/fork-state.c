@@ -1234,7 +1234,8 @@ int fork_ipc_recv_process_state(int ipc_fd,
         }
         for (int i = 0; i < g->nregions; i++) {
             parent_had_fd[i] = (g->regions[i].backing_fd >= 0);
-            parent_active[i] = g->regions[i].overlay_active;
+            parent_active[i] =
+                g->regions[i].overlay_active && g->regions[i].shared;
             parent_ovl_start[i] = g->regions[i].overlay_start;
             parent_ovl_end[i] = g->regions[i].overlay_end;
         }

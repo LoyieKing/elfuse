@@ -40,6 +40,7 @@ int guest_bootstrap_prepare(guest_t *g,
                             const unsigned char *shim_bin,
                             size_t shim_bin_len,
                             bool verbose,
+                            guest_memory_mode_t memory_mode,
                             bool *guest_initialized,
                             guest_bootstrap_t *boot);
 

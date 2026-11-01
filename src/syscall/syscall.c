@@ -717,12 +717,11 @@ SC_STUB(sc_io_destroy,          -LINUX_EINVAL)
 SC_STUB(sc_sethostname,         -LINUX_EPERM)
 /* clang-format on */
 
-/* mincore: report page residency over [addr, addr+length). elfuse tracks guest
- * mappings itself, so no host syscall is needed. Linux contract:
- * - addr must be page-aligned (EINVAL otherwise);
+/* mincore: report page residency over [addr, addr+length). Linux contract:
+ * - addr must be page-aligned (EINVAL) and the range must not wrap (ENOMEM);
  * - vec must be writable, one byte per page (EFAULT otherwise);
  * - any unmapped page in the range yields ENOMEM;
- * - the LSB of each vec byte is set when the page maps to a tracked region.
+ * - the LSB of each vec byte reports whether the backing store holds the page.
  * jemalloc, Go, and Rust's page recyclers probe this on startup.
  */
 static int64_t sc_mincore(guest_t *g,
@@ -753,20 +752,26 @@ static int64_t sc_mincore(guest_t *g,
     if (vec > UINT64_MAX - npages)
         return -LINUX_EFAULT;
     bool has_hole = false;
+    int query_err = 0;
 
     /* Pages are visited in ascending order and regions[] is start-sorted,
      * non-overlapping, with monotonic ends, so a single cursor sweeps both in
      * lockstep: skip the untouched prefix once via first_end_above, then only
-     * advance the cursor when a page passes the current region's end. O(npages
-     * + regions) instead of a binary search per page.
+     * advance the cursor when a page passes the current region's end. Pages
+     * inside one region form a contiguous gpa run, so one residency query
+     * covers it; guest_memory_residency maps the host's larger pages onto the
+     * guest pages they contain.
      *
      * mmap_lock (order 1) is held across the whole sweep so a sibling vCPU's
-     * munmap cannot memmove regions[] out from under the cursor. guest_write
-     * takes no locks, so nesting the vec flush inside the lock introduces no
-     * inversion. Flush in bounded chunks so a huge length never triggers a
-     * large host allocation. EFAULT (bad vec) takes precedence over ENOMEM
-     * (hole), matching the kernel's upfront access_ok() check, so the sweep
-     * never early-returns on a hole.
+     * munmap cannot memmove regions[] out from under the cursor, and because
+     * guest_memory_residency requires it. guest_write takes no locks, so
+     * nesting the vec flush inside the lock introduces no inversion. Flush in
+     * bounded chunks so a huge length never triggers a large host allocation.
+     * EFAULT (bad vec) takes precedence over ENOMEM (hole), matching the
+     * kernel's upfront access_ok() check, so the sweep never early-returns on a
+     * hole. A query the backing store cannot answer is remembered and returned
+     * after the vector is written, so EFAULT still wins and a failed mincore
+     * never reports those pages as a false non-resident success.
      */
     uint8_t chunk[512];
     mmap_lock_acquire();
@@ -775,14 +780,30 @@ static int64_t sc_mincore(guest_t *g,
         uint64_t batch = npages - done;
         if (batch > sizeof(chunk))
             batch = sizeof(chunk);
-        for (uint64_t i = 0; i < batch; i++) {
+        memset(chunk, 0, batch);
+        for (uint64_t i = 0; i < batch;) {
             uint64_t page = addr + (done + i) * GUEST_PAGE_SIZE;
             while (ri < g->nregions && g->regions[ri].end <= page)
                 ri++;
-            bool mapped = ri < g->nregions && page >= g->regions[ri].start;
-            chunk[i] = mapped ? 1 : 0;
-            if (!mapped)
+            if (ri >= g->nregions || page < g->regions[ri].start) {
                 has_hole = true;
+                i++;
+                continue;
+            }
+            const guest_region_t *r = &g->regions[ri];
+            uint64_t run = batch - i;
+            uint64_t in_region =
+                (r->end - page + GUEST_PAGE_SIZE - 1) / GUEST_PAGE_SIZE;
+            if (run > in_region)
+                run = in_region;
+            int rc = guest_memory_residency(g, r->gpa_base + (page - r->start),
+                                            run * GUEST_PAGE_SIZE, chunk + i);
+            if (rc < 0) {
+                if (!query_err)
+                    query_err = rc;
+                memset(chunk + i, 0, run);
+            }
+            i += run;
         }
         if (guest_write(g, vec + done, chunk, batch) < 0) {
             mmap_lock_release();
@@ -792,6 +813,8 @@ static int64_t sc_mincore(guest_t *g,
     }
     mmap_lock_release();
 
+    if (query_err)
+        return query_err;
     return has_hole ? -LINUX_ENOMEM : 0;
 }
 

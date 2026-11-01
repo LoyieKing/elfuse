@@ -21,7 +21,7 @@
 /* Fork IPC protocol identity. Bump this whenever the header layout or ordered
  * fork payload changes incompatibly.
  */
-#define FORK_IPC_PROTOCOL_MAGIC 0x454C4655U /* "ELFU" */
+#define FORK_IPC_PROTOCOL_MAGIC 0x454C4656U /* "ELFV": memory_mode */
 
 #define IPC_HDR_SOFT_NEWPID 0x1u
 
@@ -80,7 +80,12 @@ typedef struct {
      * MAP_PRIVATE so the child does not share writes with the parent.
      */
     uint32_t shm_is_clone;
-    uint32_t _pad2;
+
+    /* guest_memory_mode_t the child passes to guest_init, so both sides of the
+     * fork retire ranges to zero the same way. Validated against the enum
+     * before the child creates its VM.
+     */
+    uint32_t memory_mode;
 
     /* Guest rlimit table (sys.h), indexed by Linux resource number. The child
      * restores it after installing inherited FDs so descriptors above a lowered

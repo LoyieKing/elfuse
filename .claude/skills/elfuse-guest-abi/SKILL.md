@@ -274,14 +274,16 @@ macOS HVF allows one VM per process, so fork is `posix_spawn` of
 `elfuse --fork-child <fd>` plus IPC state transfer. Two rules that are easy to
 violate:
 
-- The parent must NOT remap `host_base`. HVF caches host VA to PA at
-  `hv_vm_map` time, so a remap silently detaches the guest's view from the
-  hypervisor's.
+- Replacing host backing requires pausing guest execution and refreshing the
+  same HVF stage-2 range. `hv_vm_map` retains the backing association; a host
+  `MAP_FIXED` alone would leave guest and host accesses inconsistent.
 - The child must restore `g->ttbr0` from the IPC header.
 
-The fast path takes an APFS `fclonefileat` snapshot and passes the fd via
-SCM_RIGHTS; the child maps it MAP_PRIVATE. The snapshot decouples parent and
-child even before the child remaps.
+The snapshot helper in `src/syscall/mem.c` synchronizes current anonymous and
+private-file CoW bytes into an independent APFS clone. Paged-out pages retain
+data and must be copied; residency alone cannot authorize a zero-filled hole.
+The child retains an independent clone for nested fork. A clone failure uses
+region copy, never a live parent file.
 
 ## Rosetta hosting
 
@@ -295,11 +297,9 @@ mappings and register state, and the ways it breaks are mapping-shaped.
 - Its kbuf is aliased twice, once under TTBR1 and once under TTBR0, so that
   tagged-pointer extraction resolves to the same physical pages from either
   side. kbuf is always RW; nothing executable is installed there.
-- Fork still attempts the APFS snapshot under Rosetta, but its fallback is
-  different: a native guest can send the live `shm_fd` when the snapshot
-  fails, and Rosetta cannot, so it drops to the region-copy path. The reason
-  is the one from the fork section above, that HVF caches host VA to PA at
-  map time.
+- Rosetta uses the independent APFS snapshot with the same backing
+  synchronization as native guests. Both fall back to region copy when a clone
+  cannot be created.
 - For dynamic x86_64 guests the host deliberately does not load segments or
   the interpreter. The translator reads PT_INTERP itself and mmaps the loader
   out of `--sysroot` through ordinary guest syscalls.

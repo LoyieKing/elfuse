@@ -20,6 +20,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <pthread.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 
 #include "debug/log.h"
 #include "utils.h"
@@ -30,6 +32,7 @@
 #include "proved/brk.h"
 
 #include "runtime/thread.h"
+#include "runtime/sched/vcpu_pool.h"
 #include "syscall/linux-wire.h"
 #include "syscall/fuse.h"
 #include "syscall/internal.h"
@@ -149,6 +152,12 @@ static int64_t sync_shared_aliases_range(guest_t *g,
                                          int backing_fd,
                                          uint64_t file_start,
                                          uint64_t file_end);
+
+static int hvf_apply_private_file(guest_t *g,
+                                  uint64_t ipa,
+                                  uint64_t len,
+                                  int fd,
+                                  uint64_t file_off);
 
 static int region_count_after_removes(const guest_t *g,
                                       const remove_range_t *ranges,
@@ -307,6 +316,7 @@ typedef struct {
 
 typedef struct {
     const guest_region_t *first;
+    bool shared;
     uint64_t inherited_prefix;
     int nsegments;
     mremap_source_segment_t *segments;
@@ -346,6 +356,7 @@ static int find_mremap_source(const guest_t *g,
 
     memset(source, 0, sizeof(*source));
     source->first = first;
+    source->shared = first->shared;
 
     int index = (int) (first - g->regions);
     if (index < 0 || index >= g->nregions)
@@ -691,16 +702,8 @@ static uint64_t find_free_gap_inner(const guest_t *g,
                                     uint64_t max_addr,
                                     uint64_t align)
 {
-    /* Round the search start up to the requested alignment so an unaligned addr
-     * hint cannot return a result that lands inside a host page already covered
-     * by a preceding region's overlay tail (the overlay extends to
-     * ALIGN_UP(r->end, hps)). Apple Silicon enforces 16 KiB host pages;
-     * aligning to the guest 4 KiB page is not enough. Advance past each walked
-     * region to the same boundary for the same reason. MAP_SHARED file-backed
-     * allocations may request 2 MiB alignment as a best-effort placement
-     * preference so consecutive mappings usually avoid sharing an HVF stage-2
-     * segment, which reduces segment-table fragmentation for memfd-style
-     * allocation patterns.
+    /* Host-page alignment prevents allocations from sharing an overlay tail.
+     * Guest 4 KiB alignment alone is insufficient on a 16 KiB host.
      */
     uint64_t gap_start;
     if (!align_up_ok(min_addr, align, &gap_start))
@@ -827,6 +830,131 @@ static void *host_ptr_for_gpa(const guest_t *g, uint64_t gpa)
 
     return NULL;
 }
+
+int guest_memory_residency(const guest_t *g,
+                           uint64_t gpa,
+                           uint64_t len,
+                           unsigned char *vec)
+{
+    assert(mmap_lock_held());
+    size_t hps = host_page_size_cached();
+    while (len) {
+        uint8_t *host = host_ptr_for_gpa(g, gpa);
+        uint64_t available;
+        if (gpa < g->guest_size) {
+            available = g->guest_size - gpa;
+        } else {
+            const guest_mapping_t *m = guest_find_mapping(g, gpa);
+            const guest_overflow_t *o = guest_find_overflow(g, gpa);
+            if (m)
+                available = m->size - (gpa - m->gpa);
+            else if (o)
+                available = o->size - (gpa - o->ipa_start);
+            else
+                return -LINUX_ENOMEM;
+        }
+        if (!host)
+            return -LINUX_ENOMEM;
+        char resident[512];
+        size_t prefix = (uintptr_t) host % hps;
+        uint64_t chunk = sizeof(resident) * hps - prefix;
+        if (chunk > len)
+            chunk = len;
+        if (chunk > available)
+            chunk = available;
+        if (chunk == 0)
+            return -LINUX_ENOMEM;
+        size_t query_len = ALIGN_UP(prefix + chunk, hps);
+        if (mincore(host - prefix, query_len, resident) < 0)
+            return linux_errno();
+        for (uint64_t i = 0; i < chunk; i += GUEST_PAGE_SIZE)
+            *vec++ = (unsigned char) (resident[(prefix + i) / hps] & 1);
+        gpa += chunk;
+        len -= chunk;
+    }
+    return 0;
+}
+
+int guest_memory_snapshot(const guest_t *g, int fd)
+{
+    assert(mmap_lock_held());
+    size_t hps = host_page_size_cached();
+    for (int i = 0; i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        uint64_t len = r->end - r->start;
+        if (r->gpa_base >= g->guest_size || len > g->guest_size - r->gpa_base ||
+            (r->overlay_active && r->shared))
+            continue;
+        uint64_t cursor = r->gpa_base;
+        while (len) {
+            int dispositions[512];
+            uint64_t prefix = cursor % hps;
+            uint64_t chunk =
+                sizeof(dispositions) / sizeof(dispositions[0]) * hps - prefix;
+            if (chunk > len)
+                chunk = len;
+            mach_vm_size_t count = ALIGN_UP(prefix + chunk, hps) / hps;
+            if (mach_vm_page_range_query(
+                    mach_task_self(),
+                    (mach_vm_address_t) ((uint8_t *) g->host_base + cursor -
+                                         prefix),
+                    ALIGN_UP(prefix + chunk, hps),
+                    (mach_vm_address_t) dispositions, &count) != KERN_SUCCESS ||
+                count != ALIGN_UP(prefix + chunk, hps) / hps)
+                return -LINUX_EIO;
+            uint64_t pos = 0;
+            while (pos < chunk) {
+                uint64_t run = hps - (cursor + pos) % hps;
+                if (run > chunk - pos)
+                    run = chunk - pos;
+                int keep = VM_PAGE_QUERY_PAGE_PRESENT |
+                           VM_PAGE_QUERY_PAGE_PAGED_OUT |
+                           VM_PAGE_QUERY_PAGE_EXTERNAL;
+                bool hole = !(dispositions[(prefix + pos) / hps] & keep) &&
+                            (r->flags & LINUX_MAP_ANONYMOUS) && run == hps;
+                while (pos + run + hps <= chunk) {
+                    bool next_hole =
+                        !(dispositions[(prefix + pos + run) / hps] & keep) &&
+                        (r->flags & LINUX_MAP_ANONYMOUS);
+                    if (next_hole != hole || (cursor + pos) % hps)
+                        break;
+                    run += hps;
+                }
+                if (hole) {
+                    struct fpunchhole range = {
+                        .fp_offset = (off_t) (cursor + pos),
+                        .fp_length = (off_t) run,
+                    };
+                    if (fcntl(fd, F_PUNCHHOLE, &range) < 0)
+                        return linux_errno();
+                } else {
+                    uint8_t *src = (uint8_t *) g->host_base + cursor + pos;
+                    uint64_t copied = 0;
+                    while (copied < run) {
+                        ssize_t n = pwrite(fd, src + copied, run - copied,
+                                           (off_t) (cursor + pos + copied));
+                        if (n < 0) {
+                            if (errno == EINTR)
+                                continue;
+                            return linux_errno();
+                        }
+                        if (n == 0)
+                            return -LINUX_EIO;
+                        copied += (uint64_t) n;
+                    }
+                }
+                pos += run;
+            }
+            cursor += chunk;
+            len -= chunk;
+        }
+    }
+    return 0;
+}
+
+static int guest_memory_reset_range_quiesced(guest_t *g,
+                                             uint64_t gpa,
+                                             uint64_t len);
 
 static bool region_range_overlaps(const guest_t *g,
                                   uint64_t start,
@@ -1146,7 +1274,8 @@ static int64_t sys_mmap_high_va(guest_t *g,
         void *host = host_ptr_for_gpa(g, gpa);
         if (!host)
             goto fail;
-        memset(host, 0, BLOCK_2MIB);
+        if (g->memory_mode == GUEST_MEMORY_EAGER)
+            memset(host, 0, BLOCK_2MIB);
 
         /* Detect freshness BEFORE guest_map_va_range so the decision is not
          * confused by a prior high-VA mmap into the same 2 MiB block. A fresh
@@ -1220,7 +1349,13 @@ populate_existing:
     }
 
     if (is_anon) {
-        memset(map_host, 0, length);
+        ret = siblings_quiesced
+                  ? guest_memory_reset_range_quiesced(
+                        g, backing_gpa_start + (addr - va_base), length)
+                  : guest_memory_reset_range(
+                        g, backing_gpa_start + (addr - va_base), length);
+        if (ret < 0)
+            goto fail;
         replaced_bytes_dirty = replacing_existing;
     } else if (prot != LINUX_PROT_NONE) {
         memset(map_host, 0, length);
@@ -1490,8 +1625,14 @@ static int restore_file_overlay_range(guest_t *g,
                                       int fd,
                                       uint64_t file_off)
 {
-    int err = hvf_apply_file_overlay(
-        g, overlay_start, overlay_end - overlay_start, fd, (off_t) file_off);
+    const guest_region_t *r = guest_region_find(g, start);
+    int err =
+        r && !r->shared
+            ? hvf_apply_private_file(g, overlay_start,
+                                     overlay_end - overlay_start, fd, file_off)
+            : hvf_apply_file_overlay(g, overlay_start,
+                                     overlay_end - overlay_start, fd,
+                                     (off_t) file_off);
     if (err < 0)
         return err;
     mark_overlay_metadata_range(g, start, end, overlay_start, overlay_end);
@@ -1500,6 +1641,8 @@ static int restore_file_overlay_range(guest_t *g,
 
 static bool mremap_source_has_overlay(const mremap_source_t *source)
 {
+    if (!source->shared)
+        return false;
     for (int i = 0; i < source->nsegments; i++) {
         if (source->segments[i].overlay_active)
             return true;
@@ -1666,7 +1809,7 @@ static int copy_mremap_source(guest_t *g,
 
         uint64_t len = end - start;
         uint64_t dest = dest_gpa + (start - source_start);
-        if (segment->overlay_active) {
+        if (segment->overlay_active && source->shared) {
             if (segment->backing_fd < 0)
                 return -LINUX_EFAULT;
             int err = read_file_range_to_guest(
@@ -2042,22 +2185,8 @@ static int rollback_fresh_mmap_allocation(guest_t *g,
     return 0;
 }
 
-/* HVF stage-2 segment management.
- *
- * The slab is mapped to HVF in 2 MiB-aligned segments tracked by g->segments[].
- * Initially the slab is one segment (set up by guest_init). MAP_SHARED
- * file-backed mmap may need to overlay a sub-range of the slab with a real host
- * mmap MAP_FIXED|MAP_SHARED of the file fd. HVF caches the host VA->PA mapping
- * at hv_vm_map time and a plain MAP_FIXED overlay does not refresh it (see
- * comment in src/runtime/forkipc.c for the empirical evidence). To force HVF to
- * re-walk the host page tables after the overlay, the affected segment is
- * hv_vm_unmap'd, the file is mmap'd MAP_FIXED|MAP_SHARED into its host VA, and
- * the segment is hv_vm_map'd again.
- *
- * HVF rejects sub-range hv_vm_unmap of a larger map (HV_BAD_ARGUMENT).
- * Therefore, before applying the first overlay inside a large segment, the
- * segment is split into 2 MiB-aligned pieces around the affected range so each
- * piece is independently unmappable.
+/* Host backing replacement requires a matching stage-2 refresh. HVF accepts
+ * host-page-aligned subranges, so unrelated slab pages remain mapped.
  */
 
 /* HVF flags applied to slab segments. The slab is mapped RWX so guest stage-1
@@ -2069,33 +2198,11 @@ static int rollback_fresh_mmap_allocation(guest_t *g,
  */
 #define HVF_SEGMENT_FLAGS (HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC)
 
-/* Find the index of the segment containing ipa, or -1 if none. */
-static int hvf_segment_find(const guest_t *g, uint64_t ipa)
-{
-    int lo = 0, hi = g->n_segments - 1;
-    while (lo <= hi) {
-        int mid = (lo + hi) / 2;
-        const hvf_segment_t *s = &g->segments[mid];
-        if (ipa >= s->ipa && ipa < s->ipa + s->len)
-            return mid;
-        if (ipa < s->ipa)
-            hi = mid - 1;
-        else
-            lo = mid + 1;
-    }
-    return -1;
-}
-
-/* Restore the slab backing for [ipa, ipa+len) in the host VA. Used to undo a
- * previous file overlay. Maps shm_fd MAP_SHARED if the slab is shm-backed (so
- * subsequent fork CoW snapshots see consistent content), otherwise
- * MAP_ANON|MAP_PRIVATE. The IPA is unmapped from the guest's perspective by the
- * caller (page tables invalidated, region removed), so the content of the
- * restored backing is not directly observable to the guest until a subsequent
- * mmap targets the same IPA.
+/* Restore the slab's original file or anonymous backing after a file overlay.
+ * Caller holds mmap_lock, pauses guest execution and detaches this stage-2
+ * range.
  *
- * The caller must ensure no HVF segment currently covers [ipa, ipa+len).
- * Returns 0 on success, -errno on failure.
+ * Returns 0 or a negative Linux errno.
  */
 static int hvf_restore_slab_backing(guest_t *g, uint64_t ipa, uint64_t len)
 {
@@ -2113,190 +2220,112 @@ static int hvf_restore_slab_backing(guest_t *g, uint64_t ipa, uint64_t len)
     return 0;
 }
 
-/* Split the segment that exactly contains [aligned_start, aligned_end) so that
- * the middle range becomes its own segment. The caller MUST have quiesced
- * sibling vCPUs before calling so HVF's brief unmap window does not race with
- * concurrent guest accesses through stage-2.
- *
- * Up to two new segments may be inserted on either side. If the segment already
- * exactly matches the requested bounds, this is a no-op.
- *
- * Both bounds must be 2 MiB-aligned.
- *
- * Returns 0 on success, -errno on failure.
+/* Caller holds mmap_lock and keeps siblings outside guest execution while
+ * host-page backing and stage-2 mappings are replaced.
  */
-static int hvf_segment_split(guest_t *g,
-                             uint64_t aligned_start,
-                             uint64_t aligned_end)
+static int guest_memory_reset_range_quiesced(guest_t *g,
+                                             uint64_t gpa,
+                                             uint64_t len)
 {
-    int idx = hvf_segment_find(g, aligned_start);
-    if (idx < 0)
+    uint8_t *host = host_ptr_for_gpa(g, gpa);
+    uint64_t map_start = 0, map_size = g->guest_size;
+    uint32_t map_flags = HVF_SEGMENT_FLAGS;
+    bool primary = gpa < g->guest_size;
+    if (!primary) {
+        const guest_mapping_t *m = guest_find_mapping(g, gpa);
+        const guest_overflow_t *o = guest_find_overflow(g, gpa);
+        if (m) {
+            map_start = m->gpa;
+            map_size = m->size;
+            map_flags = m->hv_perms;
+        } else if (o) {
+            map_start = o->ipa_start;
+            map_size = o->size;
+        } else {
+            return -LINUX_EFAULT;
+        }
+    }
+    if (!host || !window_fits(gpa - map_start, len, map_size))
         return -LINUX_EFAULT;
-    hvf_segment_t orig = g->segments[idx];
-    if (aligned_end > orig.ipa + orig.len)
-        return -LINUX_EFAULT;
-    if (aligned_start == orig.ipa && aligned_end == orig.ipa + orig.len)
+    if (len == 0)
         return 0;
+    if (g->memory_mode == GUEST_MEMORY_EAGER) {
+        memset(host, 0, len);
+        return 0;
+    }
 
-    hvf_segment_t pieces[3];
-    int n_pieces = 0;
-    if (aligned_start > orig.ipa)
-        pieces[n_pieces++] =
-            (hvf_segment_t) {.ipa = orig.ipa, .len = aligned_start - orig.ipa};
-    pieces[n_pieces++] = (hvf_segment_t) {.ipa = aligned_start,
-                                          .len = aligned_end - aligned_start};
-    if (aligned_end < orig.ipa + orig.len)
-        pieces[n_pieces++] = (hvf_segment_t) {
-            .ipa = aligned_end, .len = orig.ipa + orig.len - aligned_end};
+    size_t hps = host_page_size_cached();
+    uint64_t head = ((uintptr_t) host % hps) ? hps - (uintptr_t) host % hps : 0;
+    if (head > len)
+        head = len;
+    uint64_t whole = ALIGN_DOWN(len - head, hps);
+    if (whole == 0) {
+        memset(host, 0, len);
+        return 0;
+    }
 
-    if (g->n_segments + n_pieces - 1 > GUEST_MAX_HVF_SEGMENTS)
-        return -LINUX_ENOMEM;
-
-    if (hv_vm_unmap(orig.ipa, orig.len) != HV_SUCCESS)
+    uint64_t reset_gpa = gpa + head;
+    if (hv_vm_unmap(reset_gpa, whole) != HV_SUCCESS)
         return -LINUX_EIO;
 
-    for (int i = 0; i < n_pieces; i++) {
-        void *host_va = (uint8_t *) g->host_base + pieces[i].ipa;
-        if (hv_vm_map(host_va, pieces[i].ipa, pieces[i].len,
-                      HVF_SEGMENT_FLAGS) != HV_SUCCESS) {
-            /* Best-effort recovery: tear down whatever pieces we already mapped
-             * (HVF would reject hv_vm_map(orig) as overlapping if we left them
-             * in place) and re-map the original segment. Sibling vCPUs are
-             * quiesced so they cannot observe the gap. If the final remap also
-             * fails the IPA range stays without stage-2 entries and the guest
-             * will fault on access; log the unrecoverable state so post-mortem
-             * points at the right culprit instead of the unrelated downstream
-             * fault.
-             */
-            for (int j = 0; j < i; j++)
-                hv_vm_unmap(pieces[j].ipa, pieces[j].len);
-            hv_return_t r = hv_vm_map((uint8_t *) g->host_base + orig.ipa,
-                                      orig.ipa, orig.len, HVF_SEGMENT_FLAGS);
-            if (r != HV_SUCCESS)
-                log_error(
-                    "hvf_segment_split: recovery hv_vm_map(0x%llx, 0x%llx) "
-                    "failed with 0x%x; IPA range left without stage-2 "
-                    "entries",
-                    (unsigned long long) orig.ipa,
-                    (unsigned long long) orig.len, (int) r);
-            return -LINUX_EIO;
-        }
+    int err = 0;
+    if (mmap(host + head, whole, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) == MAP_FAILED)
+        err = linux_errno();
+    if (hv_vm_map(host + head, reset_gpa, whole, map_flags) != HV_SUCCESS) {
+        log_fatal("memory reset: stage-2 remap failed");
+        exit(128);
     }
-
-    /* Replace orig with pieces in the segment array */
-    int tail = g->n_segments - idx - 1;
-    memmove(&g->segments[idx + n_pieces], &g->segments[idx + 1],
-            (size_t) tail * sizeof(hvf_segment_t));
-    for (int i = 0; i < n_pieces; i++)
-        g->segments[idx + i] = pieces[i];
-    g->n_segments += n_pieces - 1;
-    return 0;
-}
-
-static int hvf_segment_split_range_boundaries(guest_t *g,
-                                              uint64_t aligned_start,
-                                              uint64_t aligned_end)
-{
-    int idx;
-
-    idx = hvf_segment_find(g, aligned_start);
-    if (idx < 0)
-        return -LINUX_EFAULT;
-    if (g->segments[idx].ipa < aligned_start) {
-        int err = hvf_segment_split(
-            g, aligned_start, g->segments[idx].ipa + g->segments[idx].len);
-        if (err < 0)
-            return err;
-    }
-
-    idx = hvf_segment_find(g, aligned_end - 1);
-    if (idx < 0)
-        return -LINUX_EFAULT;
-    if (aligned_end < g->segments[idx].ipa + g->segments[idx].len) {
-        int err = hvf_segment_split(g, g->segments[idx].ipa, aligned_end);
-        if (err < 0)
-            return err;
-    }
-    return 0;
-}
-
-static int hvf_segment_collect_range(guest_t *g,
-                                     uint64_t aligned_start,
-                                     uint64_t aligned_end,
-                                     hvf_segment_t *segments,
-                                     int max_segments)
-{
-    uint64_t cursor = aligned_start;
-    int n = 0;
-
-    while (cursor < aligned_end) {
-        int idx = hvf_segment_find(g, cursor);
-        if (idx < 0 || g->segments[idx].ipa != cursor)
-            return -LINUX_EFAULT;
-        if (n >= max_segments)
-            return -LINUX_ENOMEM;
-        segments[n++] = g->segments[idx];
-        cursor += g->segments[idx].len;
-    }
-    return cursor == aligned_end ? n : -LINUX_EFAULT;
-}
-
-static void hvf_remap_segments_best_effort(guest_t *g,
-                                           const hvf_segment_t *segments,
-                                           int nsegments)
-{
-    for (int i = 0; i < nsegments; i++) {
-        hv_return_t r =
-            hv_vm_map((uint8_t *) g->host_base + segments[i].ipa,
-                      segments[i].ipa, segments[i].len, HVF_SEGMENT_FLAGS);
-        if (r != HV_SUCCESS)
-            log_error(
-                "hvf: recovery hv_vm_map(0x%llx, 0x%llx) failed with 0x%x",
-                (unsigned long long) segments[i].ipa,
-                (unsigned long long) segments[i].len, (int) r);
-    }
-}
-
-/* Unmap the HVF segments covering [ipa, ipa+len) so the host VA underneath can
- * be re-backed.
- *
- * Returns the segment count, or a negative Linux errno. On success the caller
- * owns segments[0 .. count - 1] and must remap them once the new backing is in
- * place. A failed unmap rolls the earlier ones back through
- * hvf_remap_segments_best_effort, which is best effort: a remap that also fails
- * leaves that range without stage-2 entries and is logged rather than reported.
- */
-static int hvf_detach_range_segments(guest_t *g,
-                                     uint64_t ipa,
-                                     uint64_t len,
-                                     hvf_segment_t *segments)
-{
-    uint64_t aligned_start = ALIGN_2MIB_DOWN(ipa);
-    uint64_t aligned_end = ALIGN_2MIB_UP(ipa + len);
-
-    int err = hvf_segment_split_range_boundaries(g, aligned_start, aligned_end);
     if (err < 0)
         return err;
-    int nsegments = hvf_segment_collect_range(g, aligned_start, aligned_end,
-                                              segments, GUEST_MAX_HVF_SEGMENTS);
-    if (nsegments < 0)
-        return nsegments;
-
-    for (int i = 0; i < nsegments; i++) {
-        if (hv_vm_unmap(segments[i].ipa, segments[i].len) != HV_SUCCESS) {
-            hvf_remap_segments_best_effort(g, segments, i);
-            return -LINUX_EIO;
-        }
-    }
-    return nsegments;
+    if (head)
+        memset(host, 0, head);
+    uint64_t tail = len - head - whole;
+    if (tail)
+        memset(host + head + whole, 0, tail);
+    return 0;
 }
 
-/* Apply a real MAP_SHARED file overlay at [ipa, ipa+len) backed by [fd,
- * file_off). The IPA range may be sub-2 MiB; the containing 2 MiB segment is
- * split out first if it is not already isolated. Caller holds mmap_lock and has
- * already quiesced sibling vCPUs (or has none). The fork pre-snapshot path
- * quiesces siblings before calling this so the overlay install does not trigger
- * a nested quiesce.
+int guest_memory_reset_range(guest_t *g, uint64_t gpa, uint64_t len)
+{
+    assert(mmap_lock_held());
+    if (g->memory_mode == GUEST_MEMORY_EAGER)
+        return guest_memory_reset_range_quiesced(g, gpa, len);
+    vcpu_pool_memory_pause();
+    int err = guest_memory_reset_range_quiesced(g, gpa, len);
+    vcpu_pool_memory_resume();
+    return err;
+}
+
+static int hvf_apply_private_file(guest_t *g,
+                                  uint64_t ipa,
+                                  uint64_t len,
+                                  int fd,
+                                  uint64_t file_off)
+{
+    size_t hps = host_page_size_cached();
+    if (ipa % hps || file_off % hps || len % hps)
+        return -LINUX_EINVAL;
+    vcpu_pool_memory_pause();
+    if (hv_vm_unmap(ipa, len) != HV_SUCCESS) {
+        vcpu_pool_memory_resume();
+        return -LINUX_EIO;
+    }
+    void *target = (uint8_t *) g->host_base + ipa;
+    int err = 0;
+    if (mmap(target, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, fd,
+             (off_t) file_off) == MAP_FAILED)
+        err = linux_errno();
+    if (hv_vm_map(target, ipa, len, HVF_SEGMENT_FLAGS) != HV_SUCCESS) {
+        log_fatal("private mmap: stage-2 remap failed");
+        exit(128);
+    }
+    vcpu_pool_memory_resume();
+    return err;
+}
+
+/* Caller holds mmap_lock and has stopped guest execution. Host-page-aligned
+ * file backing is installed between matching stage-2 unmap/map calls.
  */
 static int hvf_apply_file_overlay_quiesced(guest_t *g,
                                            uint64_t ipa,
@@ -2304,10 +2333,8 @@ static int hvf_apply_file_overlay_quiesced(guest_t *g,
                                            int fd,
                                            off_t file_off)
 {
-    hvf_segment_t segments[GUEST_MAX_HVF_SEGMENTS];
-    int nsegments = hvf_detach_range_segments(g, ipa, len, segments);
-    if (nsegments < 0)
-        return nsegments;
+    if (hv_vm_unmap(ipa, len) != HV_SUCCESS)
+        return -LINUX_EIO;
 
     void *target = (uint8_t *) g->host_base + ipa;
     void *p = mmap(target, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
@@ -2319,26 +2346,16 @@ static int hvf_apply_file_overlay_quiesced(guest_t *g,
          * VA range stays consistent. The host VA was untouched by the failed
          * mmap, so nothing else to undo.
          */
-        hvf_remap_segments_best_effort(g, segments, nsegments);
+        if (hv_vm_map(target, ipa, len, HVF_SEGMENT_FLAGS) != HV_SUCCESS) {
+            log_fatal("file mmap: stage-2 rollback failed");
+            exit(128);
+        }
         return saved < 0 ? saved : -saved;
     }
 
-    for (int i = 0; i < nsegments; i++) {
-        if (hv_vm_map((uint8_t *) g->host_base + segments[i].ipa,
-                      segments[i].ipa, segments[i].len,
-                      HVF_SEGMENT_FLAGS) == HV_SUCCESS)
-            continue;
-
-        /* Restore slab backing so the host VA stops referencing the caller's
-         * file fd (which they expect to take back), then re-issue hv_vm_map so
-         * the IPA range is not left without stage-2 entries. Without the second
-         * hv_vm_map, sibling vCPUs would page-fault on this IPA after
-         * thread_resume_siblings with no chance of recovery short of process
-         * exit.
-         */
-        hvf_restore_slab_backing(g, ipa, len);
-        hvf_remap_segments_best_effort(g, segments, nsegments);
-        return -LINUX_EIO;
+    if (hv_vm_map(target, ipa, len, HVF_SEGMENT_FLAGS) != HV_SUCCESS) {
+        log_fatal("file mmap: stage-2 remap failed");
+        exit(128);
     }
 
     return 0;
@@ -2366,13 +2383,7 @@ static bool overlay_fd_writable(int fd)
     return (fl & O_ACCMODE) != O_RDONLY;
 }
 
-/* Apply a real MAP_SHARED file overlay at [ipa, ipa+len) backed by [fd,
- * file_off). The IPA range may be sub-2 MiB; the containing 2 MiB segment is
- * split out first if it is not already isolated. Caller holds mmap_lock and has
- * not quiesced siblings yet. The function quiesces siblings around the
- * unmap+remap window so concurrent vCPUs cannot fault on the
- * temporarily-unmapped IPA range.
- */
+/* The memory pause prevents guest execution during the stage-2 refresh. */
 static int hvf_apply_file_overlay(guest_t *g,
                                   uint64_t ipa,
                                   uint64_t len,
@@ -2381,10 +2392,9 @@ static int hvf_apply_file_overlay(guest_t *g,
 {
     if (!overlay_fd_writable(fd))
         return -LINUX_EACCES;
-    if (!thread_quiesce_siblings())
-        return -LINUX_EINTR; /* Being reaped; abandon the overlay */
+    vcpu_pool_memory_pause();
     int err = hvf_apply_file_overlay_quiesced(g, ipa, len, fd, file_off);
-    thread_resume_siblings();
+    vcpu_pool_memory_resume();
     return err;
 }
 
@@ -2392,27 +2402,16 @@ static int hvf_remove_file_overlay_quiesced(guest_t *g,
                                             uint64_t ipa,
                                             uint64_t len)
 {
-    hvf_segment_t segments[GUEST_MAX_HVF_SEGMENTS];
-    int nsegments = hvf_detach_range_segments(g, ipa, len, segments);
-    if (nsegments < 0)
-        return nsegments;
-
+    if (hv_vm_unmap(ipa, len) != HV_SUCCESS)
+        return -LINUX_EIO;
     int err = hvf_restore_slab_backing(g, ipa, len);
-    if (err < 0) {
-        /* Best-effort: re-establish the segment with whatever the host VA
-         * currently has (still the file overlay) so the guest can see something
-         * rather than nothing.
-         */
-        hvf_remap_segments_best_effort(g, segments, nsegments);
+    if (hv_vm_map((uint8_t *) g->host_base + ipa, ipa, len,
+                  HVF_SEGMENT_FLAGS) != HV_SUCCESS) {
+        log_fatal("file unmap: stage-2 remap failed");
+        exit(128);
+    }
+    if (err < 0)
         return err;
-    }
-
-    for (int i = 0; i < nsegments; i++) {
-        if (hv_vm_map((uint8_t *) g->host_base + segments[i].ipa,
-                      segments[i].ipa, segments[i].len,
-                      HVF_SEGMENT_FLAGS) != HV_SUCCESS)
-            return -LINUX_EIO;
-    }
 
     return 0;
 }
@@ -2423,10 +2422,51 @@ static int hvf_remove_file_overlay_quiesced(guest_t *g,
  */
 static int hvf_remove_file_overlay(guest_t *g, uint64_t ipa, uint64_t len)
 {
-    if (!thread_quiesce_siblings())
-        return -LINUX_EINTR; /* Being reaped; abandon the overlay */
+    vcpu_pool_memory_pause();
     int err = hvf_remove_file_overlay_quiesced(g, ipa, len);
-    thread_resume_siblings();
+    vcpu_pool_memory_resume();
+    return err;
+}
+
+static int hvf_remove_private_file(guest_t *g,
+                                   uint64_t ipa,
+                                   uint64_t len,
+                                   uint64_t discard_start,
+                                   uint64_t discard_end)
+{
+    size_t hps = host_page_size_cached();
+    uint8_t edges[2 * 16384];
+    if (hps > sizeof(edges) / 2)
+        return -LINUX_EINVAL;
+    uint8_t *host = (uint8_t *) g->host_base + ipa;
+    size_t head = discard_start > ipa ? discard_start - ipa : 0;
+    size_t tail = ipa + len > discard_end ? ipa + len - discard_end : 0;
+    if (head > hps || tail > hps)
+        return -LINUX_EINVAL;
+    vcpu_pool_memory_pause();
+    if (head)
+        memcpy(edges, host, head);
+    if (tail)
+        memcpy(edges + hps, host + len - tail, tail);
+    int err = 0;
+    if (hv_vm_unmap(ipa, len) != HV_SUCCESS) {
+        vcpu_pool_memory_resume();
+        return -LINUX_EIO;
+    }
+    if (mmap(host, len, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) == MAP_FAILED)
+        err = linux_errno();
+    if (hv_vm_map(host, ipa, len, HVF_SEGMENT_FLAGS) != HV_SUCCESS) {
+        log_fatal("private unmap: stage-2 remap failed");
+        exit(128);
+    }
+    if (err == 0) {
+        if (head)
+            memcpy(host, edges, head);
+        if (tail)
+            memcpy(host + len - tail, edges + hps, tail);
+    }
+    vcpu_pool_memory_resume();
     return err;
 }
 
@@ -2481,6 +2521,7 @@ static int cleanup_overlays_in_range(guest_t *g, uint64_t start, uint64_t end)
      */
     struct {
         uint64_t off, len;
+        bool shared;
     } overlays[GUEST_MAX_REGIONS];
     int n = 0;
     for (int i = guest_region_first_end_above(g, host_start);
@@ -2507,12 +2548,17 @@ static int cleanup_overlays_in_range(guest_t *g, uint64_t start, uint64_t end)
         if (!seen) {
             overlays[n].off = s;
             overlays[n].len = e - s;
+            overlays[n].shared = r->shared;
             n++;
         }
     }
     int err = 0;
     for (int i = 0; i < n; i++) {
-        int rc = hvf_remove_file_overlay(g, overlays[i].off, overlays[i].len);
+        int rc =
+            overlays[i].shared
+                ? hvf_remove_file_overlay(g, overlays[i].off, overlays[i].len)
+                : hvf_remove_private_file(g, overlays[i].off, overlays[i].len,
+                                          start, end);
         if (rc < 0) {
             /* Stop on first failure; leave overlay_active set on regions we
              * could not tear down so subsequent operations still see a live
@@ -2714,10 +2760,15 @@ int64_t sys_brk(guest_t *g, uint64_t addr)
             return (int64_t) ipa_brk;
     }
 
-    /* Zero new pages if growing */
-    if (new_off > g->brk_current) {
-        memset((uint8_t *) g->host_base + g->brk_current, 0,
-               new_off - g->brk_current);
+    if (new_off != old_brk) {
+        uint64_t start = new_off > old_brk ? old_brk : new_off;
+        uint64_t len =
+            new_off > old_brk ? new_off - old_brk : old_brk - new_off;
+        if (guest_memory_reset_range(g, start, len) < 0) {
+            if (shrink_remove_fd >= 0)
+                close(shrink_remove_fd);
+            return (int64_t) ipa_brk;
+        }
     }
 
     g->brk_current = new_off;
@@ -3109,7 +3160,11 @@ int64_t sys_mmap(guest_t *g,
              * the remainder zeroed (memset first).
              */
             if (is_anon) {
-                memset((uint8_t *) g->host_base + result_off, 0, length);
+                int reset_err = guest_memory_reset_range(g, result_off, length);
+                if (reset_err < 0) {
+                    mmap_fresh_dispose(&fresh);
+                    return reset_err;
+                }
             } else if (fd >= 0 && (flags & LINUX_MAP_SHARED) &&
                        (result_off % host_page_size_cached() == 0) &&
                        ((uint64_t) offset % host_page_size_cached() == 0)) {
@@ -3133,6 +3188,19 @@ int64_t sys_mmap(guest_t *g,
                 overlay_installed = true;
                 overlay_ipa = result_off;
                 overlay_len = fixed_overlay_len;
+            } else if (fd >= 0 && (flags & LINUX_MAP_PRIVATE) &&
+                       result_off % host_page_size_cached() == 0 &&
+                       (uint64_t) offset % host_page_size_cached() == 0 &&
+                       length % host_page_size_cached() == 0) {
+                int err = hvf_apply_private_file(g, result_off, length,
+                                                 host_backing_fd, offset);
+                if (err < 0) {
+                    mmap_fresh_dispose(&fresh);
+                    return err;
+                }
+                overlay_installed = true;
+                overlay_ipa = result_off;
+                overlay_len = length;
             } else if (fd >= 0) {
                 memset((uint8_t *) g->host_base + result_off, 0, length);
                 uint8_t *dst = (uint8_t *) g->host_base + result_off;
@@ -3190,6 +3258,14 @@ int64_t sys_mmap(guest_t *g,
                 return cleanup_err;
             }
 
+            if (is_anon) {
+                int reset_err = guest_memory_reset_range(g, result_off, length);
+                if (reset_err < 0) {
+                    mmap_fresh_dispose(&fresh);
+                    return reset_err;
+                }
+            }
+
             /* Remove any existing region coverage in the fixed range. */
             guest_region_remove_reserved(g, result_off, result_off + length,
                                          fresh.replaced_remove_fd);
@@ -3233,26 +3309,7 @@ int64_t sys_mmap(guest_t *g,
             host_backing_fd = fresh.backing_ref.fd;
         }
 
-        /* Prefer stage-2 2 MiB block boundaries for non-fixed MAP_SHARED
-         * file-backed allocations. Without this each shared file mmap whose
-         * result lands mid-block forces hvf_apply_file_overlay_quiesced to
-         * split the containing HVF segment at both ends; back-to-back memfd
-         * allocations burn segments at roughly two per mmap and run the table
-         * to GUEST_MAX_HVF_SEGMENTS quickly. This is a placement preference,
-         * not a Linux-visible constraint: if no 2 MiB-aligned gap exists, the
-         * allocation retries with host-page alignment. The condition mirrors
-         * the overlay fast-path's gate (host-page-aligned offset, writable
-         * backer) so read-only MAP_SHARED mappings that fall through to the
-         * pread snapshot do not pay the alignment cost without the
-         * segment-table benefit.
-         */
-        size_t hps = host_page_size_cached();
-        uint64_t align = (uint64_t) hps;
-        if (!is_anon && fd >= 0 && (flags & LINUX_MAP_SHARED) &&
-            ((uint64_t) offset % hps == 0) &&
-            overlay_fd_writable(host_backing_fd))
-            align = BLOCK_2MIB;
-        uint64_t fallback_align = (uint64_t) hps;
+        uint64_t align = host_page_size_cached();
         if (needs_exec && !(prot & LINUX_PROT_WRITE)) {
             /* PROT_EXEC without PROT_WRITE: allocate from the RX mmap region.
              * Apple HVF enforces W^X on 2MiB block page table entries, so
@@ -3262,9 +3319,6 @@ int64_t sys_mmap(guest_t *g,
              */
             result_off =
                 find_free_gap(g, length, MMAP_RX_BASE, g->mmap_limit, align);
-            if (result_off == UINT64_MAX && align != fallback_align)
-                result_off = find_free_gap(g, length, MMAP_RX_BASE,
-                                           g->mmap_limit, fallback_align);
             if (result_off == UINT64_MAX) {
                 log_debug(
                     "mmap: RX address space exhausted "
@@ -3306,26 +3360,14 @@ int64_t sys_mmap(guest_t *g,
                      */
                     uint64_t hint_max =
                         (hint_off < MMAP_BASE) ? MMAP_BASE : g->mmap_limit;
-                    if (align != fallback_align) {
-                        uint64_t exact_hint_max = hint_off + length;
-                        result_off =
-                            find_free_gap_inner(g, length, hint_off,
-                                                exact_hint_max, fallback_align);
-                    }
                     if (result_off == UINT64_MAX)
                         result_off = find_free_gap_inner(g, length, hint_off,
                                                          hint_max, align);
-                    if (result_off == UINT64_MAX && align != fallback_align)
-                        result_off = find_free_gap_inner(
-                            g, length, hint_off, hint_max, fallback_align);
                 }
             }
             if (result_off == UINT64_MAX)
                 result_off =
                     find_free_gap(g, length, MMAP_BASE, g->mmap_limit, align);
-            if (result_off == UINT64_MAX && align != fallback_align)
-                result_off = find_free_gap(g, length, MMAP_BASE, g->mmap_limit,
-                                           fallback_align);
             if (result_off == UINT64_MAX) {
                 log_debug(
                     "mmap: RW address space exhausted "
@@ -3422,8 +3464,27 @@ int64_t sys_mmap(guest_t *g,
                 g->mmap_end = ext_end;
         }
 
-        /* Zero the mapped region */
-        memset((uint8_t *) g->host_base + result_off, 0, length);
+        bool private_direct =
+            !is_anon && (flags & LINUX_MAP_PRIVATE) &&
+            result_off % host_page_size_cached() == 0 &&
+            (uint64_t) offset % host_page_size_cached() == 0 &&
+            length % host_page_size_cached() == 0;
+        if (!private_direct) {
+            int reset_err = guest_memory_reset_range(g, result_off, length);
+            if (reset_err < 0) {
+                mmap_fresh_dispose(&fresh);
+                return reset_err;
+            }
+        }
+    }
+
+    if (is_anon && !is_fixed && (is_prot_none || is_noreserve) &&
+        g->memory_mode == GUEST_MEMORY_LAZY) {
+        int reset_err = guest_memory_reset_range(g, result_off, length);
+        if (reset_err < 0) {
+            mmap_fresh_dispose(&fresh);
+            return reset_err;
+        }
     }
 
     /* MAP_NORESERVE: invalidate any stale PTEs (like PROT_NONE path) but track
@@ -3433,6 +3494,30 @@ int64_t sys_mmap(guest_t *g,
      */
     if (is_noreserve && !is_fixed) {
         guest_invalidate_ptes(g, result_off, result_off + length);
+    }
+
+    if (is_prot_none && !is_anon && (flags & LINUX_MAP_PRIVATE)) {
+        size_t hps = host_page_size_cached();
+        int err;
+        if (result_off % hps == 0 && (uint64_t) offset % hps == 0 &&
+            length % hps == 0) {
+            err = hvf_apply_private_file(g, result_off, length, host_backing_fd,
+                                         offset);
+            if (err == 0) {
+                overlay_installed = true;
+                overlay_ipa = result_off;
+                overlay_len = length;
+            }
+        } else {
+            err = guest_memory_reset_range(g, result_off, length);
+            if (err == 0)
+                err = read_file_range_to_guest(g, result_off, host_backing_fd,
+                                               offset, length);
+        }
+        if (err < 0) {
+            mmap_fresh_dispose(&fresh);
+            return err;
+        }
     }
 
     /* For file-backed mmap, populate the region with file contents. MAP_SHARED
@@ -3469,11 +3554,8 @@ int64_t sys_mmap(guest_t *g,
             return -LINUX_EACCES;
         }
 
-        /* overlay_fd_writable rejects read-only backing fds inside
-         * hvf_apply_file_overlay; mirror the check here so a read-only mmap
-         * takes the snapshot pread path directly, skipping the thread_quiesce /
-         * segment_split cycle the overlay would otherwise perform before
-         * returning EACCES.
+        /* Read-only shared fds use the snapshot path: HVF requires a writable
+         * host mapping for the slab's stage-2 permissions.
          */
         bool overlay_aligned = (flags & LINUX_MAP_SHARED) &&
                                overlay_fd_writable(host_backing_fd) &&
@@ -3496,6 +3578,17 @@ int64_t sys_mmap(guest_t *g,
             overlay_installed = true;
             overlay_ipa = result_off;
             overlay_len = nf_overlay_len;
+        } else if ((flags & LINUX_MAP_PRIVATE) && result_off % hps == 0 &&
+                   (uint64_t) offset % hps == 0 && length % hps == 0) {
+            int err = hvf_apply_private_file(g, result_off, length,
+                                             host_backing_fd, offset);
+            if (err < 0) {
+                mmap_fresh_dispose(&fresh);
+                return err;
+            }
+            overlay_installed = true;
+            overlay_ipa = result_off;
+            overlay_len = length;
         } else {
             uint8_t *dst = (uint8_t *) g->host_base + result_off;
             size_t remaining = length;
@@ -3584,18 +3677,9 @@ int64_t sys_mmap(guest_t *g,
      * snapshot-style pwrite/refresh paths for regions that the kernel already
      * keeps coherent with the file's page cache.
      */
-    if (!is_anon && fd >= 0 && !is_prot_none && (flags & LINUX_MAP_SHARED)) {
-        size_t hps = host_page_size_cached();
-        if ((result_off % hps == 0) && ((uint64_t) offset % hps == 0)) {
-            int i = guest_region_first_end_above(g, result_off);
-            if (i < g->nregions && g->regions[i].start == result_off &&
-                g->regions[i].end == result_off + length) {
-                g->regions[i].overlay_active = true;
-                g->regions[i].overlay_start = result_off;
-                g->regions[i].overlay_end = result_off + ALIGN_UP(length, hps);
-            }
-        }
-    }
+    if (overlay_installed)
+        mark_overlay_metadata_range(g, result_off, result_off + length,
+                                    overlay_ipa, overlay_ipa + overlay_len);
 
     /* A MAP_SHARED mapping whose backing fd cannot be written to has Linux
      * max_prot capped to PROT_READ, whether or not the pread snapshot path
@@ -3736,11 +3820,13 @@ int64_t sys_mremap(guest_t *g,
             return finish_mremap(&source, cleanup_err);
         }
 
-        /* Zero the trimmed region on its real backing (high-VA tails live at
-         * gpa_base, not host_base + tail_off).
-         */
-        memset(host_ptr_for_gpa(g, src_gpa_base + (tail_off - src_start)), 0,
-               tail_end - tail_off);
+        int reset_err = guest_memory_reset_range(
+            g, src_gpa_base + (tail_off - src_start), tail_end - tail_off);
+        if (reset_err < 0) {
+            if (tail_remove_fd >= 0)
+                close(tail_remove_fd);
+            return finish_mremap(&source, reset_err);
+        }
         guest_region_remove_reserved(g, tail_off, tail_end, tail_remove_fd);
         guest_invalidate_ptes(g, tail_off, tail_end);
         if (tail_off < g->mmap_rw_gap_hint)
@@ -3921,7 +4007,11 @@ int64_t sys_mremap(guest_t *g,
          */
         uint64_t copy_len = old_size < new_size ? old_size : new_size;
         if (move.track.prot == LINUX_PROT_NONE) {
-            memset((uint8_t *) g->host_base + new_off, 0, new_size);
+            int err = guest_memory_reset_range(g, new_off, new_size);
+            if (err < 0) {
+                mremap_move_dispose(&move);
+                return finish_mremap(&source, err);
+            }
         } else {
             if (source_overlay)
                 memset((uint8_t *) g->host_base + new_off, 0, new_size);
@@ -3955,15 +4045,26 @@ int64_t sys_mremap(guest_t *g,
                 return finish_mremap(&source, copy_err);
             }
         }
-        /* Zero any extension beyond old data */
-        if (new_size > old_size)
-            memset((uint8_t *) g->host_base + new_off + old_size, 0,
-                   new_size - old_size);
+        if (new_size > old_size) {
+            int err = guest_memory_reset_range(g, new_off + old_size,
+                                               new_size - old_size);
+            if (err < 0) {
+                mremap_move_dispose(&move);
+                return finish_mremap(&source, err);
+            }
+        }
 
         /* Remove old mapping */
         if (old_size > 0) {
-            memset(host_ptr_for_gpa(g, src_gpa_base + (old_off - src_start)), 0,
-                   old_size);
+            int reset_err =
+                cleanup_overlays_in_range(g, old_off, old_off + old_size);
+            if (reset_err == 0)
+                reset_err = guest_memory_reset_range(
+                    g, src_gpa_base + (old_off - src_start), old_size);
+            if (reset_err < 0) {
+                mremap_move_dispose(&move);
+                return finish_mremap(&source, reset_err);
+            }
             guest_region_remove_reserved(g, old_off, old_off + old_size,
                                          move.source_remove_fd);
             move.source_remove_fd = -1;
@@ -4034,7 +4135,13 @@ int64_t sys_mremap(guest_t *g,
                     return finish_mremap(&source, -LINUX_ENOMEM);
                 }
 
-                memset((uint8_t *) g->host_base + grow_off, 0, grow_len);
+                int reset_err = guest_memory_reset_range(g, grow_off, grow_len);
+                if (reset_err < 0) {
+                    mremap_track_dispose(&track);
+                    if (source_remove_fd >= 0)
+                        close(source_remove_fd);
+                    return finish_mremap(&source, reset_err);
+                }
 
                 /* Update region tracking: remove old, add extended */
                 guest_region_remove_reserved(g, old_off, old_off + old_size,
@@ -4149,7 +4256,13 @@ int64_t sys_mremap(guest_t *g,
          * overlay.
          */
         if (track.prot == LINUX_PROT_NONE) {
-            memset((uint8_t *) g->host_base + new_off, 0, new_size);
+            int err = guest_memory_reset_range(g, new_off, new_size);
+            if (err < 0) {
+                mremap_track_dispose(&track);
+                if (source_remove_fd >= 0)
+                    close(source_remove_fd);
+                return finish_mremap(&source, err);
+            }
         } else {
             if (source_overlay)
                 memset((uint8_t *) g->host_base + new_off, 0, new_size);
@@ -4170,14 +4283,29 @@ int64_t sys_mremap(guest_t *g,
                 return finish_mremap(&source, copy_err);
             }
         }
-        memset((uint8_t *) g->host_base + new_off + old_size, 0,
-               new_size - old_size);
+        int extension_err = guest_memory_reset_range(g, new_off + old_size,
+                                                     new_size - old_size);
+        if (extension_err < 0) {
+            mremap_track_dispose(&track);
+            if (source_remove_fd >= 0)
+                close(source_remove_fd);
+            return finish_mremap(&source, extension_err);
+        }
 
         /* Remove old mapping. Any live source overlay was already torn down
          * before the destination range was touched.
          */
-        memset(host_ptr_for_gpa(g, src_gpa_base + (old_off - src_start)), 0,
-               old_size);
+        int reset_err =
+            cleanup_overlays_in_range(g, old_off, old_off + old_size);
+        if (reset_err == 0)
+            reset_err = guest_memory_reset_range(
+                g, src_gpa_base + (old_off - src_start), old_size);
+        if (reset_err < 0) {
+            mremap_track_dispose(&track);
+            if (source_remove_fd >= 0)
+                close(source_remove_fd);
+            return finish_mremap(&source, reset_err);
+        }
         guest_region_remove_reserved(g, old_off, old_off + old_size,
                                      source_remove_fd);
         guest_invalidate_ptes(g, old_off, old_off + old_size);
@@ -4341,7 +4469,7 @@ int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
              * reset; the next guest read already sees the current file image,
              * which is what MADV_DONTNEED promises.
              */
-            if (r->overlay_active)
+            if (r->overlay_active && r->shared)
                 continue;
 
             uint64_t zstart = (r->start > off) ? r->start : off;
@@ -4353,7 +4481,27 @@ int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
              * identity regions gpa_base == start, so this is unchanged.
              */
             uint64_t rgpa = r->gpa_base + (zstart - r->start);
-            memset(host_ptr_for_gpa(g, rgpa), 0, zend - zstart);
+            if (r->overlay_active && !r->shared &&
+                rgpa % host_page_size_cached() == 0 &&
+                (r->offset + zstart - r->start) % host_page_size_cached() ==
+                    0 &&
+                (zend - zstart) % host_page_size_cached() == 0) {
+                int err = hvf_apply_private_file(g, rgpa, zend - zstart,
+                                                 r->backing_fd,
+                                                 r->offset + zstart - r->start);
+                if (err < 0)
+                    return err;
+                continue;
+            }
+            if ((r->flags & LINUX_MAP_ANONYMOUS) && !r->shared) {
+                int err = guest_memory_reset_range(g, rgpa, zend - zstart);
+                if (err < 0)
+                    return err;
+            } else if (r->flags & LINUX_MAP_ANONYMOUS) {
+                continue;
+            } else {
+                memset(host_ptr_for_gpa(g, rgpa), 0, zend - zstart);
+            }
             if (!(r->flags & LINUX_MAP_ANONYMOUS)) {
                 /* Restore file-backed pages from the current backing image.
                  * read_file_range_to_guest resolves the destination through
@@ -4452,17 +4600,6 @@ static int munmap_guest_range(guest_t *g, uint64_t unmap_off, uint64_t end)
     if (guest_region_remove_prepare(g, unmap_off, end, &remove_fd) < 0)
         return -LINUX_ENOMEM;
 
-    /* Restore slab backing under any active MAP_SHARED file overlay before
-     * zeroing the host VA. Without this, the memset below would write zeros
-     * directly into the file.
-     */
-    int cleanup_err = cleanup_overlays_in_range(g, unmap_off, end);
-    if (cleanup_err < 0) {
-        if (remove_fd >= 0)
-            close(remove_fd);
-        return cleanup_err;
-    }
-
     /* Invalidate PTEs first. This may need to split a 2MiB block which can fail
      * if the page table pool is exhausted. Failing before region removal keeps
      * metadata consistent.
@@ -4479,11 +4616,23 @@ static int munmap_guest_range(guest_t *g, uint64_t unmap_off, uint64_t end)
             break;
         if (r->end <= unmap_off)
             continue;
-        if (r->prot == LINUX_PROT_NONE)
+        if (region_has_live_overlay(r))
             continue;
         uint64_t zstart = (r->start > unmap_off) ? r->start : unmap_off;
         uint64_t zend = (r->end < end) ? r->end : end;
-        memset((uint8_t *) g->host_base + zstart, 0, zend - zstart);
+        int reset_err = guest_memory_reset_range(
+            g, r->gpa_base + (zstart - r->start), zend - zstart);
+        if (reset_err < 0) {
+            if (remove_fd >= 0)
+                close(remove_fd);
+            return reset_err;
+        }
+    }
+    int cleanup_err = cleanup_overlays_in_range(g, unmap_off, end);
+    if (cleanup_err < 0) {
+        if (remove_fd >= 0)
+            close(remove_fd);
+        return cleanup_err;
     }
     guest_region_remove_reserved(g, unmap_off, end, remove_fd);
     if (unmap_off < g->mmap_rw_gap_hint)
@@ -4558,6 +4707,23 @@ int64_t sys_munmap(guest_t *g, uint64_t addr, uint64_t length)
                     if (remove_fd >= 0)
                         close(remove_fd);
                     return -LINUX_ENOMEM;
+                }
+                for (int i = guest_region_first_end_above(g, addr);
+                     i < g->nregions && g->regions[i].start < addr + length;
+                     i++) {
+                    const guest_region_t *r = &g->regions[i];
+                    if (r->overlay_active)
+                        continue;
+                    uint64_t start = r->start > addr ? r->start : addr;
+                    uint64_t end =
+                        r->end < addr + length ? r->end : addr + length;
+                    int err = guest_memory_reset_range(
+                        g, r->gpa_base + (start - r->start), end - start);
+                    if (err < 0) {
+                        if (remove_fd >= 0)
+                            close(remove_fd);
+                        return err;
+                    }
                 }
                 guest_region_remove_reserved(g, addr, addr + length, remove_fd);
             }
@@ -5127,10 +5293,7 @@ int mmap_fork_prepare_anon_shared_locked(guest_t *g,
 
     size_t hps = host_page_size_cached();
 
-    /* Snapshot candidate ranges first; conversion mutates the region table via
-     * hvf_segment_split / mark_overlay_metadata_range and would invalidate the
-     * walk indices.
-     */
+    /* Capture ranges before overlay publication changes region metadata. */
     struct {
         uint64_t start;
         uint64_t end;

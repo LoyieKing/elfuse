@@ -101,6 +101,7 @@ struct vcpu_slot {
      * re-runs the SYNC_CORE trampoline before its next entry.
      */
     _Atomic bool in_exec;
+    _Atomic bool memory_guest; /* Guest entry handshake with memory_paused */
 
     /* Host-fence and guest SYNC_CORE generations this owner has executed. The
      * guest generation is published only by the shim trampoline after IC
@@ -188,6 +189,40 @@ static pthread_mutex_t barrier_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t barrier_cond = PTHREAD_COND_INITIALIZER;
 static _Atomic uint64_t barrier_request;
 static uint64_t barrier_seq; /* protected by barrier_lock */
+
+static pthread_mutex_t memory_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t memory_cond = PTHREAD_COND_INITIALIZER;
+static _Atomic bool memory_paused;
+
+void vcpu_pool_memory_pause(void)
+{
+    pthread_mutex_lock(&memory_lock);
+    atomic_store_explicit(&memory_paused, true, memory_order_seq_cst);
+    for (int i = 0; i < slot_count; i++) {
+        if (&slots[i] != owner_slot &&
+            atomic_load_explicit(&slots[i].memory_guest, memory_order_seq_cst))
+            slot_kick(&slots[i]);
+    }
+    for (;;) {
+        bool busy = false;
+        for (int i = 0; i < slot_count; i++)
+            busy |= &slots[i] != owner_slot &&
+                    atomic_load_explicit(&slots[i].memory_guest,
+                                         memory_order_seq_cst);
+        if (!busy)
+            break;
+        pthread_cond_wait(&memory_cond, &memory_lock);
+    }
+    pthread_mutex_unlock(&memory_lock);
+}
+
+void vcpu_pool_memory_resume(void)
+{
+    pthread_mutex_lock(&memory_lock);
+    atomic_store_explicit(&memory_paused, false, memory_order_seq_cst);
+    pthread_cond_broadcast(&memory_cond);
+    pthread_mutex_unlock(&memory_lock);
+}
 
 /* EL1h with D/A/I/F masked; the owner restores the saved context at HVC #14. */
 #define POOL_CPSR_EL1H_DAIF 0x3c5ULL
@@ -476,6 +511,29 @@ void vcpu_pool_account_phase(bool entering_guest)
 {
     if (!owner_slot || !current_thread)
         return;
+    {
+        /* Seq-cst makes the requester see this entry or this owner see its
+         * pause. No guest entry crosses the detach/remap window.
+         */
+        atomic_store_explicit(&owner_slot->memory_guest, entering_guest,
+                              memory_order_seq_cst);
+        if (atomic_load_explicit(&memory_paused, memory_order_seq_cst)) {
+            pthread_mutex_lock(&memory_lock);
+            if (entering_guest) {
+                atomic_store_explicit(&owner_slot->memory_guest, false,
+                                      memory_order_seq_cst);
+                pthread_cond_broadcast(&memory_cond);
+                while (
+                    atomic_load_explicit(&memory_paused, memory_order_seq_cst))
+                    pthread_cond_wait(&memory_cond, &memory_lock);
+                atomic_store_explicit(&owner_slot->memory_guest, true,
+                                      memory_order_seq_cst);
+            } else {
+                pthread_cond_broadcast(&memory_cond);
+            }
+            pthread_mutex_unlock(&memory_lock);
+        }
+    }
     atomic_fetch_add_explicit(&owner_slot->accounting_seq, 1,
                               memory_order_acq_rel);
     uint64_t now = slot_cpu_ns(owner_slot);

@@ -451,14 +451,6 @@ INVENTORY = {
         "signal the guest can observe, so the handler case is the one that "
         "can reach the return, and the mask is restored on the way out.",
     ),
-    "syscall/mem.c::hvf_apply_file_overlay": (
-        "not-a-wait",
-        "Refuses the overlay because an execve is reaping this thread.",
-    ),
-    "syscall/mem.c::hvf_remove_file_overlay": (
-        "not-a-wait",
-        "Refuses the unmap window because an execve is reaping this thread.",
-    ),
     "syscall/mem.c::sys_mmap_high_va": (
         "not-a-wait",
         "Refuses the overlay because an execve is reaping this thread.",

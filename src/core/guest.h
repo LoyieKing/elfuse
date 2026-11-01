@@ -225,26 +225,6 @@ typedef struct {
  */
 #define GUEST_MAX_REGIONS 4096
 
-/* HVF stage-2 mapping segment. The slab is mapped to HVF in pieces so that
- * file-backed MAP_SHARED regions can have real host-VA overlays applied via
- * mmap MAP_FIXED|MAP_SHARED of a file fd. HVF requires hv_vm_unmap to target an
- * exactly-previously-mapped range; sub-range unmap of a larger map fails with
- * HV_BAD_ARGUMENT. To allow a 2 MiB-aligned middle range to be unmapped +
- * remapped (refreshing HVF stage-2 caching after a host mmap MAP_FIXED), the
- * slab is split into 2 MiB-aligned segments around each affected block. All
- * segments are 2 MiB-aligned and 2 MiB-sized at minimum.
- *
- * 256 segments is generous: each MAP_SHARED file mmap costs at most 2 new
- * segments (left/right of the carved block), and most workloads keep that count
- * well under 50.
- */
-typedef struct {
-    uint64_t ipa; /* 2 MiB-aligned IPA start */
-    uint64_t len; /* 2 MiB-aligned length */
-} hvf_segment_t;
-
-#define GUEST_MAX_HVF_SEGMENTS 256
-
 /* A semantic memory region tracked for munmap/mprotect and /proc/self/maps.
  * Distinct from mem_region_t which is used purely for page table construction.
  * Regions are kept sorted by start address in guest_t.regions[].
@@ -280,13 +260,10 @@ typedef struct {
                              * only VMAs that can participate in that fork's
                              * CoW snapshot as Shared_Dirty.
                              */
-    bool overlay_active; /* Region has a live host MAP_FIXED|MAP_SHARED overlay
-                          * of backing_fd at host_base+start. The kernel's page
-                          * cache keeps it coherent with the file and with peer
-                          * overlays of the same file, so msync skips the
-                          * snapshot-style pwrite-the-diff and refresh-from-file
-                          * paths for these regions.
-                          */
+    bool overlay_active;    /* Host file mapping at host_base+start. MAP_SHARED
+                             * uses the file page cache; MAP_PRIVATE uses host CoW.
+                             * shared distinguishes writeback and fork restoration.
+                             */
     uint64_t overlay_start; /* Host-page-aligned overlay start. May extend
                              * outside [start, end) when only part of a host
                              * page is guest-visible.
@@ -441,6 +418,17 @@ typedef struct {
     uint64_t next;      /* Bump offset; (next + BLOCK_2MIB) > size means full */
 } guest_overflow_t;
 
+/* How the host retires a guest range that must read back as zero: EAGER zeroes
+ * it in place, paying every byte up front. LAZY drops the physical backing so
+ * the host returns zeroed pages on the next touch. The guest cannot observe the
+ * difference, since either way it reads a zero-filled range. Zero is LAZY so a
+ * zero-initialized caller gets the default.
+ */
+typedef enum {
+    GUEST_MEMORY_LAZY = 0,
+    GUEST_MEMORY_EAGER = 1,
+} guest_memory_mode_t;
+
 /* Guest state. */
 typedef struct {
     void *host_base; /* Host pointer to allocated guest memory */
@@ -448,6 +436,8 @@ typedef struct {
 
     uint64_t guest_size; /* Total size (determined by IPA capacity) */
     uint64_t ipa_base;   /* IPA base for hv_vm_map (GUEST_IPA_BASE) */
+    guest_memory_mode_t memory_mode; /* Policy for retiring ranges to zero */
+
     uint64_t mmap_limit; /* Max mmap address (computed from guest_size) */
 
     uint64_t interp_base; /* Dynamic linker load base (from guest_size) */
@@ -555,14 +545,6 @@ typedef struct {
      * doubts, so it binds this image rather than the process.
      */
     bool regions_tracker_stale;
-
-    /* HVF stage-2 segment list: the union of segments[0..n_segments) covers the
-     * live IPA range that is currently hv_vm_map'd to HVF. Sorted by ipa.
-     * Initially one segment spans the whole slab. See guest.h header comment on
-     * hvf_segment_t for the rationale.
-     */
-    hvf_segment_t segments[GUEST_MAX_HVF_SEGMENTS];
-    int n_segments;
 
     /* Page table generation counter: incremented on every PT modification. Used
      * by the per-thread GVA TLB cache to detect stale entries. 64-bit to avoid
@@ -869,27 +851,32 @@ static inline bool guest_addr_in_infra(const guest_t *g, uint64_t addr)
 
 /* Allocate guest memory, create VM, map to hypervisor. size: primary buffer
  * size (0 = auto-detect from IPA capacity). ipa_bits: IPA width for HVF VM (0 =
- * auto-detect).
+ * auto-detect). memory_mode: policy stored in g->memory_mode for every range
+ * retired to zero.
  * Returns 0 on success, -1 on failure.
  */
-int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits);
+int guest_init(guest_t *g,
+               uint64_t size,
+               uint32_t ipa_bits,
+               guest_memory_mode_t memory_mode);
 
 /* Initialize guest from a shared memory fd (CoW fork path). Creates the HVF VM
  * and maps the fd to the hypervisor. The child gets an instant CoW snapshot of
  * the parent's guest memory without copying.
  *
- * retain_shared selects the mapping: when true, shm_fd is an independent APFS
- * clone, so it is mapped MAP_SHARED and retained in g->shm_fd (guest_destroy
- * closes it) so the child can fclonefileat it for nested CoW fork. When false,
- * shm_fd may be the parent's live fd, so it is mapped MAP_PRIVATE and closed
- * after mapping. This function takes ownership of shm_fd on every path.
+ * retain_shared selects the mapping: an independent APFS clone is mapped
+ * MAP_SHARED and retained in g->shm_fd for nested fork; otherwise the supplied
+ * snapshot is mapped MAP_PRIVATE and closed. memory_mode is stored in
+ * g->memory_mode as in guest_init. This function takes ownership of shm_fd on
+ * every path.
  * Returns 0 on success, -1 on failure.
  */
 int guest_init_from_shm(guest_t *g,
                         int shm_fd,
                         uint64_t size,
                         uint32_t ipa_bits,
-                        bool retain_shared);
+                        bool retain_shared,
+                        guest_memory_mode_t memory_mode);
 
 /* Tear down VM and free guest memory. The caller has already destroyed every
  * vCPU, which is what launch_destroy_guest in core/launch.h does before calling
@@ -1399,12 +1386,10 @@ bool guest_region_range_has_ro_shared_backing(const guest_t *g,
                                               uint64_t start,
                                               uint64_t end);
 
-/* Try to materialize a lazy (MAP_NORESERVE) page at the given offset. Called
- * from the data/instruction abort handler when the faulting address falls
- * within a noreserve region. Creates page table entries for one 2MiB block
- * containing the fault address, zeros the memory, and clears the noreserve flag
- * for the materialized sub-range.
- * Returns 0 on success (caller should TLBI and retry), -1 if the offset is not
- * in a noreserve region.
+/* Materialize MAP_NORESERVE translation for the faulting block. Caller holds
+ * mmap_lock. Backing bytes are unchanged.
+ *
+ * Returns 0 to retry after TLBI, or -1 when the address is not a MAP_NORESERVE
+ * mapping.
  */
 int guest_materialize_lazy(guest_t *g, uint64_t fault_offset);

@@ -17,6 +17,7 @@ Supported user-facing options:
 | `-V`, `--version` | Print the build version and exit |
 | `-v`, `--verbose` | Enable syscall-level and loader diagnostics |
 | `-t`, `--timeout N` | Guest execution watchdog, in seconds (default `10`, `0` disables) |
+| `--memory-mode=lazy\|eager` | Private anonymous backing policy (default `lazy`); `--memory-mode MODE` also works |
 | `--sysroot PATH` | Resolve guest absolute paths under `PATH`, falling back to the host for paths it does not hold |
 | `--create-sysroot PATH` | Provision a case-sensitive APFS sparsebundle mounted at `PATH`, then use it as the sysroot |
 | `--no-rosetta` | Disable the x86_64-via-Rosetta translator (also `ELFUSE_NO_ROSETTA=1`) |
@@ -49,6 +50,16 @@ absolute path is rejected at startup rather than ignored.
 preemption. Detection takes up to two periods; a blocked syscall does not count
 as stalled execution. It does not cap total process runtime. Setting
 `--timeout 0` disables the watchdog for long-running CPU-bound guests.
+
+`--memory-mode=lazy` releases whole host pages on private anonymous discard,
+unmap and exec reset. Fresh anonymous allocations remain zero-fill-on-demand.
+`--memory-mode=eager` zeroes backing in place and retains it for reuse. Both
+modes reserve the same guest address space and preserve Linux byte semantics;
+neither commits the entire slab. Fork inherits the policy and exec preserves it.
+Lazy mode releases anonymous backing and retains zero-fill semantics. Aligned
+private file mappings use host CoW demand paging; unaligned host-page edges
+use a byte snapshot. `mincore` and guest RSS query backing residency at host
+page granularity. Shared-file coherence keeps its existing behavior.
 
 ## Guest Identity, Working Directory, And Environment
 

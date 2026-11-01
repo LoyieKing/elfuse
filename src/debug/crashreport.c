@@ -253,19 +253,11 @@ static void dump_segment_and_region_for(const guest_t *g,
         return;
 
     if (have_ipa) {
-        bool found_seg = false;
-        for (int i = 0; i < g->n_segments; i++) {
-            const hvf_segment_t *s = &g->segments[i];
-            if (ipa >= s->ipa && ipa < s->ipa + s->len) {
-                fprintf(stderr,
-                        "  HVF segment[%d]: ipa=0x%llx len=0x%llx "
-                        "(covers translated IPA 0x%llx)\n",
-                        i, (unsigned long long) s->ipa,
-                        (unsigned long long) s->len, (unsigned long long) ipa);
-                found_seg = true;
-                break;
-            }
-        }
+        bool found_seg = ipa < g->guest_size;
+        if (found_seg)
+            fprintf(stderr, "  HVF primary backing: ipa=0x%llx size=0x%llx\n",
+                    (unsigned long long) GUEST_IPA_BASE,
+                    (unsigned long long) g->guest_size);
         if (!found_seg) {
             const guest_mapping_t *m = guest_find_mapping(g, ipa);
             if (m) {
@@ -457,17 +449,12 @@ void crash_report(hv_vcpu_t vcpu,
         fprintf(stderr, "interp_base = 0x%llx  mmap_limit = 0x%llx\n",
                 (unsigned long long) g->interp_base,
                 (unsigned long long) g->mmap_limit);
-        fprintf(stderr, "nregions    = %d  hvf_segments = %d\n", g->nregions,
-                g->n_segments);
+        fprintf(stderr, "nregions    = %d\n", g->nregions);
         fprintf(stderr, "ttbr0       = 0x%llx\n\n",
                 (unsigned long long) g->ttbr0);
 
-        /* Translation diagnostics for the faulting PC. Helps decide whether an
-         * inst-abort or data-abort came from a stage-1 PT entry that went away
-         * (L3 INVALID after an unrelated mprotect / munmap) or from a stage-2
-         * backing hole (for example, an hvf_segment_split that left no covering
-         * entry). Data aborts also dump FAR when it differs from PC because FAR
-         * is the actual load/store fault address.
+        /* Dump stage-1 translation and stage-2 backing for PC and FAR to
+         * distinguish permission faults from missing backing.
          */
         if (vcpu) {
             uint64_t pc = 0, esr = 0, far_reg = 0;

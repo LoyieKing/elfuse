@@ -842,6 +842,91 @@ all owners. The existing pipe-bulk performance ceilings remain unchanged.
 CPU exits the group; scheduler shutdown must release its condition wait.
 Wait, stopped-tracee and fork-barrier cases retain exit status 42.
 
+## Anonymous backing policies
+
+`make test-memory-mode` runs private zero fill, fixed replacement, discard,
+fork isolation and concurrent reset under both policies. `make
+test-memory-residency` checks untouched, written, discarded and `PROT_NONE`
+backing through `mincore`. `make test-mmap-private` checks private file writes,
+host-page edges, fork, initial `PROT_NONE`, EOF tails and mremap under both
+policies. Both aarch64 matrices run the default lazy guest cases.
+
+```sh
+make elfuse test-memory-mode test-memory-residency test-mmap-private
+bash tests/qemu-runner.sh exec /mnt/host/build/test-memory-mode
+```
+
+`mincore`, guest `VmRSS` and stat RSS query actual host backing residency.
+The reporting granule is still the host page: four 4 KiB guest pages can share
+one resident 16 KiB host page. Host process RSS also includes elfuse/HVF and
+shared cached files; Darwin `phys_footprint` excludes much of the shared slab.
+Record matching DEX, heap limit, JIT flags and GC work for comparisons.
+
+On Apple M4 Pro, anonymous lazy reset releases complete 16 KiB host pages.
+A 128 MiB write/discard probe returned host RSS from 145.8 MiB to 17.8 MiB.
+The same Linux/HVF probe returned from 128.3 MiB to its 0.3 MiB process baseline.
+Both checked zero fill after discard. A 64 MiB sparse-touch refill measured
+about 5 ms under elfuse; Linux with THP enabled measured 0.45 ms. Linux THP
+provides a physical-page advantage that guest 2 MiB page-table blocks do not.
+
+Android 16 QPR2 ART with `-Xmx128m`, JIT thresholds 10/100 and the identical
+zero-checked 256-byte-object DEX measured lazy medians of 59.22/58.51/60.36 M
+objects/s across three runs of five one-second rounds. Linux/HVF measured
+48.51 M objects/s in the matching initial run and 16.76/25.80/55.91 M/s in a
+later three-run sample (8 vCPUs, 4 GiB, 4 KiB pages, THP always). The strongest
+Linux run is within about 6% of elfuse's median-of-medians; host scheduling and
+warmup variability prevent a general claim of superiority. All runs completed
+with `MEM_OK`.
+
+Fork synchronizes private anonymous and file-CoW backing into its cloned file.
+This trades some fork cost for lower GC reset cost; fork-heavy applications
+must be benchmarked separately. The shell fork benchmark includes process
+spawn and should not be read as a page-table-only CoW cost.
+
+The pre-recovery baseline for untouched 64 MiB private file mmap/unmap was
+11.6 us under elfuse and 2.0 us under Linux. Both verified file/CoW bytes after
+access and discard. The corresponding full checks reported 325 PASS, 0 FAIL
+and 10 SKIP in the aarch64 matrix and a passing throughput guardrail. Linux
+passed the memory-mode, residency and private-file regression binaries.
+
+Bounded recovery runs with eager file page tables and redundant backing resets
+removed measured 19.91/12.14/12.35 us for the same file probe. This variation
+does not establish a stable speedup over the 19.82 us immediate baseline.
+Private-file regressions passed all 47 checks under both backing policies;
+the residency regression passed all eight. Anonymous regressions passed under
+both policies, including fork isolation, concurrent reset and exec after
+discard. Anonymous 64 MiB discard/refill measured 0.533/5.047 ms. Standalone
+ART exited successfully with
+`ART_ARM64_OK sum=5000050000 threads=40000`. Formatting, atomics, ASCII,
+skill references, EINTR contracts, lock order, syscall coverage and shim
+return-tail checks passed. The full matrix, Linux VM and ART throughput
+workload were not rerun during recovery.
+
+Pre-commit serial `make check` passed all 107 driver entries, host unit tests,
+shared lanes, both memory policies and the static/dynamic-glibc throughput
+guardrail. The aarch64 matrix reported 325 PASS, 0 FAIL and 10 SKIP. All 76
+Rosetta-specific checks passed with native macOS tools selected through PATH;
+an initial run selected guest tools while building its host-side corpus and
+failed before the Alpine checks. `make check-format` and the source
+security/newline scans passed. Linux/QEMU and ART throughput were not rerun.
+
+## Host panic safety
+
+On macOS 26.5.1 (25F80), two SPTM kernel panics named the standalone
+hvprobe process and reported VIOLATION_ILLEGAL_MAPPING_TYPE at IPA 0x4000.
+The probe used executable host backing for guest code; the exact mapping
+combination that triggered the kernel defect is unconfirmed. This probe must
+not be rerun on a development workstation. A process timeout cannot contain
+a kernel panic. Keep diagnostic artifacts without executing their binaries.
+
+Recovery validation uses the established elfuse bootstrap and host RW slab,
+with guest page tables enforcing execution permissions. Run one bounded
+guest at a time, build with limited parallelism, and do not resume interrupted
+probe jobs. Avoid standalone HVF experiments with RX/RO host backing,
+superpages, or in-place reclaim of live HVF memory. Preserve panic reports
+before testing. A kernel-fault experiment requires a disposable machine and
+explicit approval; a guest VM on the same macOS host is not containment.
+
 ## Validation Strategy By Change Type
 
 Suggested minimum validation:

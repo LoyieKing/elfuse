@@ -58,6 +58,24 @@ check()
     report_pass "$desc"
 }
 
+# check_missing_value <desc> <flag>
+#   check appends the guest path, which a bare value-taking flag would consume.
+#   This lane invokes elfuse with nothing after the flag so the parser's
+#   missing-value arm is the one under test.
+check_missing_value()
+{
+    local desc="$1" flag="$2"
+    local out status=0
+    out="$("$ELFUSE" "$flag" 2>&1)" || status=$?
+    if [ "$status" -eq 0 ] \
+        || ! printf '%s' "$out" | grep -qF "invalid --memory-mode"; then
+        report_fail "$desc (exit $status, want a rejection naming the flag)"
+        printf '%s\n' "$out" >&2
+        return
+    fi
+    report_pass "$desc"
+}
+
 check reject "--fakeroot with a non-root --user" "cannot be combined" \
     --fakeroot --user 1000:1000
 check reject "--fakeroot with a root uid but non-root gid" "cannot be combined" \
@@ -71,6 +89,24 @@ check reject "--user GID with a sign" "invalid --user" --user 1000:+7
 check reject "--user empty GID" "invalid --user" --user 1000:
 # Both sides of parse_id_component's UINT32_MAX bail.
 check reject "--user one past UINT32_MAX" "invalid --user" --user 4294967296
+
+# --memory-mode changes physical backing, not guest bytes, so the launch path
+# merely has to accept both spellings in both modes and refuse every other value
+# before the guest runs. The value is case-sensitive and the absent flag is
+# lazy; guest-visible equivalence is tests/test-memory-mode.c's job.
+check accept "--memory-mode=lazy" '' --memory-mode=lazy
+check accept "--memory-mode=eager" '' --memory-mode=eager
+check accept "--memory-mode lazy" '' --memory-mode lazy
+check accept "--memory-mode eager" '' --memory-mode eager
+check_missing_value "--memory-mode without a value" --memory-mode
+check reject "--memory-mode empty value" "invalid --memory-mode" \
+    --memory-mode=
+check reject "--memory-mode unknown value" "invalid --memory-mode" \
+    --memory-mode=bogus
+check reject "--memory-mode space-separated unknown value" \
+    "invalid --memory-mode" --memory-mode bogus
+check reject "--memory-mode uppercase value" "invalid --memory-mode" \
+    --memory-mode=LAZY
 
 check reject "--env with an empty variable name" "empty variable name" \
     --env =VAL

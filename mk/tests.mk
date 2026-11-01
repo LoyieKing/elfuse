@@ -26,7 +26,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-mremap-tail-emfile \
         test-proctitle-host test-proctitle-low-stack test-rlimit-seed \
         test-sysroot-procfs-exec test-sysroot-fd-magiclink \
-        test-timeout-disable test-launch-flags \
+        test-timeout-disable test-launch-flags test-memory-mode test-memory-residency test-mmap-private \
         test-fuse-alpine \
         test-fstatat-empty-path \
         test-sysroot-nofollow test-sysroot-chdir test-sysroot-symlink-escape \
@@ -358,6 +358,9 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract ch
 	$(call run-lane,test-fuse-alpine,Alpine sysroot FUSE validation)
 	$(call run-lane,test-timeout-disable,timeout=0 validation)
 	$(call run-lane,test-launch-flags,launch flags)
+	$(call run-lane,test-memory-mode,memory policies)
+	$(call run-lane,test-memory-residency,physical residency)
+	$(call run-lane,test-mmap-private,private file mappings)
 	$(call run-lane,test-rosetta-cli,rosetta CLI gating)
 	$(call run-lane,test-bench-guardrail,hot-syscall guardrail)
 	$(call run-lane,test-sharun,sharun launcher and probe)
@@ -1258,6 +1261,17 @@ test-timeout-disable: $(ELFUSE_BIN) $(TEST_HELLO_DEP)
 test-launch-flags: $(ELFUSE_BIN) $(TEST_HELLO_DEP) $(TEST_ENV_DEPS)
 	@bash tests/test-launch-flags.sh $(ELFUSE_BIN) $(TEST_DIR)/test-hello \
 	    $(TEST_DIR)/test-env-dump $(TEST_DIR)/test-cat
+
+test-memory-mode: $(ELFUSE_BIN) $(TEST_DIR)/test-memory-mode
+	@$(ELFUSE_BIN) --memory-mode=lazy $(TEST_DIR)/test-memory-mode
+	@$(ELFUSE_BIN) --memory-mode=eager $(TEST_DIR)/test-memory-mode
+
+test-memory-residency: $(ELFUSE_BIN) $(TEST_DIR)/test-memory-residency
+	@$(ELFUSE_BIN) --memory-mode=lazy $(TEST_DIR)/test-memory-residency
+
+test-mmap-private: $(ELFUSE_BIN) $(TEST_DIR)/test-mmap-private
+	@$(ELFUSE_BIN) --memory-mode=lazy $(TEST_DIR)/test-mmap-private
+	@$(ELFUSE_BIN) --memory-mode=eager $(TEST_DIR)/test-mmap-private
 
 ## Check the --help and argument-error usage synopses against each other
 test-usage-synopsis: $(ELFUSE_BIN)

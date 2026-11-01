@@ -17,6 +17,32 @@
 #include "core/guest.h"
 
 typedef struct mmap_fork_anon_shared_txn mmap_fork_anon_shared_txn_t;
+struct thread_entry;
+
+/* Reset private GPA backing to zero. Lazy mode releases whole host pages; eager
+ * mode zeroes in place. Caller holds mmap_lock and removes file overlays before
+ * calling.
+ *
+ * Returns 0 or a negative Linux errno.
+ */
+int guest_memory_reset_range(guest_t *g, uint64_t gpa, uint64_t len);
+
+/* Query physical backing residency, one byte per guest page. Caller holds
+ * mmap_lock.
+ *
+ * Returns 0 or a negative Linux errno.
+ */
+int guest_memory_residency(const guest_t *g,
+                           uint64_t gpa,
+                           uint64_t len,
+                           unsigned char *vec);
+
+/* Synchronize primary guest backing into an independent fork snapshot fd.
+ * Caller holds mmap_lock and has quiesced siblings.
+ *
+ * Returns 0 or a negative Linux errno.
+ */
+int guest_memory_snapshot(const guest_t *g, int fd);
 
 /* brk: set/query program break */
 int64_t sys_brk(guest_t *g, uint64_t addr);
@@ -51,7 +77,7 @@ int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice);
 int64_t sys_msync(guest_t *g, uint64_t addr, uint64_t length, int flags);
 
 /* Apply deferred guest-stack munmap work for an exiting thread. */
-void mem_cleanup_deferred_stack_unmaps(guest_t *g, thread_entry_t *t);
+void mem_cleanup_deferred_stack_unmaps(guest_t *g, struct thread_entry *t);
 
 /* Fork preparation: convert MAP_SHARED|MAP_ANONYMOUS regions that have no
  * backing fd into memfd-backed overlay regions. Each converted region gets a

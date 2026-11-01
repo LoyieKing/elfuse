@@ -83,6 +83,12 @@ typedef struct {
     int timeout_sec;
 
     bool verbose;
+
+    /* Host-side policy for retiring guest ranges that must read back zero;
+     * guest_reset and the syscall surface both consult it. Zero
+     * (GUEST_MEMORY_LAZY) is the default.
+     */
+    guest_memory_mode_t memory_mode;
 } launch_args_t;
 
 /* Diagnostic for rejecting --gdb on an x86_64 (Rosetta) guest, shared by

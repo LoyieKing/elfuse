@@ -157,6 +157,9 @@ test-cross-fork-mapshared          # diff=skip
 
 [section] madvise MADV_DONTNEED tests
 test-madvise
+test-memory-mode
+test-memory-residency
+test-mmap-private
 
 [section] PI futex + EINTR regression tests
 test-futex-pi                  # diff=skip

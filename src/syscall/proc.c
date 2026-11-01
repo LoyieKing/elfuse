@@ -4633,9 +4633,8 @@ static bool vcpu_handle_el0_fault(guest_t *g,
         return sig_ret >= 0;
     }
 
-    /* Instruction or data abort. Try lazy page materialization before declaring
-     * SIGSEGV: translation faults (xFSC[5:2] == 0x1) may come from a
-     * MAP_NORESERVE region with deferred page-table creation.
+    /* MAP_NORESERVE translations fault until their L2 entry is materialized.
+     * Backing remains demand-paged by the host.
      */
     uint32_t fsc = (uint32_t) (esr & 0x3F);
     uint32_t fsc_type = (fsc >> 2) & 0xF;

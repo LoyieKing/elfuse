@@ -99,6 +99,13 @@ void vcpu_pool_kick_all_mounted(void);
  */
 int vcpu_pool_membarrier(bool sync_core);
 
+/* Stop guest entry while private backing is replaced. Host syscall handlers may
+ * keep running; their host VAs remain stable. Caller holds mmap_lock and pairs
+ * every pause with resume, including failures.
+ */
+void vcpu_pool_memory_pause(void);
+void vcpu_pool_memory_resume(void);
+
 /* Owner-side acknowledgement for the shim's HVC #14 trampoline tail.
  *
  * Returns false when no SYNC_CORE generation is in flight, which the HVC

@@ -70,6 +70,7 @@
 #include "syscall/fd.h"
 #include "syscall/fuse.h"
 #include "syscall/internal.h"
+#include "syscall/mem.h"
 #include "syscall/net-identity.h"
 #include "syscall/path.h"
 #include "syscall/proc.h"
@@ -104,6 +105,7 @@ typedef struct {
     uint64_t start, end;
     int prot, flags;
     uint64_t offset;
+    uint64_t resident_pages; /* host-resident guest pages, when queried */
     bool inherited_at_fork;
     bool dontfork;
     char name[64];
@@ -133,6 +135,7 @@ static int maps_entries_append_entry(maps_entries_t *entries,
                                      int prot,
                                      int flags,
                                      uint64_t offset,
+                                     uint64_t resident_pages,
                                      const char *name,
                                      bool inherited_at_fork,
                                      bool dontfork)
@@ -152,6 +155,7 @@ static int maps_entries_append_entry(maps_entries_t *entries,
         .end = end,
         .prot = prot,
         .flags = flags,
+        .resident_pages = resident_pages,
         .offset = offset,
         .inherited_at_fork = inherited_at_fork,
         .dontfork = dontfork,
@@ -1603,6 +1607,37 @@ static void proc_task_collect_cb(thread_entry_t *t, void *arg)
     c->tids[c->ntids++] = thread_tid(t);
 }
 
+/* Resident guest pages in [start, end), a page-aligned subrange of region r.
+ * Caller holds mmap_lock.
+ *
+ * Returns 0, or the backing store's negative errno, which callers propagate: a
+ * snapshot that cannot measure residency must not report the unmeasured pages
+ * as absent.
+ */
+static int proc_region_resident_pages(const guest_t *g,
+                                      const guest_region_t *r,
+                                      uint64_t start,
+                                      uint64_t end,
+                                      uint64_t *pages_out)
+{
+    unsigned char vec[512];
+    uint64_t resident = 0;
+    while (start < end) {
+        uint64_t pages = (end - start + GUEST_PAGE_SIZE - 1) / GUEST_PAGE_SIZE;
+        if (pages > sizeof(vec))
+            pages = sizeof(vec);
+        uint64_t len = pages * GUEST_PAGE_SIZE;
+        int rc = guest_memory_residency(g, r->gpa_base + (start - r->start),
+                                        len, vec);
+        if (rc < 0)
+            return rc;
+        for (uint64_t i = 0; i < pages; i++)
+            resident += vec[i] & 1;
+        start += len;
+    }
+    *pages_out = resident;
+    return 0;
+}
 
 /* Build the VMA list shared by /proc/self/maps and /proc/self/smaps, merging
  * contiguous regions[] runs that came from one mmap.
@@ -1611,9 +1646,14 @@ static void proc_task_collect_cb(thread_entry_t *t, void *arg)
  * Snapshot and merge while mmap_lock is held, then release it before formatting
  * output so readers never observe a torn VMA or metadata record and output
  * generation does not block page-table mutations.
+ *
+ * with_residency also asks the backing store for each region's resident pages
+ * under the same lock, so each smaps block pairs its VMA with the residency
+ * measured for it.
  */
 static int proc_build_maps_entries(const guest_t *g,
-                                   maps_entries_t *entries_out)
+                                   maps_entries_t *entries_out,
+                                   bool with_residency)
 {
     if (!g || !entries_out) {
         errno = EINVAL;
@@ -1639,6 +1679,15 @@ static int proc_build_maps_entries(const guest_t *g,
         const guest_region_t *r = &g->regions[i];
         uint64_t start = r->start & ~0xFFFULL;
         uint64_t end = maps_align_up_page(r->end);
+        uint64_t resident = 0;
+        if (with_residency) {
+            int rc =
+                proc_region_resident_pages(g, r, r->start, r->end, &resident);
+            if (rc < 0) {
+                errno = (rc == -LINUX_ENOMEM) ? ENOMEM : EIO;
+                goto out_unlock;
+            }
+        }
         size_t count = maps_entries_count(&entries);
         maps_entry_t *last =
             count > 0 ? maps_entries_at(&entries, count - 1) : NULL;
@@ -1647,11 +1696,12 @@ static int proc_build_maps_entries(const guest_t *g,
             last->inherited_at_fork == r->inherited_at_fork &&
             last->dontfork == r->dontfork && !strcmp(last->name, r->name)) {
             last->end = end;
+            last->resident_pages += resident;
             continue;
         }
         if (maps_entries_append_entry(&entries, start, end, r->prot, r->flags,
-                                      r->offset, r->name, r->inherited_at_fork,
-                                      r->dontfork) < 0)
+                                      r->offset, resident, r->name,
+                                      r->inherited_at_fork, r->dontfork) < 0)
             goto out_unlock;
     }
 
@@ -1730,7 +1780,7 @@ static int proc_finish_maps_output(int result,
 static int proc_open_self_maps(const guest_t *g)
 {
     maps_entries_t entries = {0};
-    int nentries = proc_build_maps_entries(g, &entries);
+    int nentries = proc_build_maps_entries(g, &entries, false);
     if (nentries < 0)
         return -1;
 
@@ -1766,19 +1816,19 @@ out:
     return proc_finish_maps_output(result, &entries, &builder);
 }
 
-/* Emit a Linux-shaped /proc/self/smaps approximation. The runtime tracks guest
- * VMAs and logical fork snapshots, but it cannot observe kernel page residency
- * or dirty bits on the host. Writable private anonymous VMAs that were present
- * in the most recent fork snapshot report their full VMA size as Shared_Dirty,
- * Rss, Pss, and Pss_Dirty; keeping those counters aligned avoids a
- * self-contradictory snapshot while retaining a coarse fork-compatibility
- * signal. Newly-created VMAs are excluded. All other fields that require kernel
- * page accounting are stable zeroes.
+/* Emit a Linux-shaped /proc/self/smaps view. Addresses and sizes come from the
+ * tracked VMA list, and Rss is the host-resident part of each VMA, read from
+ * the backing store. The host cannot report per-page dirtiness or sharing, so
+ * resident pages are charged to one coarse class: a MAP_SHARED VMA, or a
+ * private writable one inherited from a fork snapshot, reports Shared_Dirty;
+ * other private VMAs report Private_Dirty. Pss and Pss_Dirty charge a possibly
+ * shared page at half, keeping both at or below Rss. Fields that need real
+ * kernel page accounting stay at zero.
  */
 static int proc_open_self_smaps(const guest_t *g)
 {
     maps_entries_t entries = {0};
-    int nentries = proc_build_maps_entries(g, &entries);
+    int nentries = proc_build_maps_entries(g, &entries, true);
     if (nentries < 0)
         return -1;
 
@@ -1801,12 +1851,13 @@ static int proc_open_self_smaps(const guest_t *g)
         bool noreserve = (e->flags & LINUX_MAP_NORESERVE) != 0;
         bool private_anon =
             (e->flags & LINUX_MAP_PRIVATE) && anonymous && !shared;
-        bool logical_shared_dirty = e->inherited_at_fork && private_anon &&
-                                    (e->prot & LINUX_PROT_WRITE);
-        uint64_t shared_dirty_kb = logical_shared_dirty ? size_kb : 0;
-        uint64_t rss_kb = shared_dirty_kb;
-        uint64_t pss_kb = shared_dirty_kb;
-        uint64_t pss_dirty_kb = shared_dirty_kb;
+        bool fork_shared = e->inherited_at_fork && private_anon &&
+                           (e->prot & LINUX_PROT_WRITE);
+        uint64_t rss_kb = e->resident_pages * (GUEST_PAGE_SIZE / 1024);
+        uint64_t shared_dirty_kb = (shared || fork_shared) ? rss_kb : 0;
+        uint64_t private_dirty_kb = rss_kb - shared_dirty_kb;
+        uint64_t pss_kb = rss_kb - shared_dirty_kb / 2;
+        uint64_t pss_dirty_kb = pss_kb;
 
         /* Linux writes a separating space after VmFlags:, even when no
          * evidence-based flags are available (for example a PROT_NONE VMA).
@@ -1857,7 +1908,7 @@ static int proc_open_self_smaps(const guest_t *g)
                 "Shared_Clean: 0 kB\n"
                 "Shared_Dirty: %llu kB\n"
                 "Private_Clean: 0 kB\n"
-                "Private_Dirty: 0 kB\n"
+                "Private_Dirty: %llu kB\n"
                 "Referenced: 0 kB\n"
                 "Anonymous: 0 kB\n"
                 "KSM: 0 kB\n"
@@ -1875,7 +1926,8 @@ static int proc_open_self_smaps(const guest_t *g)
                 header_len, header, (unsigned long long) size_kb,
                 (unsigned long long) rss_kb, (unsigned long long) pss_kb,
                 (unsigned long long) pss_dirty_kb,
-                (unsigned long long) shared_dirty_kb, vmflags) < 0)
+                (unsigned long long) shared_dirty_kb,
+                (unsigned long long) private_dirty_kb, vmflags) < 0)
             goto out;
     }
 
@@ -2532,17 +2584,29 @@ static int intercept_open_dispatch(const guest_t *g,
     /* /proc/self/status -> synthetic process status */
     if (!strcmp(path, "/proc/self/status")) {
         /* VmSize is total_vm, which leaves out [shim] and [shim-data]. VmRSS
-         * approximates residency as the non-PROT_NONE part of it, since HVF
-         * cannot report which pages are resident.
+         * sums the pages the backing store reports resident for the same
+         * regions, so a PROT_NONE page that was faulted in still counts, as it
+         * does on Linux.
          */
         uint64_t vm_size_kb = 0, vm_rss_kb = 0;
+        int query_err = 0;
+        mmap_lock_acquire();
         for (int i = 0; i < g->nregions; i++) {
             const guest_region_t *r = &g->regions[i];
             if (!guest_region_in_process_vm(g, r))
                 continue;
+            uint64_t resident = 0;
+            query_err =
+                proc_region_resident_pages(g, r, r->start, r->end, &resident);
+            if (query_err < 0)
+                break;
             vm_size_kb += r->end - r->start;
-            if (r->prot != LINUX_PROT_NONE)
-                vm_rss_kb += r->end - r->start;
+            vm_rss_kb += resident * GUEST_PAGE_SIZE;
+        }
+        mmap_lock_release();
+        if (query_err < 0) {
+            errno = (query_err == -LINUX_ENOMEM) ? ENOMEM : EIO;
+            return -1;
         }
         vm_size_kb /= 1024;
         vm_rss_kb /= 1024;
@@ -2653,7 +2717,7 @@ static int intercept_open_dispatch(const guest_t *g,
         return proc_open_self_maps(g);
 
     /* /proc/self/smaps -> Linux-shaped VMA blocks with tracked VMA metadata and
-     * the coarse fork Shared_Dirty/Rss/Pss/Pss_Dirty compatibility signal.
+     * backing-store resident Rss, plus the coarse fork Shared_Dirty signal.
      */
     if (!strcmp(path, "/proc/self/smaps"))
         return proc_open_self_smaps(g);
@@ -2984,16 +3048,28 @@ static int intercept_open_dispatch(const guest_t *g,
         proc_task_priority(leader, &priority, &nice);
         char state = proc_task_state_char(leader);
 
-        /* vsize and rss cover the regions VmSize and VmRSS count. */
+        /* vsize and rss cover the regions VmSize and VmRSS count; rss counts
+         * only host-resident pages.
+         */
         uint64_t vsize = 0, rss_pages = 0;
+        int query_err = 0;
+        mmap_lock_acquire();
         for (int i = 0; i < g->nregions; i++) {
             const guest_region_t *r = &g->regions[i];
             if (!guest_region_in_process_vm(g, r))
                 continue;
-            uint64_t sz = r->end - r->start;
-            vsize += sz;
-            if (r->prot != LINUX_PROT_NONE) /* non-PROT_NONE = resident */
-                rss_pages += sz / GUEST_PAGE_SIZE;
+            uint64_t resident = 0;
+            query_err =
+                proc_region_resident_pages(g, r, r->start, r->end, &resident);
+            if (query_err < 0)
+                break;
+            vsize += r->end - r->start;
+            rss_pages += resident;
+        }
+        mmap_lock_release();
+        if (query_err < 0) {
+            errno = (query_err == -LINUX_ENOMEM) ? ENOMEM : EIO;
+            return -1;
         }
 
         uint64_t start_stack = proc_start_stack(g);

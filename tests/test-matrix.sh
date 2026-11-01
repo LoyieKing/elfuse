@@ -392,10 +392,8 @@ QEMU_SKIP="
 #   under elfuse, while a real kernel allows the open and only rejects the
 #   write -- a genuine behavioral difference worth reviewing on its own,
 #   not just an environment artifact.
-# test-proc-smap: validates elfuse's synthetic smaps VMA snapshot, including
-#   per-VMA Shared_Dirty inheritance and exclusion of post-fork VMAs. Real
-#   Linux smaps exposes kernel-owned VMA/page accounting instead, so this is
-#   intentionally not a reference-kernel invariant.
+# test-proc-smap: validates elfuse's VMA snapshot and VmFlags. Linux exposes
+#   kernel-owned VMAs whose split/merge layout differs from the guest tracker.
 # test-fuse-reply: probes uniques one past the stalled request, which matches
 #   elfuse's consecutive numbering; a real kernel steps uniques by two and reads
 #   an odd one as an interrupt reply, refusing it with EINVAL, not ENOENT.
@@ -964,6 +962,9 @@ run_unit_tests()
 
     printf "\nmadvise MADV_DONTNEED\n"
     test_rc "$runner" "test-madvise" 0 "$bindir/test-madvise"
+    test_rc "$runner" "test-memory-mode" 0 "$bindir/test-memory-mode"
+    test_rc "$runner" "test-memory-residency" 0 "$bindir/test-memory-residency"
+    test_rc "$runner" "test-mmap-private" 0 "$bindir/test-mmap-private"
 
     printf "\nmadvise MADV_DONTFORK/DOFORK\n"
     test_rc "$runner" "test-madvise-fork" 0 "$bindir/test-madvise-fork"

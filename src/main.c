@@ -83,6 +83,23 @@ static bool parse_id_component(const char *s, const char **end, uint32_t *out)
     return true;
 }
 
+/* --memory-mode takes lazy or eager. The choice is host-side only: either way a
+ * retired range reads back as zero, so nothing in the launch path below the
+ * option depends on it.
+ */
+static int parse_memory_mode_arg(const char *s, guest_memory_mode_t *out)
+{
+    if (!strcmp(s, "lazy")) {
+        *out = GUEST_MEMORY_LAZY;
+        return 0;
+    }
+    if (!strcmp(s, "eager")) {
+        *out = GUEST_MEMORY_EAGER;
+        return 0;
+    }
+    return -1;
+}
+
 static int resolve_guest_elf_host_path(const char *elf_guest_path,
                                        char *elf_host_path,
                                        size_t elf_host_path_sz,
@@ -212,7 +229,8 @@ static int host_dc_zva_assert(void)
  * (one copy had already lost the --gdb flags).
  */
 #define ELFUSE_USAGE_BODY(sep)                                             \
-    "usage: elfuse [--verbose] [--timeout N] [--sysroot PATH]" sep         \
+    "usage: elfuse [--verbose] [--timeout N] [--memory-mode MODE] "        \
+    "[--sysroot PATH]" sep                                                 \
     "[--create-sysroot PATH] [--no-rosetta] [--fakeroot] [--gdb PORT]" sep \
     "[--gdb-stop-on-entry] [--user UID[:GID]] [--workdir DIR]" sep         \
     "[--env KEY=VALUE] [--clear-env] <elf-path> [args...]"
@@ -237,6 +255,7 @@ int main(int argc, char **argv)
     syscall_hist_init();
 
     bool verbose = false;
+    guest_memory_mode_t memory_mode = GUEST_MEMORY_LAZY;
 
     /* x86_64-via-Rosetta is on by default; --no-rosetta or ELFUSE_NO_ROSETTA=1
      * disables it. Architecture is auto-detected from the ELF header in
@@ -313,6 +332,8 @@ int main(int argc, char **argv)
                 "  -v, --verbose           Trace each guest syscall\n"
                 "  --timeout N             vCPU watchdog period "
                 "(seconds, default 10; 0 disables)\n"
+                "  --memory-mode MODE      Guest memory reset: lazy discards "
+                "pages, eager zeroes\n"
                 "  --sysroot PATH          Resolve absolute guest paths under "
                 "PATH first\n"
                 "  --create-sysroot PATH   Provision and use a case-sensitive "
@@ -366,6 +387,27 @@ int main(int argc, char **argv)
                 0)
                 timeout_sec = 10;
             arg_start += 2;
+        } else if (!strcmp(argv[arg_start], "--memory-mode") ||
+                   !strncmp(argv[arg_start], "--memory-mode=", 14)) {
+            bool inline_value = argv[arg_start][13] == '=';
+            const char *value = NULL;
+            if (inline_value)
+                value = argv[arg_start] + 14;
+            else if (arg_start + 1 < argc)
+                value = argv[arg_start + 1];
+            if (!value) {
+                log_error(
+                    "invalid --memory-mode: missing value (want lazy or "
+                    "eager)");
+                goto cleanup;
+            }
+            if (parse_memory_mode_arg(value, &memory_mode) < 0) {
+                log_error(
+                    "invalid --memory-mode value: '%s' (want lazy or eager)",
+                    value);
+                goto cleanup;
+            }
+            arg_start += inline_value ? 1 : 2;
         } else if (!strcmp(argv[arg_start], "--fork-child") &&
                    arg_start + 1 < argc) {
             if (parse_int_arg(argv[arg_start + 1], 0, INT_MAX, &fork_child_fd) <
@@ -780,6 +822,7 @@ int main(int argc, char **argv)
         .gdb_stop_on_entry = gdb_stop_on_entry,
         .timeout_sec = timeout_sec,
         .verbose = verbose,
+        .memory_mode = memory_mode,
     };
 
     /* Ownership of the temp unlink transfers here (contract in launch.h); drop

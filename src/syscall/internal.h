@@ -121,6 +121,8 @@
  *   slice_lock (runtime/sched/vcpu_pool.c): timer deadlines; nests sched_lock
  *   barrier_lock (runtime/sched/vcpu_pool.c): serializes barrier generations;
  *                                     nests per-slot handle_lock for kicks
+ *   memory_lock (runtime/sched/vcpu_pool.c): guest entry during backing reset;
+ *                                     nests per-slot handle_lock for kicks
  *   cwd_lock     (syscall/proc-state.c): cached guest cwd. A leaf on every
  *                                     path but one: proc_acquire_cwd_view
  *                                     returns still holding it, and both

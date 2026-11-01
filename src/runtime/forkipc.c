@@ -206,6 +206,16 @@ int fork_child_main(int ipc_fd,
         return 1;
     }
 
+    /* The mode picks how guest_reset recycles the slab; an out-of-range value
+     * means the peer speaks a protocol this binary does not know.
+     */
+    if (hdr.memory_mode > GUEST_MEMORY_EAGER) {
+        log_error("fork-child: invalid memory_mode %u",
+                  (unsigned) hdr.memory_mode);
+        close(ipc_fd);
+        return 1;
+    }
+
     /* Create guest memory before receiving state so all incoming offsets can be
      * bounds-checked against the negotiated guest size.
      */
@@ -224,7 +234,8 @@ int fork_child_main(int ipc_fd,
             return 1;
         }
         if (guest_init_from_shm(&g, shm_fd, hdr.guest_size, hdr.ipa_bits,
-                                hdr.shm_is_clone != 0) < 0) {
+                                hdr.shm_is_clone != 0,
+                                (guest_memory_mode_t) hdr.memory_mode) < 0) {
             log_error("fork-child: guest_init_from_shm failed");
             close(ipc_fd);
             return 1;
@@ -232,7 +243,8 @@ int fork_child_main(int ipc_fd,
         log_debug("fork-child: CoW fork via shm fd");
     } else {
         /* Legacy fork copies selected guest memory regions over IPC. */
-        if (guest_init(&g, hdr.guest_size, hdr.ipa_bits) < 0) {
+        if (guest_init(&g, hdr.guest_size, hdr.ipa_bits,
+                       (guest_memory_mode_t) hdr.memory_mode) < 0) {
             log_error("fork-child: failed to init guest");
             close(ipc_fd);
             return 1;
@@ -1303,35 +1315,15 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     if (mmap_fork_prepare_anon_shared_locked(g, &anon_shared_txn) < 0)
         goto fail_snapshot;
 
-    /* CoW fast path: if shm_fd >= 0, send a snapshot of guest memory to the
-     * child instead of the per-region copy. The child maps that snapshot
-     * MAP_PRIVATE; subsequent writes on either side are private.
-     *
-     * The parent's own mapping cannot be flipped to MAP_PRIVATE here: hv_vm_map
-     * caches the host VA->PA mapping, and a MAP_FIXED remap invalidates it (the
-     * parent then reads stale memory and writev returns EFAULT). So the parent
-     * stays on MAP_SHARED and the snapshot is what isolates the child.
-     *
-     * Two snapshot sources, in preference order (selected just below):
-     *   1. fclonefileat of g->shm_fd to an independent APFS clone. The clone
-     *      shares blocks with the parent until either side writes, so the
-     *      parent's subsequent writes never reach the child's backing.
-     *   2. The live g->shm_fd. Any page the child has not yet COW'd reads the
-     *      parent's current bytes -- benign for typical guest state, but
-     *      corrupts Rosetta's translator-internal structures (TLS slabs, code
-     *      caches, indirect-call tables) on mid-update reads. Issue #45.
-     *
-     * Rosetta therefore requires path 1 and falls back to region copy if
-     * fclonefileat fails; native guests accept path 2 as a fallback so a
-     * non-APFS /tmp does not silently slow forks down to per-region copy cost.
+    /* Clone the slab file, then synchronize anonymous and private-file backing
+     * that was replaced at the host VA. The independent file preserves CoW
+     * isolation. Without a clone, copy regions rather than send a live file
+     * whose untouched child pages could observe later parent writes.
      */
     bool use_shm = (g->shm_fd >= 0);
 
-    /* Overlay sync runs before the snapshot so the cloned file picks up the
-     * overlay-backed bytes. The parent's host VA for each overlay region maps
-     * the overlay file, not shm_fd, so shm_fd's contents at those offsets are
-     * stale (typically zero) until the pwrite below copies them in. Both the
-     * clone-fd path and the live-shm_fd fallback consume this sync.
+    /* Shared overlays reference their file rather than shm_fd. Synchronize them
+     * before cloning so the snapshot file includes their current bytes.
      */
     if (use_shm) {
         for (int i = 0; i < g->nregions; i++) {
@@ -1362,28 +1354,15 @@ int64_t sys_clone(hv_vcpu_t vcpu,
             }
         }
 
-        /* Attempt the APFS clone snapshot for every guest, not just Rosetta:
-         * the clone gives POSIX-style isolation at O(metadata) cost and avoids
-         * torn-snapshot reads in guests that snapshot their own state across
-         * fork (Redis BGSAVE, checkpointing runtimes). On failure the fallback
-         * differs per design above: Rosetta drops use_shm so the region-copy
-         * path runs; native guests keep use_shm and send the live g->shm_fd.
+        /* The clone supplies an independent snapshot file; synchronization
+         * below also copies resident anonymous backing and private file CoW.
          */
         snapshot_shm_fd = fork_snapshot_shm_via_clonefile(g->shm_fd);
-        if (snapshot_shm_fd < 0) {
-            if (g->is_rosetta) {
-                log_warn(
-                    "clone: rosetta CoW snapshot via fclonefileat failed "
-                    "(%s); falling back to region-copy path",
-                    strerror(errno));
-                use_shm = false;
-            } else {
-                log_debug(
-                    "clone: CoW snapshot via fclonefileat failed (%s); "
-                    "sending live shm fd as fallback",
-                    strerror(errno));
-            }
-        }
+        if (snapshot_shm_fd >= 0 &&
+            guest_memory_snapshot(g, snapshot_shm_fd) < 0)
+            goto fail_snapshot;
+        if (snapshot_shm_fd < 0)
+            use_shm = false;
     }
 
     /* Snapshot of the semantic region array, populated after the memory dump
@@ -1430,6 +1409,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
             flags & (LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID),
         .ctid_gva = ctid_gva,
         .shm_is_clone = (snapshot_shm_fd >= 0) ? 1 : 0,
+        .memory_mode = (uint32_t) g->memory_mode,
     };
     sched_task_get_attr(current_thread, &hdr.sched_attr);
     (void) sched_task_get_affinity(current_thread, hdr.cpu_affinity,

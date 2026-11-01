@@ -48,6 +48,7 @@
 #include "debug/log.h"
 #include "utils.h"
 #include "syscall/linux-wire.h" /* LINUX_MAP_*, LINUX_PROT_* */
+#include "syscall/mem.h"
 
 /* Per-vCPU pending TLBI request. Zero-initialized in every host pthread by
  * virtue of TLS default-zeroing, which maps to TLBI_NONE.
@@ -435,7 +436,10 @@ static void tlbi_range_probe_run(void)
         lse2_raw != 0;
 }
 
-int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
+int guest_init(guest_t *g,
+               uint64_t size,
+               uint32_t ipa_bits,
+               guest_memory_mode_t memory_mode)
 {
     uint64_t t0;
 
@@ -443,6 +447,7 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
 
     memset(g, 0, sizeof(*g));
     g->shm_fd = -1;
+    g->memory_mode = memory_mode;
     g->ipa_base = GUEST_IPA_BASE;
     g->elf_load_min = ELF_DEFAULT_BASE;
     g->brk_base = BRK_BASE_DEFAULT;
@@ -520,7 +525,6 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
      */
     static const uint32_t slab_attempt_bits[] = {40, 38, 36};
     bool mapped = false;
-    size_t mapped_size = 0;
     for (size_t i = 0;
          i < sizeof(slab_attempt_bits) / sizeof(slab_attempt_bits[0]); i++) {
         uint32_t bits = slab_attempt_bits[i];
@@ -584,7 +588,6 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
                         HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
         startup_trace_step("hv_vm_map", t0);
         if (ret == HV_SUCCESS) {
-            mapped_size = try_size;
             mapped = true;
             log_info("guest: primary slab %u GiB (%u-bit) mapped",
                      (unsigned) (try_size >> 30), bits);
@@ -609,14 +612,6 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
         hv_vm_destroy();
         return -1;
     }
-    size = mapped_size;
-
-    /* Seed HVF segment list with one entry covering the whole slab. sys_mmap
-     * may later split this for MAP_SHARED file overlays.
-     */
-    g->segments[0] = (hvf_segment_t) {.ipa = GUEST_IPA_BASE, .len = size};
-    g->n_segments = 1;
-
     return 0;
 }
 
@@ -624,12 +619,14 @@ int guest_init_from_shm(guest_t *g,
                         int shm_fd,
                         uint64_t size,
                         uint32_t ipa_bits,
-                        bool retain_shared)
+                        bool retain_shared,
+                        guest_memory_mode_t memory_mode)
 {
     uint64_t t0;
 
     memset(g, 0, sizeof(*g));
     g->shm_fd = -1; /* Child does not own the shm unless retain_shared */
+    g->memory_mode = memory_mode;
     g->ipa_base = GUEST_IPA_BASE;
     g->elf_load_min = ELF_DEFAULT_BASE;
     g->brk_base = BRK_BASE_DEFAULT;
@@ -722,12 +719,6 @@ int guest_init_from_shm(guest_t *g,
         return -1;
     }
 
-    /* Seed HVF segment list. The child re-establishes any per-region file
-     * overlays the parent had after this call (handled by fork-state
-     * deserialization).
-     */
-    g->segments[0] = (hvf_segment_t) {.ipa = GUEST_IPA_BASE, .len = size};
-    g->n_segments = 1;
 
     log_debug(
         "guest: CoW fork: mapped %llu GiB from shm "
@@ -778,13 +769,8 @@ static void release_extra_mappings(guest_t *g)
 
 void guest_destroy(guest_t *g)
 {
-    /* Unmap each HVF segment. hv_vm_destroy releases all stage-2 state
-     * regardless, but unmapping explicitly keeps invariants clean for
-     * downstream tools (Instruments, leak detectors).
-     */
-    for (int i = 0; i < g->n_segments; i++)
-        hv_vm_unmap(g->segments[i].ipa, g->segments[i].len);
-    g->n_segments = 0;
+    if (g->host_base)
+        hv_vm_unmap(GUEST_IPA_BASE, g->guest_size);
 
     /* Release extra IPA mappings (rosetta segments etc.). hv_vm_destroy would
      * release Stage-2 state on its own; the explicit unmap inside the helper
@@ -1795,31 +1781,23 @@ int guest_read_str_small(const guest_t *g, uint64_t gva, char *dst, size_t max)
 
 void guest_reset(guest_t *g)
 {
-    /* Zero only actually-used memory regions. With a potentially 1TiB address
-     * space, memset of the entire range would fault in all demand-paged memory
-     * for no benefit. PROT_NONE regions (e.g., a managed runtime's heap
-     * reservation) were never written to, so they're already in the MAP_ANON
-     * zero-fill-on-demand state.
-     */
-
-    /* Zero tracked regions (ELF segments, heap, stack, mmap allocations). Skip
-     * PROT_NONE regions because they were never touched.
-     *
-     * Scrub by backing GPA, not by VA: identity-mapped regions have gpa_base ==
-     * start, but high-VA regions (rosetta) carry their VA in start/end and the
-     * real primary-buffer offset in gpa_base. Filtering by end <= guest_size
-     * alone would silently skip high-VA backing and leak bytes across a
-     * rosetta-to-rosetta execve.
+    /* Reset tracked backing by GPA, including pages made PROT_NONE after use.
+     * High-VA mappings record their physical offset in gpa_base. Overflow
+     * backing is released below; primary backing survives execve.
      */
     for (int i = 0; i < g->nregions; i++) {
         guest_region_t *r = &g->regions[i];
-        if (r->prot == 0 /* PROT_NONE */ || r->end <= r->start)
+        if (r->end <= r->start)
             continue;
         uint64_t len = r->end - r->start;
         uint64_t gpa = r->gpa_base;
         if (gpa > g->guest_size || len > g->guest_size - gpa)
             continue; /* backing lies outside the primary slab */
-        memset((uint8_t *) g->host_base + gpa, 0, len);
+        int err = guest_memory_reset_range(g, gpa, len);
+        if (err < 0) {
+            log_fatal("execve: memory reset failed: %d", err);
+            exit(128);
+        }
     }
 
     /* Zero page table pool (not tracked in region array) */
@@ -3293,9 +3271,7 @@ int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end)
 
         uint64_t block_start = ALIGN_2MIB_DOWN(addr);
         uint64_t block_end = block_start + BLOCK_2MIB;
-
-        /* Not mapped at all: skip */
-        if (!(*l2_entry & 1)) {
+        if (!(*l2_entry & PT_VALID)) {
             addr = block_end;
             continue;
         }
@@ -3407,9 +3383,7 @@ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms)
 
         uint64_t block_start = ALIGN_2MIB_DOWN(addr);
         uint64_t block_end = block_start + BLOCK_2MIB;
-
-        /* Not mapped at all: skip */
-        if (!(*l2_entry & 1)) {
+        if (!(*l2_entry & PT_VALID)) {
             addr = block_end;
             continue;
         }
@@ -3664,13 +3638,6 @@ int guest_materialize_lazy(guest_t *g, uint64_t fault_offset)
     }
 
     guest_update_perms(g, materialize_start, materialize_end, perms);
-
-    /* Zero the materialized memory. Only zero within the region boundaries to
-     * avoid clobbering adjacent data.
-     */
-    if (materialize_end > materialize_start)
-        memset((uint8_t *) g->host_base + materialize_start, 0,
-               materialize_end - materialize_start);
 
     /* The page-table helpers above already requested the matching TLBI; no
      * additional flush is needed here.

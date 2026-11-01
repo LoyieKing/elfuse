@@ -235,6 +235,22 @@ Both `mmap_limit` and `interp_base` are computed at runtime from `guest_size`
 and stored in `guest_t`. macOS demand-pages physical memory on first touch,
 so the reservation costs no RAM until the guest writes to a page.
 
+`guest_t.memory_mode` selects private backing reset. Lazy mode detaches only
+the affected host-page-aligned stage-2 range, replaces it with anonymous
+backing and remaps that range. No slab-wide refresh or segment splitting is
+required. The vCPU pool pauses guest entry for this window; host syscall
+handlers retain stable host VAs and memory handlers serialize on `mmap_lock`.
+A stage-2 remap failure is fatal because guest execution cannot safely resume
+without its backing.
+
+On Apple Silicon, a 4 KiB guest page can share a 16 KiB host page with live
+neighbors. Only the fully covered host pages are released; edge bytes are
+zeroed in place. Eager mode zeroes the whole requested range in place.
+Shared anonymous mappings retain their object contents on `MADV_DONTNEED`;
+overlay teardown precedes any private slab reset. Fork clones inherit the
+policy and reset their own backing. Exec resets tracked `PROT_NONE` ranges too,
+since permission revocation does not imply that the pages were never written.
+
 The mmap RW region starts at 8 GiB to match real Linux kernel address-space
 layout, where `mmap` allocations sit well above text/data/brk.
 
@@ -556,21 +572,22 @@ goes above the structured area, never below. Post-push masking
 
 ### `mmap` Notes
 
-Aligned file-backed `MAP_SHARED` (fixed or non-fixed) installs a real
-host `mmap(MAP_FIXED|MAP_SHARED, fd)` overlay onto the guest slab so
-the kernel page cache keeps the mapping coherent with the file (and
-with peer overlays). The slab is tracked as a sorted list of
-2 MiB-aligned `hvf_segment_t` entries; each overlay request splits,
-unmaps, and re-`mmap`s the host file at the exact host VA, then
-re-maps the segment. Apple Silicon enforces 16 KiB host pages, so the
-gap-finder advances to the next host-page boundary after each
-allocation.
+Aligned file-backed `MAP_SHARED` installs a host shared file mapping;
+`MAP_PRIVATE` installs a host CoW file mapping, including writable private
+views opened through an `O_RDONLY` descriptor. Replacement refreshes only the
+host-page-aligned HVF range. Apple Silicon uses 16 KiB host pages, so the
+gap-finder advances to the next host-page boundary after each allocation.
 
-The snapshot `pread` emulation (zero first for pages beyond EOF, then
-overlay file content) is the fallback for the cases where the overlay
-path cannot be used: misaligned `MAP_FIXED`, `MAP_PRIVATE` file-backed
-mappings, and any time the host slab cannot accept a fresh overlay at
-the requested VA.
+Private mappings whose address, length or file offset is not host-page-aligned
+use a zero-filled `pread` snapshot. These edges preserve guest 4 KiB byte
+semantics but do not have file demand paging. Private discard remaps complete
+host pages from the file; partial host pages restore only requested bytes.
+Private unmap preserves neighboring bytes in shared host-page edges.
+
+Direct private file installation replaces the old backing without first
+resetting it to anonymous memory. Unmap resets plain slab pages and tears down
+file overlays once. Accessible file mappings install guest page tables eagerly;
+host file pages remain demand-paged.
 
 `MAP_SHARED|MAP_ANONYMOUS` is promoted before fork to a memfd-style
 overlay (`mmap_fork_prepare_anon_shared_locked`) and reattached in the child
@@ -746,35 +763,26 @@ reaper is currently provided.
 
 ### CoW Fork Path
 
-When `g->shm_fd >= 0` the guest memory is file-backed (`mkstemp` +
-`unlink`, `MAP_SHARED`). Fork takes an APFS `fclonefileat` snapshot of
-the backing file and sends the snapshot fd over `SCM_RIGHTS`:
+The primary slab starts as a shared sparse file. Anonymous resets can replace
+parts of its host VA with private anonymous backing; file-private mappings
+also have independent CoW pages. Fork clones the slab file with APFS
+`fclonefileat`, then synchronizes the current primary backing into that
+independent snapshot before sending its fd through `SCM_RIGHTS`.
 
-- The snapshot decouples the parent and child: subsequent parent writes
-  cannot be observed by the child even before the child remaps. APFS
-  copy-on-write keeps the snapshot cheap.
-- Parent stays on `MAP_SHARED` and does NOT remap -- HVF caches the host
-  VA->PA mapping from `hv_vm_map`, and a `MAP_FIXED` remap does not
-  update Stage-2, so a remapping parent would observe stale pages.
-- Child maps the snapshot fd `MAP_PRIVATE`, producing an instant CoW
-  clone with zero data copy.
-- The IPC header sets `has_shm = 1` and `num_regions = 0`, skipping memory
-  serialization entirely.
-- Child calls `guest_init_from_shm()` instead of `guest_init()`, and must
-  restore `g->ttbr0` from the IPC header -- `guest_init_from_shm` zeroes
-  the struct, and without `ttbr0` page-table walks fail for all high VAs.
+The synchronization walks bounded batches of Mach page dispositions. Resident,
+paged-out and external-file pages are copied; absent anonymous pages become
+holes in the snapshot. Residency alone is insufficient because compressed
+pages still contain data. Host-page edge bytes are copied exactly.
+The child maps an independent clone shared so nested fork can clone it again;
+later anonymous resets remain private to that process. Private file mappings
+retain snapshot bytes rather than reattaching the original file over them.
+If cloning is unavailable, fork uses the region-copy path and never lends the
+child a live parent slab file. The child restores `ttbr0` from the IPC header.
 - `MAP_SHARED|MAP_ANONYMOUS` regions are promoted to a memfd-style
   overlay before fork (`mmap_fork_prepare_anon_shared_locked`) and
   reattached in the child via SCM_RIGHTS (`mmap_fork_restore_overlays`) so
   cross-fork shared-memory coherence is preserved.
 
-This path is roughly 50x faster than the legacy IPC copy path on large
-guest memories.
-
-The CoW path is disabled when hosting Rosetta because HVF caches the host
-VA->PA mapping from `hv_vm_map`, and Rosetta's translated code touches
-the parent's slab in ways the snapshot model cannot intercept. Rosetta
-forks fall back to the legacy IPC copy path.
 
 macOS rejects `MAP_PRIVATE` on `shm_open` fds (`EINVAL`), so the backing
 file is created via `mkstemp` + `unlink`.
@@ -1605,12 +1613,13 @@ Shared_Hugetlb, Private_Hugetlb, Swap, SwapPss, Locked, THPeligible,
 VmFlags
 ```
 
-`Size` is the VMA length in KiB. `KernelPageSize` and `MMUPageSize` are
-reported as 4 KiB. In a fork child, writable private anonymous VMAs that
-existed in the parent's CoW snapshot report their full VMA size for
-`Shared_Dirty`, `Rss`, `Pss`, and `Pss_Dirty`, keeping those coarse counters
-internally consistent. Newly-created VMAs are excluded from that signal. Every
-other numeric counter, including `THPeligible`, is emitted as a stable zero.
+`Size` is the VMA length in KiB. `KernelPageSize` and `MMUPageSize` report the
+guest 4 KiB granule. `Rss` queries host backing residency, including written
+pages protected with `PROT_NONE`. One resident host page can cover four guest
+pages. Shared and fork-inherited private-anonymous writable VMAs charge their
+resident pages to `Shared_Dirty`; other private VMAs charge `Private_Dirty`.
+`Pss` and `Pss_Dirty` charge possibly shared pages at half. These sharing and
+dirty classifications are coarse VMA estimates, not Linux page mapcounts.
 `ProtectionKey` (a Linux pkeys field added in Linux 4.9) is intentionally
 omitted because the macOS host has no equivalent; consumers comparing against a
 real Linux kernel should treat it as optional. `VmFlags` is evidence-based and
@@ -1618,11 +1627,9 @@ contains only the permission, sharing and inheritance flags represented by the
 tracked VMA (`rd`, `wr`, `ex`, `sh`, `nr`, and `dc` when applicable); no
 untracked kernel flags are invented. A VMA with no such evidence still
 prints the field's separating space as `VmFlags: `.
-These are coarse VMA-level values, not host page-residency, dirty-bit, or
-proportional-sharing accounting, so they are suitable for fork-safety checks
-but not precise memory profiling. The fork-child marker is tracked per VMA, so
-writable private anonymous mappings created after fork are excluded from the
-compatibility signal. `smaps_rollup` is not implemented.
+`mincore`, `VmRSS` and stat RSS use backing residency; query failures return an
+error rather than report unmeasured pages as absent. Proportional sharing and
+dirty counters remain estimates. `smaps_rollup` is not implemented.
 
 Synthetic proc directories have explicit snapshot boundaries. The backing
 trees reached by opening `/proc` or `/proc/self` are materialized once, on the
@@ -2242,9 +2249,8 @@ Runtime integration:
   under `$HOME/.cache/elfuse-rosettad/`. First launch warms the cache;
   subsequent launches reuse translations.
 
-Fork interaction: the CoW shm fast path is disabled for Rosetta because
-HVF caches host VA-to-PA at `hv_vm_map` time. Rosetta forks use the
-legacy IPC copy path.
+Rosetta uses the same independent snapshot path as native guests. If APFS
+cloning is unavailable, fork copies the current backing through IPC.
 
 Dynamic linking under Rosetta is supported. For x86_64 guests with a
 `PT_INTERP` header, elfuse does not load the ELF segments or the

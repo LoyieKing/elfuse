@@ -40,6 +40,11 @@ not total process lifetime. CPU-bound work can trigger it legitimately;
 `--timeout 0` disables that limit. A task parked in a syscall is outside the
 execution watchdog. Diagnose a blocked wait from the harness timeout sample.
 
+A host kernel panic is outside the guest repro loop. Follow `docs/testing.md`,
+section "Host panic safety", before another run. Process timeouts do not
+contain a kernel panic; recovery uses bounded existing guests, never a
+standalone HVF mapping experiment on the workstation.
+
 ## Build a loop that goes red
 
 One command that fails on this bug and passes once it is fixed. Everything

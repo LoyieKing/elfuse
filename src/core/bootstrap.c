@@ -371,6 +371,7 @@ int guest_bootstrap_prepare(guest_t *g,
                             const unsigned char *shim_bin,
                             size_t shim_bin_len,
                             bool verbose,
+                            guest_memory_mode_t memory_mode,
                             bool *guest_initialized,
                             guest_bootstrap_t *boot)
 {
@@ -418,7 +419,7 @@ int guest_bootstrap_prepare(guest_t *g,
      */
     uint32_t req_ipa = want_rosetta ? 48 : 0;
     t0 = startup_trace_now_ns();
-    if (guest_init(g, 0, req_ipa) < 0) {
+    if (guest_init(g, 0, req_ipa, memory_mode) < 0) {
         log_error("failed to initialize guest");
         return -1;
     }
