@@ -46,9 +46,13 @@ bool path_prefix_match(const char *path, const char *prefix, size_t plen)
 #define SYSFS_PREFIX "/sys"
 #define DEV_USB_PREFIX "/dev/bus"
 
-static size_t bare_len(const char *path)
+/* The length of @path once its directory requirement is taken off: trailing
+ * separators, and a final "." that carries one. @len is strlen(@path), passed
+ * in because every caller has it and the test below compares against it.
+ */
+static size_t bare_len_of(const char *path, size_t len)
 {
-    size_t end = strlen(path);
+    size_t end = len;
     for (;;) {
         if (end >= 2 && path[end - 1] == '.' && path[end - 2] == '/')
             end -= 1;
@@ -62,13 +66,15 @@ static size_t bare_len(const char *path)
 
 bool path_dir_required(const char *path)
 {
-    return bare_len(path) != strlen(path);
+    size_t len = strlen(path);
+    return bare_len_of(path, len) != len;
 }
 
 const char *path_bare_name(const char *path, char *buf, size_t bufsz)
 {
-    size_t end = bare_len(path);
-    if (end == strlen(path) || end + 1 > bufsz)
+    size_t len = strlen(path);
+    size_t end = bare_len_of(path, len);
+    if (end == len || end + 1 > bufsz)
         return path;
     memcpy(buf, path, end);
     buf[end] = '\0';
@@ -795,7 +801,8 @@ int path_translate_at(guest_fd_t dirfd,
     }
 
     unsigned int lookup_flags = flags;
-    if (path_has_trailing_slash(tx->guest_path))
+    bool trailing_slash = path_has_trailing_slash(tx->guest_path);
+    if (trailing_slash)
         lookup_flags &= ~PATH_TR_NOFOLLOW;
 
     errno = 0;
@@ -925,8 +932,7 @@ int path_translate_at(guest_fd_t dirfd,
      * semantics itself, so the kernel answers on the caller's own syscall,
      * which is both free and atomic with the operation being performed.
      */
-    if (path_has_trailing_slash(tx->guest_path) &&
-        !path_has_trailing_slash(tx->host_path)) {
+    if (trailing_slash && !path_has_trailing_slash(tx->host_path)) {
         size_t len = strlen(tx->host_path);
 
         if (tx->host_path != tx->host_buf) {

@@ -188,6 +188,11 @@ void chown_overlay_apply(struct stat *st)
     pthread_rwlock_unlock(&overlay_lock);
 }
 
+bool chown_overlay_empty(void)
+{
+    return atomic_load_explicit(&entry_count, memory_order_acquire) == 0;
+}
+
 /* Wire format: uint32_t count, followed by count records of { uint64_t dev;
  * uint64_t ino; uint32_t uid; uint32_t gid; }. Matches the in-memory layout so
  * the child can install the table without an intermediate translation step.

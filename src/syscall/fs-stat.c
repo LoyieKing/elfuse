@@ -292,23 +292,23 @@ static int64_t stat_at_path(guest_t *g,
                             int flags,
                             struct stat *mac_st)
 {
-    if (dirfd == LINUX_AT_FDCWD) {
-        char dot_path[2];
-        if (guest_read_small(g, path_gva, dot_path, sizeof(dot_path)) == 0 &&
-            dot_path[0] == '.' && dot_path[1] == '\0') {
-            int mac_flags = translate_at_flags(flags);
-            if (fstatat(AT_FDCWD, ".", mac_st, mac_flags) < 0)
-                return linux_errno();
-            return 0;
-        }
-    }
-
     char short_path[64];
     char path[LINUX_PATH_MAX];
     const char *pathp;
     if (guest_read_path(g, path_gva, short_path, sizeof(short_path), path,
                         sizeof(path), &pathp) < 0)
         return -LINUX_EFAULT;
+
+    /* "." measured against the cwd names the directory itself, which needs no
+     * resolution: the host call answers it directly. Reading the name once
+     * first is what keeps this arm from copying it twice.
+     */
+    if (dirfd == LINUX_AT_FDCWD && pathp[0] == '.' && pathp[1] == '\0') {
+        int mac_flags = translate_at_flags(flags);
+        if (fstatat(AT_FDCWD, ".", mac_st, mac_flags) < 0)
+            return linux_errno();
+        return 0;
+    }
 
     if ((flags & LINUX_AT_EMPTY_PATH) && pathp[0] == '\0' &&
         dirfd != LINUX_AT_FDCWD)

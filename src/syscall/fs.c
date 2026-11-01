@@ -966,6 +966,7 @@ int64_t sys_openat_path(guest_t *g,
              * carries no virtual identity stamps nothing at all.
              */
             const char *stamp = tx.intercept_path;
+            char usb_stamp[LINUX_PATH_MAX];
 
             /* Under /sys the request and the result can name different objects:
              * opening <dev>/subsystem without O_NOFOLLOW hands back the
@@ -978,11 +979,17 @@ int64_t sys_openat_path(guest_t *g,
              * and the target for every open that followed one. Under /dev/bus
              * the request may spell a '..' the layer applied, and the
              * descriptor names the directory it reached.
+             *
+             * The question costs an F_GETPATH, and only those two trees can
+             * answer differently, so it is asked for them alone. Every other
+             * intercept's spelling is already the descriptor's identity.
              */
-            char usb_stamp[LINUX_PATH_MAX];
-            if (usb_sysfs_guest_path_for_fd(intercepted, usb_stamp,
-                                            sizeof(usb_stamp)) > 0)
-                stamp = usb_stamp;
+            if (path_prefix_match(tx.intercept_path, "/sys", 4) ||
+                path_prefix_match(tx.intercept_path, "/dev/bus", 8)) {
+                if (usb_sysfs_guest_path_for_fd(intercepted, usb_stamp,
+                                                sizeof(usb_stamp)) > 0)
+                    stamp = usb_stamp;
+            }
 
             if (alias_fd >= 0)
                 stamp = (aliased && alias_src.proc_path[0] != '\0')
@@ -1193,6 +1200,27 @@ static void chown_overlay_clear_closed_unlinked_fd(int host_fd)
     }
 }
 
+/* Whether closing a descriptor can drop an overlay record: only an entry for
+ * the file, or an identity parked in the removed list, gives the fstat below
+ * something to decide. Both empty is the state of a process that never chowned
+ * and never unlinked an open file, and the common one.
+ *
+ * Read only with no sibling thread: one active task means nothing can record an
+ * entry between this test and the fstat it skips, so the answer cannot go stale
+ * under it. With siblings the probe stays, because a record added after the
+ * test is exactly the case the answer must not have guessed.
+ */
+static bool chown_overlay_close_may_drop(void)
+{
+    if (!thread_is_single_active() || !chown_overlay_empty())
+        return true;
+
+    pthread_mutex_lock(&removed_overlay_lock);
+    bool listed = removed_overlay_identities != NULL;
+    pthread_mutex_unlock(&removed_overlay_lock);
+    return listed;
+}
+
 int64_t sys_close(int fd)
 {
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
@@ -1209,7 +1237,8 @@ int64_t sys_close(int fd)
          * FD_REGULAR slot, so every guest close of one lands here.
          */
         proc_pty_forget_host_fd(host_fd);
-        chown_overlay_clear_closed_unlinked_fd(host_fd);
+        if (chown_overlay_close_may_drop())
+            chown_overlay_clear_closed_unlinked_fd(host_fd);
         if (close(host_fd) < 0)
             return linux_errno();
         return 0;
@@ -1223,7 +1252,8 @@ int64_t sys_close(int fd)
     if (!fd_snapshot_and_close_relaxed(fd, &snap))
         return -LINUX_EBADF;
 
-    chown_overlay_clear_closed_unlinked_fd(snap.host_fd);
+    if (chown_overlay_close_may_drop())
+        chown_overlay_clear_closed_unlinked_fd(snap.host_fd);
     fd_cleanup_entry(fd, &snap);
     return 0;
 }

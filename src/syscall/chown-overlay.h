@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <sys/stat.h>
 
@@ -39,6 +40,11 @@ void chown_overlay_clear(uint64_t dev, uint64_t ino);
  * and st->st_gid in place. Cheap atomic-load fast path when the table is empty.
  */
 void chown_overlay_apply(struct stat *st);
+
+/* True when no override is recorded. The close path reads it to decide whether
+ * a host stat is worth taking: with an empty table there is no entry to drop.
+ */
+bool chown_overlay_empty(void);
 
 /* Fork IPC: serialize the table to ipc_sock.
  *

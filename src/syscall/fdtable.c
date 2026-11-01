@@ -125,11 +125,10 @@ static bool host_fd_may_block(int host_fd)
  *
  * Resolving the common pipe/socket/synthetic cases from the type keeps an fstat
  * off the fd-creation lock hold, but does not empty it: fd_init_entry still
- * takes O_NONBLOCK ownership with two fcntls in the same window. Measured
- * against a build that skips them, the whole cost of both is 4.4% of a
- * pipe()+close pair and 2.7% of an open()+close, so hoisting them out of the
- * lock was not done -- it would not remove the syscalls, only the lock hold,
- * and nothing measures a contended fd-creation path today.
+ * takes O_NONBLOCK ownership inside the same window. That is a small slice of a
+ * pipe()+close or open()+close pair, so hoisting it out of the lock was not
+ * done -- it would not remove the syscall, only the lock hold, and nothing
+ * measures a contended fd-creation path today.
  */
 static bool type_may_block(int type, int host_fd)
 {
@@ -213,10 +212,10 @@ static int fd_flags_with_accmode(int type, int linux_flags)
  * fd_lock rather than under it.
  *
  * Both are host syscalls: type_may_block fstats a regular or stdio fd, and
- * fd_set_nonblock is an F_GETFL/F_SETFL pair. Holding the table lock across
- * them puts up to three host calls in front of every read, write and close that
- * wants the table, and the design note above fd_alloc says the lock is held for
- * table mutation only.
+ * taking O_NONBLOCK ownership is an F_GETFL that issues F_SETFL only when the
+ * bit is missing. Holding the table lock across them puts up to two host calls
+ * in front of every read, write and close that wants the table, and the design
+ * note above fd_alloc says the lock is held for table mutation only.
  *
  * Nothing races: the host fd is not published until fd_init_entry writes the
  * slot, so this thread is the only one that can see it. The alias state is
@@ -261,14 +260,22 @@ static fd_host_probe_t fd_probe_host(int type, int host_fd)
     if (!probe.can_block || foreign)
         return probe;
 
-    /* Remember the flags only when this call is the one adding O_NONBLOCK. A
-     * descriptor that already carried it is left alone on rollback, since
-     * putting back what was already there is not this function's to undo.
+    /* One read, and a write only when the bit is missing: a descriptor whose
+     * creator already asked for non-blocking costs no second host call. The old
+     * flags are remembered only when this call adds O_NONBLOCK, since putting
+     * back what was already there is not this function's to undo.
      */
     int old_flags = fcntl(host_fd, F_GETFL);
-    probe.nonblock_owned = fd_set_nonblock(host_fd) >= 0;
-    if (probe.nonblock_owned && old_flags >= 0 && !(old_flags & O_NONBLOCK))
-        probe.restore_flags = old_flags;
+    if (old_flags < 0)
+        return probe;
+    if (old_flags & O_NONBLOCK) {
+        probe.nonblock_owned = true;
+        return probe;
+    }
+    if (fcntl(host_fd, F_SETFL, old_flags | O_NONBLOCK) < 0)
+        return probe;
+    probe.nonblock_owned = true;
+    probe.restore_flags = old_flags;
     return probe;
 }
 
