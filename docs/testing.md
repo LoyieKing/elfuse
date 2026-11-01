@@ -788,6 +788,17 @@ an OSR `Jumping to` transition, collection of 128 large objects and JIT
 shutdown. Android framework, Binder services, zygote and applications are
 outside this standalone fixture.
 
+Owner CPU accounting uses Darwin's public `CLOCK_THREAD_CPUTIME_ID`;
+cross-worker live samples use the cached Mach thread port. Both exclude
+waiting and host descheduling. The static `fd-create` guardrail allows 15 us
+above same-host native `open("/dev/null", O_RDWR)` plus close; the dynamic
+glibc allowance is 35 us for sysroot resolution. `bench-fd-create-host` takes
+the median of three passes before and after each guest pass; their average
+is the baseline. Native open failures and absent or invalid measurements fail
+the gate. The remaining getpid ratios and absolute ceilings are unchanged.
+The native baseline isolates host filesystem/security-policy costs, measured
+at 42.8-48.6 us here, which exceed the former 1,000-times-getpid ceiling.
+
 `test-futex-wake-nowaiter` starts its round gate at `UINT32_MAX`; the first
 waker cannot run until main resets the word and publishes round zero. The
 stats-enabled lane exercises the same handshake without losing the first

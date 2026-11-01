@@ -189,6 +189,11 @@ $(BUILD_DIR)/test-multi-vcpu: $(BUILD_DIR)/test-multi-vcpu.o | $(BUILD_DIR)
 $(BUILD_DIR)/test-rwx: $(BUILD_DIR)/test-rwx.o | $(BUILD_DIR)
 	$(call link-and-sign,$@,$<)
 
+# Native descriptor baseline, without HVF or guest syscall translation.
+$(BUILD_DIR)/bench-fd-create-host: tests/bench-fd-create-host.c | $(BUILD_DIR)
+	@echo "  CC      $<"
+	$(Q)$(CC) $(CFLAGS) -o $@ $<
+
 ## Build the TLBI RVAE1IS operand encoder unit test (native macOS binary).
 # Pure C; no HVF entitlement needed. Verifies the architectural bit-layout
 # of tlbi_rvae1is_operand so a future regression that drops TG=01 (which

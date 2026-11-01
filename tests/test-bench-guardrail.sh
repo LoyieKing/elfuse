@@ -14,9 +14,9 @@
 #   read(empty nonblocking pipe) <= Nx getpid   (per-transfer overhead)
 #   pipe write+read       <= Nx getpid    (transfer plus wait/wakeup)
 #
-# The first three are absolute; every other lane is a ratio to a getpid from the
-# same run. See the threshold block below for why the two kinds of limit are not
-# interchangeable.
+# The first three are absolute; host-served lanes use same-run getpid ratios
+# except fd-create, which uses a same-host native open/close baseline. See the
+# threshold block below for the limits each measurement can establish.
 #
 # The static (musl) bench is the baseline; the dynamic-glibc bench verifies that
 # glibc 2.41's vDSO probe (NT_GNU_ABI_TAG PT_NOTE) keeps clock_gettime on the
@@ -28,6 +28,7 @@ set -u
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ELFUSE="${ELFUSE:-${REPO_ROOT}/build/elfuse}"
 BENCH_GUARDRAIL_DIR="${BENCH_GUARDRAIL_DIR:-${REPO_ROOT}/build}"
+BENCH_FD_CREATE_HOST="${BENCH_FD_CREATE_HOST:-${REPO_ROOT}/build/bench-fd-create-host}"
 BENCH_GUARDRAIL_REQUIRE_STATIC="${BENCH_GUARDRAIL_REQUIRE_STATIC:-1}"
 STATIC_BENCH="${BENCH_GUARDRAIL_DIR}/bench-hot-guard"
 GLIBC_BENCH="${BENCH_GUARDRAIL_DIR}/bench-hot-guard-glibc"
@@ -150,18 +151,13 @@ THRESH_PIPE_EAGAIN_MT_RATIO=110
 # fail on clean trees.
 THRESH_PIPE_BULK_RATIO=15000
 
-# Descriptor creation, with and without path resolution. fd_init_entry stats the
-# host fd and may set O_NONBLOCK on it inside the fd-table lock; pipe-create is
-# the same allocation with the path work removed, so the pair says how much of
-# the cost is resolution.
-#
-# fd-create splits by variant for the same reason stat-path does: under dynamic
-# glibc the open resolves through the sysroot, which is most of the lane. It
-# measured 999x against a first-cut 1000x ceiling, which would have flaked on
-# the next busy run rather than caught anything. pipe-create allocates without a
-# path, so one number covers both.
-THRESH_FD_CREATE_RATIO_STATIC=1000
-THRESH_FD_CREATE_RATIO_GLIBC=1700
+# fd-create is measured against native open/close on this host: filesystem and
+# security policy latency can exceed the entire guest-getpid ratio ceiling. The
+# median of three native passes brackets each guest run. Allowed extra runtime
+# work is 15 us static and 35 us with glibc sysroot resolution; the static
+# allowance covers the measured 8-12 us translation/descriptor cost.
+THRESH_FD_CREATE_EXTRA_STATIC=15000
+THRESH_FD_CREATE_EXTRA_GLIBC=35000
 THRESH_PIPE_CREATE_RATIO=1000
 
 C_RED='\033[0;31m'
@@ -171,6 +167,10 @@ C_RESET='\033[0m'
 
 if [ ! -x "$ELFUSE" ]; then
     echo "elfuse binary missing at $ELFUSE" >&2
+    exit 1
+fi
+if [ ! -x "$BENCH_FD_CREATE_HOST" ]; then
+    echo "native fd-create benchmark missing at $BENCH_FD_CREATE_HOST" >&2
     exit 1
 fi
 
@@ -271,16 +271,32 @@ check_ratio()
 
 run_one_pass()
 {
-    local variant="$1" bench="$2" stat_ratio="$3" fd_ratio="$4"
+    local variant="$1" bench="$2" stat_ratio="$3" fd_extra="$4"
     shift 4
-    local out
+    local out native_before native_after before_ns after_ns guest_ns
     out="$(mktemp)"
+    native_before="$(mktemp)"
+    native_after="$(mktemp)"
+    if ! "$BENCH_FD_CREATE_HOST" "$ITERS" > "$native_before"; then
+        echo "native fd-create benchmark failed" >&2
+        failures=$((failures + 1))
+        deterministic=1
+        rm -f "$out" "$native_before" "$native_after"
+        return
+    fi
     if ! "$ELFUSE" "$@" "$bench" "$ITERS" > "$out" 2>&1; then
         echo "  ${C_RED}FAIL${C_RESET}  $variant bench exited non-zero" >&2
         cat "$out" >&2
         failures=$((failures + 1))
         deterministic=1
-        rm -f "$out"
+        rm -f "$out" "$native_before" "$native_after"
+        return
+    fi
+    if ! "$BENCH_FD_CREATE_HOST" "$ITERS" > "$native_after"; then
+        echo "native fd-create benchmark failed" >&2
+        failures=$((failures + 1))
+        deterministic=1
+        rm -f "$out" "$native_before" "$native_after"
         return
     fi
 
@@ -302,8 +318,23 @@ run_one_pass()
     check_ratio "$variant" "pipe-roundtrip" \
         "$(extract_ns "$out" pipe-roundtrip)" "$getpid_ns" \
         "$THRESH_PIPE_RT_RATIO"
-    check_ratio "$variant" "fd-create" \
-        "$(extract_ns "$out" fd-create)" "$getpid_ns" "$fd_ratio"
+    before_ns="$(extract_ns "$native_before" fd-create)"
+    after_ns="$(extract_ns "$native_after" fd-create)"
+    guest_ns="$(extract_ns "$out" fd-create)"
+    if ! awk -v b="$before_ns" -v a="$after_ns" -v g="$guest_ns" \
+        'BEGIN { n="^[0-9]+([.][0-9]+)?$"; exit !(b ~ n && a ~ n && g ~ n && b > 0 && a > 0 && g > 0) }'; then
+        echo "fd-create baseline or guest measurement missing or invalid" >&2
+        failures=$((failures + 1))
+        deterministic=1
+    else
+        local baseline ceiling increment
+        baseline="$(awk -v b="$before_ns" -v a="$after_ns" 'BEGIN { print (b+a)/2 }')"
+        ceiling="$(awk -v b="$baseline" -v e="$fd_extra" 'BEGIN { printf "%.0f", b+e }')"
+        increment="$(awk -v g="$guest_ns" -v b="$baseline" 'BEGIN { printf "%.1f", g-b }')"
+        printf '  native fd-create: %s ns/op; guest increment: %s ns/op (allowance %s)\n' \
+            "$baseline" "$increment" "$fd_extra"
+        check_threshold "$variant" fd-create "$guest_ns" "$ceiling"
+    fi
     check_ratio "$variant" "pipe-create" \
         "$(extract_ns "$out" pipe-create)" "$getpid_ns" \
         "$THRESH_PIPE_CREATE_RATIO"
@@ -319,7 +350,7 @@ run_one_pass()
         "$(extract_ns "$out" pipe-eagain-mt)" "$getpid_mt_ns" \
         "$THRESH_PIPE_EAGAIN_MT_RATIO"
 
-    rm -f "$out"
+    rm -f "$out" "$native_before" "$native_after"
 }
 
 # Re-measure once before failing, and report only what survives the retry.
@@ -374,13 +405,13 @@ echo "=== bench-guardrail (iters=$ITERS) ==="
 if [ "$run_static" = 1 ]; then
     echo "[static (musl)]"
     run_and_check static "$STATIC_BENCH" "$THRESH_STAT_RATIO_STATIC" \
-        "$THRESH_FD_CREATE_RATIO_STATIC"
+        "$THRESH_FD_CREATE_EXTRA_STATIC"
 fi
 
 if [ -x "$GLIBC_BENCH" ] && [ -d "$GLIBC_SYSROOT" ]; then
     echo "[dynamic-glibc]"
     run_and_check dyn-glibc "$GLIBC_BENCH" "$THRESH_STAT_RATIO_GLIBC" \
-        "$THRESH_FD_CREATE_RATIO_GLIBC" --sysroot "$GLIBC_SYSROOT"
+        "$THRESH_FD_CREATE_EXTRA_GLIBC" --sysroot "$GLIBC_SYSROOT"
 else
     /usr/bin/printf "  ${C_YELLOW}SKIP${C_RESET}  dyn-glibc      cross-toolchain absent: %s\n" \
         "$GLIBC_TOOLCHAIN"

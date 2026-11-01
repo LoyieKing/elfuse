@@ -56,7 +56,8 @@ ifeq ($(origin GUEST_TEST_BINARIES), undefined)
 endif
 
 # Exclude native macOS test files from cross-compilation
-NATIVE_TESTS := tests/test-multi-vcpu.c tests/test-rwx.c \
+NATIVE_TESTS := tests/bench-fd-create-host.c \
+                tests/test-multi-vcpu.c tests/test-rwx.c \
                 tests/test-tlbi-encoder-host.c \
                 tests/test-casefold-host.c \
                 tests/test-casefold-walk-host.c \

@@ -365,7 +365,7 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract ch
 ## and 1-byte /dev/urandom reads stay under their TODO ns/op ceilings.
 ## Builds the dynamic-glibc variant opportunistically; the script skips
 ## that arm when the cross-toolchain sysroot is missing.
-BENCH_GUARDRAIL_DEPS := $(ELFUSE_BIN)
+BENCH_GUARDRAIL_DEPS := $(ELFUSE_BIN) $(BUILD_DIR)/bench-fd-create-host
 BENCH_GUARDRAIL_REQUIRE_STATIC := 0
 ifndef GUEST_TEST_BINARIES
   BENCH_GUARDRAIL_DEPS += $(BUILD_DIR)/bench-hot-guard
@@ -376,6 +376,7 @@ ifndef GUEST_TEST_BINARIES
 endif
 test-bench-guardrail: $(BENCH_GUARDRAIL_DEPS)
 	@ELFUSE="$(ELFUSE_BIN)" \
+	    BENCH_FD_CREATE_HOST="$(BUILD_DIR)/bench-fd-create-host" \
 	    BENCH_GUARDRAIL_DIR="$(TEST_DIR)" \
 	    BENCH_GUARDRAIL_REQUIRE_STATIC="$(BENCH_GUARDRAIL_REQUIRE_STATIC)" \
 	    LINUX_TOOLCHAIN="$(LINUX_TOOLCHAIN)" \
