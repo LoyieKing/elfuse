@@ -119,6 +119,7 @@ enum {
     PARK_KIND_WAIT, /* wait driver re-check: reissue, no X0 injection */
     PARK_KIND_IPC,  /* SysV IPC wait: timeout reissues, signal gives EINTR */
     PARK_KIND_SERVICE,
+    PARK_KIND_SIGNAL,
 };
 /* Selection class. Lower value = lower precedence in Linux order. */
 enum {

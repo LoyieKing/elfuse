@@ -486,6 +486,7 @@ void thread_deactivate(thread_entry_t *t)
     /* Before thread_lock, which ranks after sig_lock, and before the slot can
      * be handed to a new thread that would inherit the claims by address.
      */
+    signal_wait_cancel(t);
     signal_release_claims(t);
     futex_pi_task_release(t);
     uint64_t runtime_user_ns, runtime_sys_ns;
@@ -550,6 +551,7 @@ void thread_exit_task(thread_entry_t *t, guest_t *g, int wait_status)
     }
     t->exit_cleanup_claimed = true;
     pthread_mutex_unlock(&thread_lock);
+    signal_wait_cancel(t);
     futex_task_cancel_wait(t);
     io_task_cancel_wait(t);
     mqueue_task_cancel_wait(t);

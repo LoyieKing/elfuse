@@ -3850,6 +3850,9 @@ void sched_park_on_signal(thread_entry_t *t)
     case PARK_KIND_WAIT:
         wait_park_on_interrupt(t);
         break;
+    case PARK_KIND_SIGNAL:
+        signal_wait_park_on_interrupt(t);
+        break;
     default:
         /* STOP is resumed by the debugger path, WAIT by its wait driver. */
         break;
@@ -3932,6 +3935,9 @@ static void fire_wait_one(thread_entry_t *t, void *ctx)
         break;
     case PARK_KIND_WAIT:
         wait_park_on_deadline(t);
+        break;
+    case PARK_KIND_SIGNAL:
+        signal_wait_park_on_deadline(t);
         break;
     default:
         break;

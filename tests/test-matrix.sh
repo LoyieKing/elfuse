@@ -785,6 +785,8 @@ run_unit_tests()
     test_check "$runner" "test-ptrace-interrupt" "OK: ptrace-stop reports EL0" \
         "$bindir/test-ptrace-interrupt"
     test_check "$runner" "test-sigsuspend" "PASS|0 failed" "$bindir/test-sigsuspend"
+    test_check "$runner" "test-sigtimedwait" "0 failed" \
+        "$bindir/test-sigtimedwait"
     test_check "$runner" "test-eintr-restart" "0 failed" \
         "$bindir/test-eintr-restart"
     test_check "$runner" "test-tgkill-directed" "0 failed" "$bindir/test-tgkill-directed"

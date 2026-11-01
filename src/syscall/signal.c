@@ -124,6 +124,7 @@ typedef struct {
 } pending_fault_t;
 
 static void refresh_pending_hint_locked(void);
+static void signal_wait_wake_locked(void);
 
 static pending_fault_t pending_fault_take(void)
 {
@@ -152,6 +153,7 @@ void signal_task_reset(struct thread_entry *t)
 {
     if (!t)
         return;
+    signal_wait_cancel(t);
     t->sig_fault_valid = false;
     t->sig_fault_code = 0;
     t->sig_fault_addr = 0;
@@ -169,6 +171,7 @@ void signal_task_reset(struct thread_entry *t)
  * acquisition order is the lock-ordering block in src/syscall/internal.h.
  */
 static pthread_mutex_t sig_lock = PTHREAD_MUTEX_INITIALIZER;
+static thread_entry_t *signal_waiters;
 
 /* Atomic "maybe pending" hint. signal_queue() sets it before releasing the
  * queue lock, and signal_deliver() clears it after draining visible state. The
@@ -636,6 +639,7 @@ static void refresh_pending_hint_locked(void)
     uint64_t hint =
         pending_load(&sig_state.shared.pending) | thread_pending_union();
     atomic_store_explicit(&sig_pending_hint, hint, memory_order_release);
+    signal_wait_wake_locked();
 }
 
 /* Process-directed signals a waiter has claimed, and the thread that did.
@@ -784,6 +788,7 @@ void signal_init(void)
      * fields instead would silently drop a field added later.
      */
     memset(&sig_state, 0, sizeof(sig_state));
+    signal_waiters = NULL;
 
     /* Clear the attention singleton on every init pass. Bootstrap and the
      * fork-child receive path both call this before
@@ -3056,14 +3061,90 @@ int64_t signal_rt_sigpending(guest_t *g, uint64_t set_gva, uint64_t sigsetsize)
 
 /* rt_sigtimedwait. */
 
+/* The owner keeps the request through reissue; sig_lock serializes registration
+ * with signal enqueue so wake-before-unmount cannot lose a signal.
+ */
+static void signal_wait_unlink_locked(thread_entry_t *t)
+{
+    if (!t->sigwait_registered)
+        return;
+    if (t->sigwait_prev)
+        t->sigwait_prev->sigwait_next = t->sigwait_next;
+    else
+        signal_waiters = t->sigwait_next;
+    if (t->sigwait_next)
+        t->sigwait_next->sigwait_prev = t->sigwait_prev;
+    t->sigwait_prev = t->sigwait_next = NULL;
+    t->sigwait_registered = false;
+}
+
+static bool signal_wait_ready_locked(thread_entry_t *t)
+{
+    uint64_t pending =
+        pending_load(&t->tpending.pending) | shared_visible_for_locked(t);
+    return (pending & t->sigwait_mask) ||
+           signal_first_waking_locked(pending & ~thread_blocked_load(t));
+}
+
+static void signal_wait_complete_locked(thread_entry_t *t, bool interrupted)
+{
+    if (!t->sigwait_registered)
+        return;
+    t->sigwait_interrupted = interrupted;
+    if (sched_park_try_complete_reissue_seq(t, PARK_KIND_SIGNAL,
+                                            sched_park_seq(t)))
+        signal_wait_unlink_locked(t);
+}
+
+static void signal_wait_wake_locked(void)
+{
+    for (thread_entry_t *t = signal_waiters, *next; t; t = next) {
+        next = t->sigwait_next;
+        if (signal_wait_ready_locked(t))
+            signal_wait_complete_locked(t, true);
+    }
+}
+
+void signal_wait_cancel(thread_entry_t *t)
+{
+    if (!t)
+        return;
+    pthread_mutex_lock(&sig_lock);
+    signal_wait_unlink_locked(t);
+    t->sigwait_continuation = false;
+    t->sigwait_interrupted = false;
+    t->sigwait_mask = t->sigwait_info_gva = t->sigwait_deadline_ns = 0;
+    pthread_mutex_unlock(&sig_lock);
+}
+
+void signal_wait_park_on_interrupt(thread_entry_t *t)
+{
+    if (!t)
+        return;
+    pthread_mutex_lock(&sig_lock);
+    if (t->sigwait_registered &&
+        (signal_wait_ready_locked(t) || thread_stop_requested_for(t)))
+        signal_wait_complete_locked(t, true);
+    pthread_mutex_unlock(&sig_lock);
+}
+
+void signal_wait_park_on_deadline(thread_entry_t *t)
+{
+    if (!t)
+        return;
+    pthread_mutex_lock(&sig_lock);
+    if (t->sigwait_registered && t->sigwait_deadline_ns &&
+        sched_now_ns() >= t->sigwait_deadline_ns)
+        signal_wait_complete_locked(t, false);
+    pthread_mutex_unlock(&sig_lock);
+}
+
 /* Try to consume one signal from the set under sig_lock.
  * Returns the signal number if one was found and dequeued, 0 otherwise.
  * Populates *info_out with the queued siginfo metadata.
  */
 static int sigtimedwait_try_dequeue(uint64_t mask, signal_rt_info_t *info_out)
 {
-    pthread_mutex_lock(&sig_lock);
-
     /* Private (thread-directed) set first, then shared (process-directed),
      * matching Linux dequeue_signal() priority.
      */
@@ -3072,7 +3153,6 @@ static int sigtimedwait_try_dequeue(uint64_t mask, signal_rt_info_t *info_out)
     uint64_t shared_m = shared_visible_locked() & mask;
 
     if ((thread_m | shared_m) == 0) {
-        pthread_mutex_unlock(&sig_lock);
         return 0;
     }
 
@@ -3108,7 +3188,6 @@ static int sigtimedwait_try_dequeue(uint64_t mask, signal_rt_info_t *info_out)
         shared_claim_release_locked(signum);
     refresh_pending_hint_locked();
 
-    pthread_mutex_unlock(&sig_lock);
     return signum;
 }
 
@@ -3118,120 +3197,99 @@ int64_t signal_rt_sigtimedwait(guest_t *g,
                                uint64_t timeout_gva,
                                uint64_t sigsetsize)
 {
-    if (sigsetsize != 8)
+    thread_entry_t *t = current_thread;
+    if (!t)
         return -LINUX_EINVAL;
-    if (!set_gva)
-        return -LINUX_EFAULT;
 
-    uint64_t mask;
-    if (guest_read_small(g, set_gva, &mask, sizeof(mask)) < 0)
-        return -LINUX_EFAULT;
-
-    /* SIGKILL and SIGSTOP cannot be caught or waited for. Remove them from the
-     * wait mask silently, matching Linux do_sigtimedwait behavior.
-     */
-    uint64_t unmaskable = sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP);
-    mask &= ~unmaskable;
-
-    /* Determine deadline: NULL timeout_gva means block indefinitely. Zero
-     * timespec means poll once.
-     */
-    bool has_timeout = (timeout_gva != 0);
-    int64_t remaining_ns = 0;
-
-    if (has_timeout) {
-        linux_timespec_t lts;
-        if (guest_read_small(g, timeout_gva, &lts, sizeof(lts)) < 0)
-            return -LINUX_EFAULT;
-        if (!linux_timespec_valid(&lts))
+    pthread_mutex_lock(&sig_lock);
+    bool continuing = t->sigwait_continuation;
+    pthread_mutex_unlock(&sig_lock);
+    if (!continuing) {
+        if (sigsetsize != 8)
             return -LINUX_EINVAL;
-        remaining_ns = linux_timespec_to_ns_sat(&lts);
-    }
-
-    /* Poll/wait loop. */
-#define SIGWAIT_CHUNK_NS 1000000LL /* 1ms chunks */
-
-    while (1) {
-        signal_rt_info_t info;
-        posix_timer_check();
-        int signum = sigtimedwait_try_dequeue(mask, &info);
-        if (signum > 0) {
-            /* Populate guest siginfo_t if the caller wants it. */
-            if (info_gva) {
-                linux_siginfo_t si;
-                memset(&si, 0, sizeof(si));
-                si.si_signo = signum;
-                si.si_code = info.si_code;
-                si.si_pid = info.si_pid;
-                si.si_uid = (int32_t) info.si_uid;
-                si.si_value = info.si_ptr;
-                if (guest_write_small(g, info_gva, &si, sizeof(si)) < 0)
-                    return -LINUX_EFAULT;
-            }
-            return signum;
+        uint64_t mask;
+        if (!set_gva || guest_read_small(g, set_gva, &mask, sizeof(mask)) < 0)
+            return -LINUX_EFAULT;
+        mask &= ~(sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP));
+        uint64_t deadline = 0;
+        if (timeout_gva) {
+            linux_timespec_t timeout;
+            if (guest_read_small(g, timeout_gva, &timeout, sizeof(timeout)) < 0)
+                return -LINUX_EFAULT;
+            if (!linux_timespec_valid(&timeout))
+                return -LINUX_EINVAL;
+            uint64_t duration = (uint64_t) linux_timespec_to_ns_sat(&timeout);
+            uint64_t now = sched_now_ns();
+            deadline =
+                duration > UINT64_MAX - now ? UINT64_MAX : now + duration;
         }
-
-        /* For a zero timeout (poll-once), bail immediately. */
-        if (has_timeout && remaining_ns <= 0)
-            return -LINUX_EAGAIN;
-
-        /* Exit if the process, or just this thread, is tearing down. The chunks
-         * already consumed above came out of the guest's timeout, and Linux
-         * converts do_sigtimedwait's ERESTARTSYS to EINTR even without a
-         * timeout, so neither spelling restarts the original request.
-         */
-        if (thread_stop_requested()) {
-            syscall_restart_forbid();
-            return -LINUX_EINTR;
-        }
-
-        /* If a non-waited, guest-visible signal is pending, return -EINTR.
-         * Mirror signal_pending_interruption()'s disposition filter: SIG_IGN
-         * signals and signals whose default disposition is ignore, stop, or
-         * continue are silently discarded by signal_deliver and must NOT
-         * interrupt the wait. Only a signal with a real handler, or a SIG_DFL
-         * TERM/CORE disposition, justifies waking the caller with -EINTR.
-         * Claimed, not just seen, so a sibling woken by the same
-         * process-directed signal does not report EINTR for it too.
-         */
         pthread_mutex_lock(&sig_lock);
-        _Atomic uint64_t *blocked = thread_blocked_ptr();
-        bool interrupt =
-            signal_claim_waking_locked(
-                atomic_load_explicit(blocked, memory_order_relaxed) | mask) !=
-            0;
+        t->sigwait_mask = mask;
+        t->sigwait_info_gva = info_gva;
+        t->sigwait_deadline_ns = deadline;
+        t->sigwait_continuation = true;
         pthread_mutex_unlock(&sig_lock);
-        if (interrupt) {
-            syscall_restart_forbid();
-            return -LINUX_EINTR;
-        }
-
-        /* Sleep one chunk, then recheck. */
-        int64_t sleep_ns =
-            has_timeout ? (remaining_ns < SIGWAIT_CHUNK_NS ? remaining_ns
-                                                           : SIGWAIT_CHUNK_NS)
-                        : SIGWAIT_CHUNK_NS;
-        struct timespec req = {
-            .tv_sec = sleep_ns / 1000000000LL,
-            .tv_nsec = sleep_ns % 1000000000LL,
-        };
-        struct timespec rem = {0};
-        if (nanosleep(&req, &rem) < 0) {
-            /* Host EINTR: account for time already slept. */
-            int64_t slept =
-                sleep_ns - (rem.tv_sec * 1000000000LL + rem.tv_nsec);
-            if (slept < 0)
-                slept = 0;
-            if (has_timeout)
-                remaining_ns -= slept;
-            /* Recheck immediately (will catch deliverable signal). */
-            continue;
-        }
-        if (has_timeout)
-            remaining_ns -= sleep_ns;
     }
 
-#undef SIGWAIT_CHUNK_NS
+    posix_timer_check();
+    pthread_mutex_lock(&sig_lock);
+    signal_wait_unlink_locked(t);
+    signal_rt_info_t info;
+    int signum = sigtimedwait_try_dequeue(t->sigwait_mask, &info);
+    uint64_t destination = t->sigwait_info_gva;
+    int64_t result = signum;
+    if (!signum) {
+        if (t->sigwait_interrupted) {
+            (void) signal_claim_waking_for_locked(
+                t, thread_blocked_load(t) | t->sigwait_mask);
+            syscall_restart_forbid();
+            result = -LINUX_EINTR;
+        } else if (t->sigwait_deadline_ns &&
+                   sched_now_ns() >= t->sigwait_deadline_ns)
+            result = -LINUX_EAGAIN;
+        else if (thread_stop_requested_for(t) ||
+                 signal_claim_waking_for_locked(
+                     t, thread_blocked_load(t) | t->sigwait_mask)) {
+            syscall_restart_forbid();
+            result = -LINUX_EINTR;
+        } else {
+            t->sigwait_interrupted = false;
+            exec_park_kind_store(t, PARK_KIND_SIGNAL);
+            exec_park_result_pending_store(t, false);
+            exec_park_reissue_store(t, false);
+            exec_park_deadline_ns_store(t, 0);
+            (void) sched_park_seq_next(t);
+            t->sigwait_prev = NULL;
+            t->sigwait_next = signal_waiters;
+            if (signal_waiters)
+                signal_waiters->sigwait_prev = t;
+            signal_waiters = t;
+            t->sigwait_registered = true;
+            exec_park_active_store(t, true);
+            if (t->sigwait_deadline_ns)
+                sched_arm_wait_deadline(t, t->sigwait_deadline_ns);
+            if (thread_stop_requested_for(t))
+                signal_wait_complete_locked(t, true);
+            pthread_mutex_unlock(&sig_lock);
+            return SYSCALL_PARKED;
+        }
+    }
+    t->sigwait_continuation = false;
+    t->sigwait_interrupted = false;
+    t->sigwait_mask = t->sigwait_info_gva = t->sigwait_deadline_ns = 0;
+    pthread_mutex_unlock(&sig_lock);
+    if (signum > 0 && destination) {
+        linux_siginfo_t si;
+        memset(&si, 0, sizeof(si));
+        si.si_signo = signum;
+        si.si_code = info.si_code;
+        si.si_pid = info.si_pid;
+        si.si_uid = (int32_t) info.si_uid;
+        si.si_value = info.si_ptr;
+        if (guest_write_small(g, destination, &si, sizeof(si)) < 0)
+            return -LINUX_EFAULT;
+    }
+    return result;
 }
 
 

@@ -122,9 +122,9 @@ INVENTORY = {
     ),
     "syscall/signal.c::signal_rt_sigtimedwait": (
         "forbids",
-        "The timeout is spent in 1 ms chunks, and Linux converts "
-        "do_sigtimedwait's ERESTARTSYS to EINTR even when no timeout was "
-        "supplied, so every EINTR exit leaves the original request spent.",
+        "The absolute wait deadline survives reissue; Linux converts "
+        "do_sigtimedwait's ERESTARTSYS to EINTR even without a timeout, "
+        "so unrelated handled signals never restart the original request.",
     ),
     "syscall/io.c::tty_drain_interruptible": (
         "forbids",

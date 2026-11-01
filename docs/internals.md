@@ -863,6 +863,13 @@ Key points:
 - Each `thread_entry_t` carries its own `blocked` mask. `rt_sigprocmask`
   operates on `current_thread->blocked`, and child threads inherit the
   parent's mask at clone time.
+- `rt_sigtimedwait` parks the task and releases its logical CPU while waiting.
+  The wait set, siginfo destination and monotonic deadline remain task-owned
+  across reissue. Signal enqueue and wait registration share `sig_lock`, so a
+  signal arriving before unmount is not lost. Matching signals are consumed
+  from the private set before the shared set. Unrelated handled signals return
+  `EINTR` even with `SA_RESTART`; timeout returns `EAGAIN`. Guest siginfo writes
+  run on the resumed worker, and exit/exec retires the wait registration.
 
 ## Ptrace And `clone(CLONE_VM)` Tracing
 

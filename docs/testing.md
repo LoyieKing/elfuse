@@ -741,6 +741,22 @@ bash tests/qemu-runner.sh exec /mnt/host/build/test-madvise-fork
 
 The normal aarch64 matrices include the case for both elfuse and Linux.
 
+## Synchronous signal waits
+
+`tests/test-sigtimedwait.c` reproduces a waiter occupying a host worker while
+another task on the same allowed CPU is READY. The producer must run before
+the waited-for signal is released. The case also covers pending-signal
+selection, RT payload ordering, signal competition, timeout deadlines,
+`SA_RESTART` interruption, wake-before-park races and exit/exec cancellation.
+
+```sh
+make elfuse build/test-sigtimedwait
+build/elfuse build/test-sigtimedwait
+bash tests/qemu-runner.sh exec /mnt/host/build/test-sigtimedwait
+```
+
+The normal aarch64 matrices include this test for elfuse and Linux.
+
 ## Validation Strategy By Change Type
 
 Suggested minimum validation:

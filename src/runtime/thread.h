@@ -251,6 +251,12 @@ typedef struct thread_entry {
     void *fuse_service;
     bool sysv_waited;
 
+    /* Synchronous signal wait registration and saved request, under sig_lock.
+     */
+    struct thread_entry *sigwait_prev, *sigwait_next;
+    bool sigwait_registered, sigwait_continuation, sigwait_interrupted;
+    uint64_t sigwait_mask, sigwait_info_gva, sigwait_deadline_ns;
+
     /* Async park (pool unmount). Futex wait / nanosleep return SYSCALL_PARKED
      * instead of pthread_cond_wait on the worker. Waker, deadline, or signal
      * completes the park and READY-enqueues; remount injects X0 then resumes

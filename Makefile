@@ -617,8 +617,10 @@ $(BUILD_DIR)/test-tgkill-directed: tests/test-tgkill-directed.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
-# test-sigtimedwait uses a sender pthread to verify thread-directed waits.
-$(BUILD_DIR)/test-sigtimedwait: tests/test-sigtimedwait.c | $(BUILD_DIR)
+# test-sigtimedwait covers synchronous selection, queued payloads and the
+# parked waiter's deadline; the starvation case and its sender need pthreads.
+$(BUILD_DIR)/test-sigtimedwait: tests/test-sigtimedwait.c tests/test-harness.h \
+		| $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 

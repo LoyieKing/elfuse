@@ -79,7 +79,9 @@
  *   epoll inst   (syscall/poll.c):    per-epoll-instance regs[]; taken under
  *                                     fd_lock by the close hook, taken alone
  *                                     (no fd_lock held) by epoll_ctl/pwait
- *   sig_lock     (syscall/signal.c):  signal handlers/pending/blocked
+ *   sig_lock     (syscall/signal.c):  signal handlers/pending/blocked and
+ *                                     signal wait registrations; nests
+ *                                     scheduler completion and timer wakes
  *   thread_lock  (runtime/thread.c):  thread table
  *   sfd_lock     (syscall/fd.c):      special fd (never held with thread_lock)
  *   autoreap_lock (syscall/proc.c):   serializes the whole no-zombie reap
