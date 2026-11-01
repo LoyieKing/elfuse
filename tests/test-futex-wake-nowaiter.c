@@ -50,7 +50,8 @@ int passes = 0, fails = 0;
 #define SETTLE_NS 200000L
 
 static uint32_t word;
-static uint32_t round_gate;
+/* The waker waits until main has reset word for the first round. */
+static uint32_t round_gate = UINT32_MAX;
 
 static long wake(uint32_t *w, int n)
 {

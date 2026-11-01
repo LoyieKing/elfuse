@@ -788,6 +788,11 @@ an OSR `Jumping to` transition, collection of 128 large objects and JIT
 shutdown. Android framework, Binder services, zygote and applications are
 outside this standalone fixture.
 
+`test-futex-wake-nowaiter` starts its round gate at `UINT32_MAX`; the first
+waker cannot run until main resets the word and publishes round zero. The
+stats-enabled lane exercises the same handshake without losing the first
+wakeup to a late reset.
+
 `test-sched-affinity` exercises eight compute threads pinned to one logical
 CPU. The slice timer rejects wait snapshots invalidated by notifications
 received during unlocked deadline sampling. FAIR dispatch renews an activation
