@@ -5484,11 +5484,9 @@ static vcpu_action_t vcpu_handle_exception_exit(guest_t *g,
             break;
 
         case 14:
-            /* Guest-side SYNC_CORE trampoline. The shim has already executed IC
-             * IALLU/DSB ISH/ISB on this vCPU and saved ELR/SPSR; the pool
-             * publishes the generation ack and returns, leaving every guest
-             * register untouched so the shim can ERET to the interrupted
-             * PC/CPSR.
+            /* The trampoline completed IC/DSB/ISB. Restore interrupted EL0/EL1
+             * state before acknowledging; an EL1 syscall tail retains its own
+             * ELR/SPSR rather than ERET through the trampoline's values.
              */
             if (!vcpu_pool_barrier_ack_current()) {
                 log_fatal("%s: HVC #14 with no SYNC_CORE in flight", prefix);

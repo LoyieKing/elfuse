@@ -757,6 +757,37 @@ bash tests/qemu-runner.sh exec /mnt/host/build/test-sigtimedwait
 
 The normal aarch64 matrices include this test for elfuse and Linux.
 
+## Core synchronization and standalone ART
+
+`tests/test-membarrier-sync-core.c` races 1,000 private expedited core
+barriers against three threads making syscalls and computing a deterministic
+64-bit sequence. It checks syscall results, arithmetic and completed work.
+Both aarch64 matrices run this case.
+
+```sh
+make elfuse build/test-membarrier-sync-core
+build/elfuse build/test-membarrier-sync-core
+bash tests/qemu-runner.sh exec /mnt/host/build/test-membarrier-sync-core
+```
+
+The local `externals/art-arm64` fixture contains the Android 16 QPR2 ARM64
+ART APEX, matching Bionic/i18n/conscrypt libraries, a boot image and the
+`ArtSmoke` DEX. It is not fetched or built by the repository test suite.
+Its `build-info.txt` records source revision and build commands.
+
+```sh
+bash externals/art-arm64/run.sh
+```
+
+The entrypoint enables JIT with warmup threshold 10 and compilation threshold
+100. A successful run exits 0 with `ART_ARM64_OK sum=5000050000 threads=40000`.
+The workload checks arithmetic, four Java threads, atomic increments,
+allocation, explicit GC and an exception. Android logd packets captured from
+the fixture's `dev/socket/logdw` confirm Baseline/Optimized/OSR compilation,
+an OSR `Jumping to` transition, collection of 128 large objects and JIT
+shutdown. Android framework, Binder services, zygote and applications are
+outside this standalone fixture.
+
 ## Validation Strategy By Change Type
 
 Suggested minimum validation:

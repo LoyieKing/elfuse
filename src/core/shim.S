@@ -32,8 +32,8 @@
  *   #12  System instr trap cache maintenance logging (DC CVAU, IC IVAU, ...)
  *   #13  Ptrace interrupt  GPRs restored from HVC #5's saved SVC frame
  *   #14  SYNC_CORE done  host-injected trampoline below executed the guest
- *                        IC IALLU/DSB ISH/ISB; the host acknowledges the
- *                        barrier generation. No registers are an input.
+ *                        IC IALLU/DSB ISH/ISB; the host restores the interrupted
+ *                        context, then acknowledges. No registers are inputs.
  *
  * X8 on return from #5, the post-syscall request:
  *   0  no flush
@@ -307,11 +307,10 @@
 
 /* SYNC_CORE_VEC: host-injected trampoline entry. It occupies the AArch32
  * lower-EL synchronous slot (0x600), which an AArch64-only guest never vectors
- * through. The host redirects a vCPU here between hv_vcpu_run calls with
- * ELR_EL1/SPSR_EL1 set to the interrupted PC/CPSR and CPSR set to EL1h+DAIF;
- * sync_core_entry preserves every GPR and both registers, so the guest resumes
- * exactly where it was. Used by MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE,
- * where the I-cache invalidation is per-PE and a host ISB cannot perform it.
+ * through. The host saves interrupted EL0/EL1 state and redirects execution
+ * here between hv_vcpu_run calls with CPSR set to EL1h+DAIF. HVC #14 restores
+ * that state. Used by MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE, where the
+ * I-cache invalidation is per-PE and a host ISB cannot perform it.
  */
 .macro SYNC_CORE_VEC
     .align 7
@@ -410,31 +409,14 @@ vectors:
     BAD_VEC 0x700
     BAD_VEC 0x780
 
-/* sync_core_entry: guest-side core synchronization for a host-injected
- * SYNC_CORE barrier. Runs on the target vCPU with interrupts masked, after the
- * host redirected execution here and repurposed ELR_EL1/SPSR_EL1 for the
- * interrupted PC/CPSR. HVC #14 overwrites both system registers, so save them
- * in an extra 32-byte frame below the GPR frame; the host only acknowledges.
- * TLBI is deliberately absent: the request orders a code change, not
- * translations, and an IS-broadcast TLBI does not invalidate another PE's
- * I-cache.
+/* The host restores the interrupted context at HVC #14, including an EL1
+ * syscall tail's live ELR/SPSR. No guest return frame is needed here.
  */
 sync_core_entry:
-    SAVE_GPRS
-    sub sp, sp, #32
-    mrs x9, elr_el1
-    mrs x10, spsr_el1
-    stp x9, x10, [sp]
     ic iallu
     dsb ish
     isb
     hvc #14
-    ldp x9, x10, [sp]
-    add sp, sp, #32
-    msr elr_el1, x9
-    msr spsr_el1, x10
-    RESTORE_GPRS
-    eret
 
 /* bad_exception: Report unexpected exception to host and halt */
 bad_exception:

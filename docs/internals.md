@@ -370,7 +370,7 @@ aligned address from the `Rt` register); HVF traps DC ZVA via `HCR_EL2.TDZ=1`.
 | #11 | EL0 fault | SIGSEGV/SIGILL delivery; GPRs in frame |
 | #12 | EL0 system-instruction trap | cache maintenance logging (DC CVAU, IC IVAU, …) and `MSR TPIDR_EL0` emulation |
 | #13 | Ptrace interrupt | the shim restores the saved SVC frame before this stop, so ptrace snapshots architectural registers |
-| #14 | SYNC_CORE trampoline done | the host redirected this vCPU to vector slot `0x600`, which executed guest `IC IALLU`/`DSB ISH`/`ISB` and saved `ELR_EL1`/`SPSR_EL1`; the host acknowledges the barrier generation in `vcpu_pool_barrier_ack_current()`. No register is an input; the shim restores all GPRs and `ERET`s to the interrupted `PC`/`CPSR` |
+| #14 | SYNC_CORE trampoline done | vector slot `VBAR_EL1 + 0x600` executed guest `IC IALLU`/`DSB ISH`/`ISB`; `vcpu_pool_barrier_ack_current()` restores the owner-saved interrupted EL0/EL1 context before acknowledging the generation. No register is an input |
 
 ### Guest Barriers And SYNC_CORE
 
@@ -380,13 +380,14 @@ acknowledges.  A plain expedited barrier is a host full fence plus `ISB` on the
 owner at its next safe point.  `MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE`
 additionally needs the guest-side I-cache invalidation on every target vCPU:
 `IC IALLU` is per-PE, and an IS-broadcast `TLBI` does not wait for or perform
-it.  The owner therefore redirects its paused vCPU to vector slot `0x600` (the
-unused AArch32 synchronous slot) with `ELR_EL1`/`SPSR_EL1` holding the
-interrupted `PC`/`CPSR` and `CPSR` set to EL1h+DAIF.  The trampoline preserves
-the complete GPR set, runs `IC IALLU`, `DSB ISH`, `ISB`, and enters `HVC #14`;
-the host only acknowledges and returns, and the trampoline `ERET`s to the exact
-interrupted state.  A task that is not mounted keeps its generation lag and
-runs the same trampoline before its next guest instruction.
+it. The owner saves the complete interrupted context and redirects the paused
+vCPU to `VBAR_EL1 + 0x600`, the unused AArch32 synchronous slot, with `CPSR`
+set to EL1h+DAIF. The trampoline runs `IC IALLU`, `DSB ISH`, `ISB`, and enters
+`HVC #14`. The host restores GPRs, SIMD, PC/CPSR and system registers before
+acknowledging. An interrupted EL1 syscall tail retains its live ELR/SPSR;
+returning through a trampoline `ERET` would overwrite that tail's EL0 return
+state. An in-flight trampoline finishes before another barrier can redirect
+the vCPU. An unmounted task runs the trampoline before its next instruction.
 
 ### Critical Vector-Entry Rule
 

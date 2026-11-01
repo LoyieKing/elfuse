@@ -113,6 +113,8 @@ struct vcpu_slot {
      * #14 acknowledges exactly this value.
      */
     _Atomic uint64_t barrier_inflight;
+    guest_thread_ctx_t
+        barrier_context; /* Owner-only interrupted EL0/EL1 state. */
 
     /* Owner-only mount state. */
     struct thread_entry *_Atomic current;
@@ -187,9 +189,7 @@ static pthread_cond_t barrier_cond = PTHREAD_COND_INITIALIZER;
 static _Atomic uint64_t barrier_request;
 static uint64_t barrier_seq; /* protected by barrier_lock */
 
-/* EL1h with D/A/I/F masked. The trampoline saves the interrupted CPSR in
- * SPSR_EL1 and restores it before ERET, so the guest state is unchanged.
- */
+/* EL1h with D/A/I/F masked; the owner restores the saved context at HVC #14. */
 #define POOL_CPSR_EL1H_DAIF 0x3c5ULL
 
 static void barrier_signal(void)
@@ -203,14 +203,13 @@ static void barrier_signal(void)
  * guest never vectors through the AArch32 synchronous slot) inside the 2 KiB
  * vector table the shim is entered through.
  */
-static uint64_t slot_sync_core_entry(const guest_t *g)
+static uint64_t slot_sync_core_entry(hv_vcpu_t vcpu)
 {
-    return guest_ipa(g, g->shim_base) + 0x600;
+    return vcpu_get_sysreg(vcpu, HV_SYS_REG_VBAR_EL1) + 0x600;
 }
 
-/* Redirect the owner's live vCPU into the trampoline. Called only by the owner,
- * between hv_vcpu_run calls, so ELR_EL1/SPSR_EL1 can be repurposed for the
- * interrupted PC/CPSR without racing the guest.
+/* Redirect the owner's paused vCPU into the trampoline. Saving the complete
+ * context preserves live ELR/SPSR even when execution was interrupted in EL1.
  */
 static bool slot_start_sync_core(struct vcpu_slot *slot, guest_t *g)
 {
@@ -227,12 +226,8 @@ static bool slot_start_sync_core(struct vcpu_slot *slot, guest_t *g)
     if (gen == 0)
         return false;
 
-    uint64_t pc = 0, cpsr = 0;
-    hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc);
-    hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &cpsr);
-    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, pc);
-    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, cpsr);
-    hv_vcpu_set_reg(vcpu, HV_REG_PC, slot_sync_core_entry(g));
+    guest_ctx_save(vcpu, &slot->barrier_context);
+    hv_vcpu_set_reg(vcpu, HV_REG_PC, slot_sync_core_entry(vcpu));
     hv_vcpu_set_reg(vcpu, HV_REG_CPSR, POOL_CPSR_EL1H_DAIF);
     atomic_store_explicit(&slot->barrier_inflight, gen, memory_order_release);
     return true;
@@ -256,6 +251,8 @@ static void slot_host_barrier_ack(struct vcpu_slot *slot, uint64_t gen)
  */
 static bool slot_barrier_before_guest(struct vcpu_slot *slot, guest_t *g)
 {
+    if (atomic_load_explicit(&slot->barrier_inflight, memory_order_acquire))
+        return true;
     uint64_t req = atomic_load_explicit(&barrier_request, memory_order_acquire);
     if (req == 0)
         return false;
@@ -306,6 +303,11 @@ bool vcpu_pool_barrier_ack_current(void)
         atomic_load_explicit(&slot->barrier_inflight, memory_order_acquire);
     if (gen == 0)
         return false;
+
+    /* HVC changes ELR/SPSR even when the interrupted PC was already in EL1.
+     * Restore the entire saved context instead of ERET through that live tail.
+     */
+    guest_ctx_restore(slot->vcpu, &slot->barrier_context, NULL, 0);
     atomic_store_explicit(&slot->barrier_sync_ack, gen, memory_order_release);
     atomic_store_explicit(&slot->barrier_fence_ack, gen, memory_order_release);
     atomic_store_explicit(&slot->barrier_inflight, 0, memory_order_release);

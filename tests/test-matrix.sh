@@ -1058,6 +1058,7 @@ run_unit_tests()
 
     printf "\nmembarrier\n"
     test_rc "$runner" "test-membarrier" 0 "$bindir/test-membarrier"
+    test_rc "$runner" "test-membarrier-sync-core" 0 "$bindir/test-membarrier-sync-core"
 
     printf "\nrseq registration\n"
     test_rc "$runner" "test-rseq" 0 "$bindir/test-rseq"
