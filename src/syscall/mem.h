@@ -37,12 +37,20 @@ int guest_memory_residency(const guest_t *g,
                            uint64_t len,
                            unsigned char *vec);
 
-/* Synchronize primary guest backing into an independent fork snapshot fd.
- * Caller holds mmap_lock and has quiesced siblings.
+/* Synchronize primary guest backing into an independent fork snapshot fd. Whole
+ * file pages past EOF and DONTFORK regions are omitted. Caller holds mmap_lock
+ * and has quiesced siblings.
  *
  * Returns 0 or a negative Linux errno.
  */
 int guest_memory_snapshot(const guest_t *g, int fd);
+
+/* Remove private file EOF translations after fork restore or mprotect regrant.
+ * Caller holds mmap_lock.
+ *
+ * Returns 0 or a negative Linux errno.
+ */
+int mmap_fork_invalidate_private_eof(guest_t *g, uint64_t start, uint64_t end);
 
 /* brk: set/query program break */
 int64_t sys_brk(guest_t *g, uint64_t addr);

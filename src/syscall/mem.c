@@ -883,9 +883,19 @@ int guest_memory_snapshot(const guest_t *g, int fd)
     for (int i = 0; i < g->nregions; i++) {
         const guest_region_t *r = &g->regions[i];
         uint64_t len = r->end - r->start;
-        if (r->gpa_base >= g->guest_size || len > g->guest_size - r->gpa_base ||
-            (r->overlay_active && r->shared))
+        if (r->dontfork || r->gpa_base >= g->guest_size ||
+            len > g->guest_size - r->gpa_base)
             continue;
+        if (r->backing_fd >= 0) {
+            struct stat st;
+            if (fstat(r->backing_fd, &st) < 0)
+                return linux_errno();
+            uint64_t file_end;
+            if (st.st_size < 0 ||
+                !align_up_ok((uint64_t) st.st_size, GUEST_PAGE_SIZE, &file_end))
+                return -LINUX_EIO;
+            slice_clamp(file_end, r->offset, len, &len);
+        }
         uint64_t cursor = r->gpa_base;
         while (len) {
             int dispositions[512];
@@ -2429,7 +2439,7 @@ static int hvf_remove_file_overlay(guest_t *g, uint64_t ipa, uint64_t len)
     return err;
 }
 
-static int invalidate_private_file_eof(guest_t *g, uint64_t start, uint64_t end)
+int mmap_fork_invalidate_private_eof(guest_t *g, uint64_t start, uint64_t end)
 {
     for (int i = guest_region_first_end_above(g, start); i < g->nregions; i++) {
         const guest_region_t *r = &g->regions[i];
@@ -3146,6 +3156,11 @@ int64_t sys_mmap(guest_t *g,
                 return ref_err;
             }
             host_backing_fd = fresh.backing_ref.fd;
+            if ((flags & LINUX_MAP_SHARED) && (prot & LINUX_PROT_WRITE) &&
+                !overlay_fd_writable(host_backing_fd)) {
+                mmap_fresh_dispose(&fresh);
+                return -LINUX_EACCES;
+            }
         }
 
         remove_range_t replaced = {result_off, result_off + length};
@@ -3257,6 +3272,7 @@ int64_t sys_mmap(guest_t *g,
                     return reset_err;
                 }
             } else if (fd >= 0 && (flags & LINUX_MAP_SHARED) &&
+                       overlay_fd_writable(host_backing_fd) &&
                        (result_off % host_page_size_cached() == 0) &&
                        ((uint64_t) offset % host_page_size_cached() == 0)) {
                 uint64_t fixed_overlay_len =
@@ -3401,6 +3417,28 @@ int64_t sys_mmap(guest_t *g,
         }
 
         uint64_t align = host_page_size_cached();
+
+        /* Private mappings can retain a guest-page hint. Shared aliases need
+         * host-page placement to keep live file backing instead of snapshots.
+         */
+        result_off = UINT64_MAX;
+        if (addr >= g->ipa_base && addr != 0) {
+            uint64_t hint = ALIGN_DOWN(addr - g->ipa_base, GUEST_PAGE_SIZE);
+            if (hint >= GUEST_PAGE_SIZE &&
+                (!(flags & LINUX_MAP_SHARED) || hint % align == 0) &&
+                window_fits(hint, length, g->mmap_limit) &&
+                !guest_range_hits_infra(g, hint, hint + length) &&
+                !region_range_overlaps(g, hint, hint + length)) {
+                uint64_t host_start = ALIGN_DOWN(hint, align);
+                uint64_t host_end = ALIGN_UP(hint + length, align);
+                bool live_overlay = false;
+                for (int i = guest_region_first_end_above(g, host_start);
+                     i < g->nregions && g->regions[i].start < host_end; i++)
+                    live_overlay |= region_has_live_overlay(&g->regions[i]);
+                if (!live_overlay)
+                    result_off = hint;
+            }
+        }
         if (needs_exec && !(prot & LINUX_PROT_WRITE)) {
             /* PROT_EXEC without PROT_WRITE: allocate from the RX mmap region.
              * Apple HVF enforces W^X on 2MiB block page table entries, so
@@ -3408,8 +3446,9 @@ int64_t sys_mmap(guest_t *g,
              * ones. The RX region at MMAP_RX_BASE is pre-mapped with execute
              * permission.
              */
-            result_off =
-                find_free_gap(g, length, MMAP_RX_BASE, g->mmap_limit, align);
+            if (result_off == UINT64_MAX)
+                result_off = find_free_gap(g, length, MMAP_RX_BASE,
+                                           g->mmap_limit, align);
             if (result_off == UINT64_MAX) {
                 log_debug(
                     "mmap: RX address space exhausted "
@@ -3432,8 +3471,7 @@ int64_t sys_mmap(guest_t *g,
              * spin-retry if they get a low address instead. On real Linux, mmap
              * tries the hint first and falls back to any suitable address.
              */
-            result_off = UINT64_MAX;
-            if (addr != 0) {
+            if (result_off == UINT64_MAX && addr != 0) {
                 uint64_t hint_off = addr - g->ipa_base;
                 if (hint_off >= ELF_DEFAULT_BASE && hint_off <= g->mmap_limit &&
                     length <= g->mmap_limit - hint_off) {
@@ -4953,7 +4991,7 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
                     return -LINUX_ENOMEM;
             }
             if (prot != LINUX_PROT_NONE) {
-                int err = invalidate_private_file_eof(g, addr, mprot_end);
+                int err = mmap_fork_invalidate_private_eof(g, addr, mprot_end);
                 if (err < 0)
                     return err;
             }
@@ -4996,7 +5034,8 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
                     return -LINUX_ENOMEM;
             }
             if (prot != LINUX_PROT_NONE) {
-                int err = invalidate_private_file_eof(g, mprot_off, mprot_end);
+                int err =
+                    mmap_fork_invalidate_private_eof(g, mprot_off, mprot_end);
                 if (err < 0)
                     return err;
             }

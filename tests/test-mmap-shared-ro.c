@@ -234,6 +234,39 @@ static void test_rdonly_mprotect_write_rejected(const char *path)
     close(fd);
 }
 
+static void test_rdonly_shared_fixed(const char *path)
+{
+    const size_t len = 8 * PGSZ;
+    unsigned char *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    int fd = open(path, O_RDONLY);
+    if (p == MAP_FAILED || fd < 0) {
+        FAIL("setup fixed mapping");
+        if (p != MAP_FAILED)
+            munmap(p, len);
+        if (fd >= 0)
+            close(fd);
+        return;
+    }
+    p[0] = 0xe7;
+    TEST("fixed shared write on read-only fd preserves old bytes");
+    EXPECT_ERRNO(
+        mmap(p, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0),
+        EACCES, "writable mapping accepted read-only backing");
+    EXPECT_TRUE(p[0] == 0xe7, "failed fixed mmap destroyed original bytes");
+    TEST("fixed read-only shared mapping keeps bytes");
+    unsigned char *mapped =
+        mmap(p, len, PROT_READ, MAP_SHARED | MAP_FIXED, fd, 0);
+    EXPECT_TRUE(
+        mapped == p && p[0] == page_marker(0) && p[7 * PGSZ] == page_marker(7),
+        "fixed read-only file mapping failed");
+    TEST("fixed read-only shared rejects write regrant");
+    EXPECT_ERRNO(mprotect(p, len, PROT_READ | PROT_WRITE), EACCES,
+                 "write regrant accepted read-only backing");
+    munmap(p, len);
+    close(fd);
+}
+
 int main(void)
 {
     printf("test-mmap-shared-ro: read-only MAP_SHARED file overlay tests\n\n");
@@ -250,6 +283,7 @@ int main(void)
     test_rdonly_shared_write_rejected(path);
     test_rdwr_fd_readonly_mapping(path);
     test_rdonly_mprotect_write_rejected(path);
+    test_rdonly_shared_fixed(path);
 
     unlink(path);
 

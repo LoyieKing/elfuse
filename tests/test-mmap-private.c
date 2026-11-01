@@ -1422,6 +1422,63 @@ close_files:
     close(rw);
 }
 
+/* Untouched EOF pages are valid VMA coverage, but have no backing to copy into
+ * a fork snapshot. Dirty bytes in the last file page still belong to the child.
+ */
+static void test_fork_eof_mapping(void)
+{
+    const size_t file_len = 4 * page_size + 123;
+    const size_t map_len = 12 * page_size;
+    int ro = -1, rw = -1, status = 0;
+    struct sigaction action = {.sa_sigaction = eof_handler,
+                               .sa_flags = SA_SIGINFO};
+    struct sigaction old_bus, old_segv;
+
+    TEST("fork preserves private file EOF");
+    if (!make_seed_file(file_len, &ro, &rw)) {
+        FAIL("seed file");
+        return;
+    }
+    unsigned char *p =
+        mmap(NULL, map_len, PROT_READ | PROT_WRITE, MAP_PRIVATE, ro, 0);
+    if (p == MAP_FAILED) {
+        FAIL("mmap private");
+        close(ro);
+        close(rw);
+        return;
+    }
+    p[0] = 0xe7;
+    p[4 * page_size + 200] = 0xd4;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGBUS, &action, &old_bus);
+    sigaction(SIGSEGV, &action, &old_segv);
+    pid_t child = fork();
+    if (child == 0) {
+        if (p[0] != 0xe7 || p[4 * page_size + 200] != 0xd4 ||
+            !matches_seed(p + page_size, page_size, 3 * page_size + 123))
+            _exit(2);
+        eof_signal = 0;
+        eof_code = 0;
+        if (sigsetjmp(eof_recover, 1) == 0) {
+            volatile unsigned char value = p[8 * page_size];
+            (void) value;
+        }
+        if (eof_signal != SIGBUS || eof_code != BUS_ADRERR)
+            _exit(3);
+        p[0] = 0xa1;
+        _exit(0);
+    }
+    bool ok = child > 0 && waitpid(child, &status, 0) == child &&
+              WIFEXITED(status) && WEXITSTATUS(status) == 0 && p[0] == 0xe7 &&
+              p[4 * page_size + 200] == 0xd4 && file_matches_seed(rw, file_len);
+    EXPECT_TRUE(ok, "fork lost private bytes or EOF fault");
+    sigaction(SIGBUS, &old_bus, NULL);
+    sigaction(SIGSEGV, &old_segv, NULL);
+    munmap(p, map_len);
+    close(ro);
+    close(rw);
+}
+
 int main(void)
 {
     long host_page = sysconf(_SC_PAGESIZE);
@@ -1456,6 +1513,7 @@ int main(void)
     }
     test_untouched_file_mapping_absent();
     test_untouched_large_mapping_io();
+    test_fork_eof_mapping();
     test_elf_segment_replacement();
     test_mremap_keeps_data();
 

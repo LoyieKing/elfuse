@@ -12,6 +12,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/mman.h>
@@ -77,28 +78,17 @@ static void test_shared_file_hint_falls_back_from_2m_alignment(void)
     TEST("MAP_SHARED file hint falls back from 2MiB alignment");
 
     const size_t page = (size_t) sysconf(_SC_PAGESIZE);
-    const uintptr_t block_2m = 2ULL * 1024ULL * 1024ULL;
 
-    void *anchor =
-        mmap(NULL, page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void *base = reserve_free_low_hint(0x20000 + page);
+    void *anchor = base == MAP_FAILED ? MAP_FAILED : (char *) base + 0x20000;
     if (anchor == MAP_FAILED) {
         FAIL("anchor mmap failed");
         return;
     }
 
     uintptr_t anchor_addr = (uintptr_t) anchor;
-    uintptr_t anchor_block = anchor_addr & ~(block_2m - 1);
-    if (anchor_addr != anchor_block) {
-        munmap(anchor, page);
-        FAIL("anchor not 2MiB-aligned");
-        return;
-    }
-    if (anchor_block < 0x00400000ULL + 0x10000ULL) {
-        munmap(anchor, page);
-        FAIL("anchor too low for regression hint");
-        return;
-    }
-    uintptr_t hint_addr = anchor_block - 0x10000ULL;
+    munmap(base, 0x20000);
+    uintptr_t hint_addr = anchor_addr - 0x10000;
 
     char path[] = "/tmp/elfuse-mmap-hint-XXXXXX";
     int fd = mkstemp(path);
@@ -133,10 +123,81 @@ static void test_shared_file_hint_falls_back_from_2m_alignment(void)
     munmap(anchor, page);
 }
 
+static void test_guest_page_hint(void)
+{
+    const size_t len = 8 * 4096;
+    void *base = reserve_free_low_hint(len);
+    if (base == MAP_FAILED) {
+        TEST("4KiB hint setup");
+        FAIL("no free range");
+        return;
+    }
+    munmap(base, len);
+    void *hint = (char *) base + 2 * 4096;
+    TEST("4KiB-aligned anonymous hint stays exact");
+    void *p = mmap(hint, 4096, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    EXPECT_TRUE(p == hint, "hint rounded to host page");
+    if (p != MAP_FAILED)
+        munmap(p, 4096);
+
+    TEST("4KiB-aligned executable hint stays exact");
+    p = mmap(hint, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1,
+             0);
+    EXPECT_TRUE(p == hint, "executable mmap ignored free hint");
+    if (p != MAP_FAILED)
+        munmap(p, 4096);
+}
+
+static void test_shared_hint_coherence(void)
+{
+    const size_t len = 4 * 4096;
+    void *base = reserve_free_low_hint(2 * len);
+    char path[] = "/tmp/elfuse-shared-hint-XXXXXX";
+    int fd = mkstemp(path);
+    TEST("shared aliases stay coherent with 4KiB hint");
+    if (base == MAP_FAILED || fd < 0) {
+        FAIL("setup shared hint");
+        if (base != MAP_FAILED)
+            munmap(base, 2 * len);
+        if (fd >= 0) {
+            close(fd);
+            unlink(path);
+        }
+        return;
+    }
+    unlink(path);
+    munmap(base, 2 * len);
+    if (ftruncate(fd, len) < 0) {
+        FAIL("ftruncate");
+        close(fd);
+        return;
+    }
+    volatile unsigned char *p = mmap((char *) base + 2 * 4096, len,
+                                     PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    volatile unsigned char *alias =
+        mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    bool ok = (void *) p != MAP_FAILED && (void *) alias != MAP_FAILED;
+    if (ok) {
+        p[0] = 0xe7;
+        ok = alias[0] == 0xe7;
+        alias[4096] = 0xd3;
+        ok = ok && p[4096] == 0xd3;
+    }
+    EXPECT_TRUE(ok, "address hint turned shared backing into a snapshot");
+    if ((void *) p != MAP_FAILED)
+        munmap((void *) p, len);
+    if ((void *) alias != MAP_FAILED)
+        munmap((void *) alias, len);
+    close(fd);
+}
+
 int main(void)
 {
     test_low_hint_exact();
     test_shared_file_hint_falls_back_from_2m_alignment();
+    test_guest_page_hint();
+    test_shared_hint_coherence();
     SUMMARY("test-mmap-hint");
     return fails ? 1 : 0;
 }

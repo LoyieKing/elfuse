@@ -788,6 +788,15 @@ an OSR `Jumping to` transition, collection of 128 large objects and JIT
 shutdown. Android framework, Binder services, zygote and applications are
 outside this standalone fixture.
 
+ATL's Alpine `art_standalone` package is a separate runtime from this APEX.
+Its compiler path exercises fork/exec, boot image creation and fixed read-only
+VDEX mappings. With a matching passwd entry and writable cache, boot image and
+application dex compilation complete under elfuse. The package's
+`AsynchronousCloseMonitor` signal-handler EINVAL and shutdown
+`JavaVM::GetEnv()` abort also occur under Linux/HVF; a printed `ART_ARM64_OK`
+followed by this abort is not a passing runtime exit. GTK display and APK
+lifecycle remain outside this command-line runtime validation.
+
 Owner CPU accounting uses Darwin's public `CLOCK_THREAD_CPUTIME_ID`;
 cross-worker live samples use the cached Mach thread port. Both exclude
 waiting and host descheduling. The static `fd-create` guardrail allows 15 us
@@ -848,10 +857,10 @@ Wait, stopped-tracee and fork-barrier cases retain exit status 42.
 fork isolation and concurrent reset under both policies. `make
 test-memory-residency` checks untouched, written, discarded and `PROT_NONE`
 backing through `mincore`. `make test-mmap-private` checks private file writes,
-host-page edges, fork, initial `PROT_NONE`, EOF tails, ELF segment replacement
-across EOF and mremap under both policies. It also checks retained EOF-page
-SIGBUS delivery after replacement and permission regrant. Both aarch64 matrices
-run the default lazy guest cases.
+host-page edges, fork (including mappings beyond EOF), initial `PROT_NONE`, EOF
+tails, ELF segment replacement across EOF and mremap under both policies. It
+also checks retained EOF-page SIGBUS delivery after replacement, fork and
+permission regrant. Both aarch64 matrices run the default lazy guest cases.
 
 ```sh
 make elfuse test-memory-mode test-memory-residency test-mmap-private

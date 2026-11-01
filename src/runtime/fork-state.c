@@ -18,6 +18,9 @@
 
 #include "utils.h"
 
+#include "proved/align.h"
+#include "proved/slice.h"
+
 #include "runtime/fork-state.h"
 #include "runtime/procemu.h"
 
@@ -222,15 +225,33 @@ int fork_ipc_send_memory_regions_locked(int ipc_sock,
         if (fork_ipc_write_all(ipc_sock, &rhdr, sizeof(rhdr)) < 0)
             return -1;
 
-        uint8_t *src = (uint8_t *) g->host_base + used[i].offset;
-        size_t remaining = used[i].size;
+        uint64_t cursor = used[i].offset;
+        uint64_t remaining = used[i].size;
         while (remaining > 0) {
-            size_t chunk = remaining > ((size_t) 1024 * 1024)
-                               ? ((size_t) 1024 * 1024)
-                               : remaining;
+            size_t chunk = remaining > GUEST_PAGE_SIZE ? GUEST_PAGE_SIZE
+                                                       : (size_t) remaining;
+            uint8_t bytes[GUEST_PAGE_SIZE];
+            const guest_region_t *r = guest_region_find(g, cursor);
+            bool file_hole = false;
+            if (r && r->backing_fd >= 0) {
+                struct stat st;
+                if (fstat(r->backing_fd, &st) < 0)
+                    return -1;
+                uint64_t file_end, available;
+                if (st.st_size < 0 || !align_up_ok((uint64_t) st.st_size,
+                                                   GUEST_PAGE_SIZE, &file_end))
+                    return -1;
+                slice_clamp(file_end, r->offset, r->end - r->start, &available);
+                file_hole = cursor - r->start >= available;
+            }
+            const void *src = (uint8_t *) g->host_base + cursor;
+            if (file_hole) {
+                memset(bytes, 0, chunk);
+                src = bytes;
+            }
             if (fork_ipc_write_all(ipc_sock, src, chunk) < 0)
                 return -1;
-            src += chunk;
+            cursor += chunk;
             remaining -= chunk;
         }
     }
@@ -1296,6 +1317,16 @@ int fork_ipc_recv_process_state(int ipc_fd,
     if (g->nregions > 0)
         (void) mmap_fork_restore_overlays(g, parent_active, parent_ovl_start,
                                           parent_ovl_end);
+    mmap_lock_acquire();
+    int eof_err = mmap_fork_invalidate_private_eof(g, 0, UINT64_MAX);
+    mmap_lock_release();
+    if (eof_err < 0) {
+        free(parent_had_fd);
+        free(parent_active);
+        free(parent_ovl_start);
+        free(parent_ovl_end);
+        return -1;
+    }
     free(parent_had_fd);
     free(parent_active);
     free(parent_ovl_start);

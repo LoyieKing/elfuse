@@ -578,6 +578,12 @@ views opened through an `O_RDONLY` descriptor. Replacement refreshes only the
 host-page-aligned HVF range. Apple Silicon uses 16 KiB host pages, so the
 gap-finder advances to the next host-page boundary after each allocation.
 
+Free private mmap hints are honored at the guest's 4 KiB granularity, including
+executable mappings. Shared mappings prefer host-page-aligned placement so
+their aliases retain live coherence. Read-only shared files use the snapshot
+path for both fixed and non-fixed mappings; write requests are rejected before
+replacing an existing mapping.
+
 Private mappings whose address, length or file offset is not host-page-aligned
 use a zero-filled `pread` snapshot. These edges preserve guest 4 KiB byte
 semantics but do not have file demand paging. Private discard remaps complete
@@ -588,6 +594,12 @@ ELF data-segment replacement can intersect a file mapping beyond EOF. Host-page
 edge preservation copies only backed guest pages, including private writes in
 the file's last page. Retained whole pages beyond EOF stay invalid and deliver
 `SIGBUS/BUS_ADRERR`; `mprotect` regrant keeps those pages invalid.
+
+Fork snapshots copy file-backed pages only through the rounded guest EOF page,
+including private writes in its zero-filled tail. Whole EOF pages are omitted
+from both clonefile synchronization and the region-copy fallback; the child
+restores their invalid PTEs after receiving backing descriptors. Anonymous
+compressed or paged-out data is still copied rather than treated as a hole.
 
 Direct private file installation replaces the old backing without first
 resetting it to anonymous memory. Unmap resets plain slab pages and tears down

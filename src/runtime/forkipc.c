@@ -1322,41 +1322,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
      */
     bool use_shm = (g->shm_fd >= 0);
 
-    /* Shared overlays reference their file rather than shm_fd. Synchronize them
-     * before cloning so the snapshot file includes their current bytes.
-     */
     if (use_shm) {
-        for (int i = 0; i < g->nregions; i++) {
-            const guest_region_t *r = &g->regions[i];
-            if (!r->overlay_active)
-                continue;
-            uint64_t len = r->end - r->start;
-            const uint8_t *src = (const uint8_t *) g->host_base + r->start;
-            uint64_t off = r->start;
-            while (len > 0) {
-                size_t chunk = len > (uint64_t) SSIZE_MAX ? (size_t) SSIZE_MAX
-                                                          : (size_t) len;
-                ssize_t nw = pwrite(g->shm_fd, src, chunk, (off_t) off);
-                if (nw < 0) {
-                    if (errno == EINTR)
-                        continue;
-                    log_error("clone: shm overlay sync pwrite failed: %s",
-                              strerror(errno));
-                    goto fail_snapshot;
-                }
-                if (nw == 0) {
-                    log_error("clone: shm overlay sync pwrite returned 0");
-                    goto fail_snapshot;
-                }
-                src += nw;
-                off += (uint64_t) nw;
-                len -= (uint64_t) nw;
-            }
-        }
-
-        /* The clone supplies an independent snapshot file; synchronization
-         * below also copies resident anonymous backing and private file CoW.
-         */
         snapshot_shm_fd = fork_snapshot_shm_via_clonefile(g->shm_fd);
         if (snapshot_shm_fd >= 0 &&
             guest_memory_snapshot(g, snapshot_shm_fd) < 0)
@@ -1435,12 +1401,9 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         goto fail_snapshot;
     }
 
-    /* Send the snapshot fd if fclonefileat succeeded, otherwise the live
-     * g->shm_fd. The Rosetta-failure case already cleared use_shm above so it
-     * never reaches this branch with snapshot_shm_fd < 0.
-     */
+    /* Only independent snapshots are sent; clone failure uses region copy. */
     if (use_shm) {
-        int fd_to_send = (snapshot_shm_fd >= 0) ? snapshot_shm_fd : g->shm_fd;
+        int fd_to_send = snapshot_shm_fd;
         if (fork_ipc_send_fds(ipc_sock, &fd_to_send, 1) < 0) {
             log_error("clone: failed to send shm fd");
             goto fail_snapshot;
