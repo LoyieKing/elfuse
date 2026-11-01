@@ -2285,6 +2285,17 @@ static int64_t host_fd_ref_open_checked(int guest_fd,
     return 0;
 }
 
+/* The slot types a pty master can occupy. /dev/ptmx goes through the ordinary
+ * path open, which publishes FD_REGULAR (or FD_STDIO when it lands on 0-2), and
+ * dup/clone carry the type along with the slot. Nothing else can hold one:
+ * pipe() and socket() make their host descriptors themselves, and the synthetic
+ * types are emulated objects with no host descriptor of their own.
+ */
+static bool fd_type_may_be_pty_master(int type)
+{
+    return type == FD_REGULAR || type == FD_STDIO;
+}
+
 /* True when a read on this pty master must fail with EIO.
  *
  * Linux fails every read variant once the master has hung up, not just read(2).
@@ -2296,13 +2307,40 @@ static int64_t host_fd_ref_open_checked(int guest_fd,
  * the pty alive from its point of view -- so a terminal that drains its master
  * with readv() gets the POLLHUP, calls readv, and wedges there forever with its
  * window still open.
+ *
+ * type is the slot's classification taken with the pinned descriptor, and it
+ * gates the probe: proc_pty_master_hung_up re-resolves the guest fd (one
+ * fd-table lock and a whole-entry snapshot) and then scans the keepalive table
+ * under its own lock, which is work a pipe or a socket read can never need. The
+ * gate is not an approximation -- only a type that can hold a pty master
+ * reaches the probe, and the generation check inside it still rejects a slot
+ * recycled since this read resolved it.
  */
-static bool pty_read_hangs_up(int guest_fd, uint64_t gen, int host_fd)
+static bool pty_read_hangs_up(int guest_fd, uint64_t gen, int host_fd, int type)
 {
+    if (!fd_type_may_be_pty_master(type))
+        return false;
     if (!proc_pty_master_hung_up(guest_fd, gen))
         return false;
     struct pollfd drain = {.fd = host_fd, .events = POLLIN};
     return poll(&drain, 1, 0) <= 0 || !(drain.revents & POLLIN);
+}
+
+/* Whether lseek below could answer anything but ESPIPE for a slot of this type.
+ *
+ * A pipe and a socket have no file offset: Linux reports ESPIPE for both
+ * (lseek(2)), and macOS does the same, measured here for a pipe end and for an
+ * AF_UNIX socket of either type. So every read and write below asks the host a
+ * question the type has already answered, once per transfer. Declining to ask
+ * changes nothing else: it is the failed lseek that leaves the offset negative,
+ * and a negative offset is what tells the proc intercept and the RLIMIT_FSIZE
+ * check to stand down. Neither can apply to a description with no offset -- the
+ * emulated /proc entries are staged regular files, and fsize_room rejects
+ * anything that is not one.
+ */
+static bool fd_type_has_file_offset(int type)
+{
+    return type != FD_PIPE && type != FD_SOCKET;
 }
 
 
@@ -2582,7 +2620,13 @@ static int64_t sys_write_cont(guest_t *g,
     if (count > avail)
         count = avail;
 
-    off_t offset = lseek(host_ref.fd, 0, SEEK_CUR);
+    /* A pipe or a socket has no offset for the intercept or the RLIMIT_FSIZE
+     * check below to work from; fd_type_has_file_offset says why the host call
+     * is not worth making to learn that.
+     */
+    off_t offset = fd_type_has_file_offset(write_st.type)
+                       ? lseek(host_ref.fd, 0, SEEK_CUR)
+                       : (off_t) -1;
     if (offset >= 0) {
         ssize_t intercepted = 0;
         int handled = proc_intercept_write(fd, host_ref.fd, buf, count, offset,
@@ -2687,13 +2731,23 @@ int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
      * Only once nothing is left to read: a shell that printed on its way out
      * leaves that output queued, and Linux hands it over before reporting the
      * hangup. Deciding on the hangup first would swallow it.
+     *
+     * read_st is the classification taken with this descriptor above, so the
+     * type test costs nothing and cannot disagree with the fd the probe would
+     * re-resolve.
      */
-    if (pty_read_hangs_up(fd, read_gen, host_ref.fd)) {
+    if (pty_read_hangs_up(fd, read_gen, host_ref.fd, read_st.type)) {
         host_fd_ref_close(&host_ref);
         return -LINUX_EIO;
     }
 
-    off_t offset = lseek(host_ref.fd, 0, SEEK_CUR);
+    /* The intercept below needs the offset it must answer for, so it can only
+     * apply to a description that has one; see fd_type_has_file_offset for why
+     * asking a pipe or a socket is a host call spent on a known answer.
+     */
+    off_t offset = fd_type_has_file_offset(read_st.type)
+                       ? lseek(host_ref.fd, 0, SEEK_CUR)
+                       : (off_t) -1;
     if (offset >= 0) {
         int64_t intercepted =
             proc_try_read_intercept(fd, host_ref.fd, buf, count, offset, 0);
@@ -3277,14 +3331,19 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
      * After the zero-payload branch on purpose: a vector that can consume
      * nothing reads zero bytes on Linux whatever the pty's state, so deciding
      * the hangup first would turn that into a spurious EIO.
+     *
+     * readv_st gates the probe exactly as sys_read's read_st does: a type that
+     * cannot hold a pty master never reaches it.
      */
-    if (pty_read_hangs_up(fd, readv_gen, host_ref.fd)) {
+    if (pty_read_hangs_up(fd, readv_gen, host_ref.fd, readv_st.type)) {
         host_iov_free(&host_iov);
         host_fd_ref_close(&host_ref);
         return -LINUX_EIO;
     }
 
-    off_t offset = lseek(host_ref.fd, 0, SEEK_CUR);
+    off_t offset = fd_type_has_file_offset(readv_st.type)
+                       ? lseek(host_ref.fd, 0, SEEK_CUR)
+                       : (off_t) -1;
     if (offset >= 0) {
         int64_t intercepted = proc_try_readv_intercept(
             fd, host_ref.fd, host_iov.iov, iovcnt, offset, 0);
@@ -3370,7 +3429,12 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
         return err < 0 ? err : 0;
     }
 
-    off_t offset = lseek(host_ref.fd, 0, SEEK_CUR);
+    /* Same gate as the scalar write above: no offset, no intercept and no
+     * RLIMIT_FSIZE for a pipe or a socket.
+     */
+    off_t offset = fd_type_has_file_offset(writev_st.type)
+                       ? lseek(host_ref.fd, 0, SEEK_CUR)
+                       : (off_t) -1;
     if (offset >= 0) {
         int64_t intercepted = proc_try_writev_intercept(
             fd, host_ref.fd, host_iov.iov, iovcnt, offset, 0);
