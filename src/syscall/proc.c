@@ -4633,12 +4633,36 @@ static bool vcpu_handle_el0_fault(guest_t *g,
         return sig_ret >= 0;
     }
 
-    /* MAP_NORESERVE translations fault until their L2 entry is materialized.
-     * Backing remains demand-paged by the host.
+    /* A private file edge detached during MAP_FIXED keeps whole EOF pages
+     * invalid. Classify these before MAP_NORESERVE materialization or stale-TLB
+     * retry so an absent file page remains SIGBUS.
      */
     uint32_t fsc = (uint32_t) (esr & 0x3F);
     uint32_t fsc_type = (fsc >> 2) & 0xF;
     if (fsc_type == 0x01) {
+        bool file_eof = false;
+        mmap_lock_acquire();
+        const guest_region_t *region = guest_region_find(g, far_addr);
+        if (region && region->backing_fd >= 0 && !region->shared &&
+            !region->overlay_active && region->prot != LINUX_PROT_NONE) {
+            struct stat st;
+            if (fstat(region->backing_fd, &st) == 0 && st.st_size >= 0) {
+                uint64_t pages = (uint64_t) st.st_size / GUEST_PAGE_SIZE +
+                                 ((uint64_t) st.st_size % GUEST_PAGE_SIZE != 0);
+                uint64_t offset_pages = region->offset / GUEST_PAGE_SIZE;
+                file_eof = offset_pages >= pages ||
+                           (far_addr - region->start) / GUEST_PAGE_SIZE >=
+                               pages - offset_pages;
+            }
+        }
+        mmap_lock_release();
+        if (file_eof) {
+            signal_set_fault_info(LINUX_BUS_ADRERR, far_addr, esr);
+            int sig_ret =
+                signal_deliver_fault(vcpu, g, LINUX_SIGBUS, exit_code);
+            hv_vcpu_set_reg(vcpu, HV_REG_X8, 0);
+            return sig_ret >= 0;
+        }
         uint64_t fault_off = far_addr - g->ipa_base;
         mmap_lock_acquire();
         int mat = guest_materialize_lazy(g, fault_off);

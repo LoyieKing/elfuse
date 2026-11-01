@@ -584,6 +584,11 @@ semantics but do not have file demand paging. Private discard remaps complete
 host pages from the file; partial host pages restore only requested bytes.
 Private unmap preserves neighboring bytes in shared host-page edges.
 
+ELF data-segment replacement can intersect a file mapping beyond EOF. Host-page
+edge preservation copies only backed guest pages, including private writes in
+the file's last page. Retained whole pages beyond EOF stay invalid and deliver
+`SIGBUS/BUS_ADRERR`; `mprotect` regrant keeps those pages invalid.
+
 Direct private file installation replaces the old backing without first
 resetting it to anonymous memory. Unmap resets plain slab pages and tears down
 file overlays once. Accessible file mappings install guest page tables eagerly;

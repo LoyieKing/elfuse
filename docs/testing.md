@@ -848,8 +848,10 @@ Wait, stopped-tracee and fork-barrier cases retain exit status 42.
 fork isolation and concurrent reset under both policies. `make
 test-memory-residency` checks untouched, written, discarded and `PROT_NONE`
 backing through `mincore`. `make test-mmap-private` checks private file writes,
-host-page edges, fork, initial `PROT_NONE`, EOF tails and mremap under both
-policies. Both aarch64 matrices run the default lazy guest cases.
+host-page edges, fork, initial `PROT_NONE`, EOF tails, ELF segment replacement
+across EOF and mremap under both policies. It also checks retained EOF-page
+SIGBUS delivery after replacement and permission regrant. Both aarch64 matrices
+run the default lazy guest cases.
 
 ```sh
 make elfuse test-memory-mode test-memory-residency test-mmap-private

@@ -30,6 +30,7 @@
 
 #include "proved/align.h"
 #include "proved/brk.h"
+#include "proved/slice.h"
 
 #include "runtime/thread.h"
 #include "runtime/sched/vcpu_pool.h"
@@ -2428,6 +2429,71 @@ static int hvf_remove_file_overlay(guest_t *g, uint64_t ipa, uint64_t len)
     return err;
 }
 
+static int invalidate_private_file_eof(guest_t *g, uint64_t start, uint64_t end)
+{
+    for (int i = guest_region_first_end_above(g, start); i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (r->start >= end)
+            break;
+        if (r->backing_fd < 0 || r->shared || r->overlay_active)
+            continue;
+        struct stat st;
+        if (fstat(r->backing_fd, &st) < 0)
+            return linux_errno();
+        uint64_t file_end;
+        if (st.st_size < 0 ||
+            !align_up_ok((uint64_t) st.st_size, GUEST_PAGE_SIZE, &file_end))
+            return -LINUX_EIO;
+        uint64_t available;
+        slice_clamp(file_end, r->offset, r->end - r->start, &available);
+        uint64_t hole = r->start + available;
+        if (hole < start)
+            hole = start;
+        uint64_t limit = r->end < end ? r->end : end;
+        if (hole < limit && guest_invalidate_ptes(g, hole, limit) < 0)
+            return -LINUX_ENOMEM;
+    }
+    return 0;
+}
+
+/* Whole guest pages past EOF have no bytes to preserve, including when an ELF
+ * loader reserves a file mapping larger than the file itself.
+ */
+static int private_file_edge_save(guest_t *g,
+                                  uint64_t start,
+                                  size_t len,
+                                  uint8_t *bytes,
+                                  unsigned *missing)
+{
+    *missing = 0;
+    for (size_t off = 0; off < len; off += GUEST_PAGE_SIZE) {
+        uint64_t addr = start + off;
+        const guest_region_t *r = guest_region_find(g, addr);
+        if (!r || r->backing_fd < 0)
+            return -LINUX_EFAULT;
+        struct stat st;
+        if (fstat(r->backing_fd, &st) < 0)
+            return linux_errno();
+        uint64_t file_end;
+        if (st.st_size < 0 ||
+            !align_up_ok((uint64_t) st.st_size, GUEST_PAGE_SIZE, &file_end))
+            return -LINUX_EIO;
+        uint64_t available;
+        slice_clamp(file_end, r->offset, r->end - r->start, &available);
+        size_t chunk = len - off;
+        if (chunk > GUEST_PAGE_SIZE)
+            chunk = GUEST_PAGE_SIZE;
+        if (addr - r->start >= available) {
+            *missing |= 1u << (off / GUEST_PAGE_SIZE);
+            continue;
+        }
+        if (guest_host_copy_partial(
+                bytes + off, (uint8_t *) g->host_base + addr, chunk) != chunk)
+            return -LINUX_EFAULT;
+    }
+    return 0;
+}
+
 static int hvf_remove_private_file(guest_t *g,
                                    uint64_t ipa,
                                    uint64_t len,
@@ -2443,12 +2509,32 @@ static int hvf_remove_private_file(guest_t *g,
     size_t tail = ipa + len > discard_end ? ipa + len - discard_end : 0;
     if (head > hps || tail > hps)
         return -LINUX_EINVAL;
+    unsigned head_missing, tail_missing;
     vcpu_pool_memory_pause();
-    if (head)
-        memcpy(edges, host, head);
-    if (tail)
-        memcpy(edges + hps, host + len - tail, tail);
-    int err = 0;
+    int err = private_file_edge_save(g, ipa, head, edges, &head_missing);
+    if (err == 0)
+        err = private_file_edge_save(g, ipa + len - tail, tail, edges + hps,
+                                     &tail_missing);
+    if (err < 0) {
+        vcpu_pool_memory_resume();
+        return err;
+    }
+    for (size_t off = 0; off < head; off += GUEST_PAGE_SIZE) {
+        if ((head_missing & (1u << (off / GUEST_PAGE_SIZE))) &&
+            guest_invalidate_ptes(g, ipa + off, ipa + off + GUEST_PAGE_SIZE) <
+                0) {
+            vcpu_pool_memory_resume();
+            return -LINUX_ENOMEM;
+        }
+    }
+    for (size_t off = 0; off < tail; off += GUEST_PAGE_SIZE) {
+        uint64_t addr = ipa + len - tail + off;
+        if ((tail_missing & (1u << (off / GUEST_PAGE_SIZE))) &&
+            guest_invalidate_ptes(g, addr, addr + GUEST_PAGE_SIZE) < 0) {
+            vcpu_pool_memory_resume();
+            return -LINUX_ENOMEM;
+        }
+    }
     if (hv_vm_unmap(ipa, len) != HV_SUCCESS) {
         vcpu_pool_memory_resume();
         return -LINUX_EIO;
@@ -2461,10 +2547,15 @@ static int hvf_remove_private_file(guest_t *g,
         exit(128);
     }
     if (err == 0) {
-        if (head)
-            memcpy(host, edges, head);
-        if (tail)
-            memcpy(host + len - tail, edges + hps, tail);
+        for (size_t off = 0; off < head; off += GUEST_PAGE_SIZE) {
+            if (!(head_missing & (1u << (off / GUEST_PAGE_SIZE))))
+                memcpy(host + off, edges + off, GUEST_PAGE_SIZE);
+        }
+        for (size_t off = 0; off < tail; off += GUEST_PAGE_SIZE) {
+            if (!(tail_missing & (1u << (off / GUEST_PAGE_SIZE))))
+                memcpy(host + len - tail + off, edges + hps + off,
+                       GUEST_PAGE_SIZE);
+        }
     }
     vcpu_pool_memory_resume();
     return err;
@@ -4861,6 +4952,11 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
                 if (guest_invalidate_ptes(g, addr, mprot_end) < 0)
                     return -LINUX_ENOMEM;
             }
+            if (prot != LINUX_PROT_NONE) {
+                int err = invalidate_private_file_eof(g, addr, mprot_end);
+                if (err < 0)
+                    return err;
+            }
             guest_region_set_prot(g, addr, mprot_end, prot);
             return 0;
         }
@@ -4898,6 +4994,11 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
             } else {
                 if (guest_invalidate_ptes(g, mprot_off, mprot_end) < 0)
                     return -LINUX_ENOMEM;
+            }
+            if (prot != LINUX_PROT_NONE) {
+                int err = invalidate_private_file_eof(g, mprot_off, mprot_end);
+                if (err < 0)
+                    return err;
             }
             guest_region_set_prot(g, mprot_off, mprot_end, prot);
         }

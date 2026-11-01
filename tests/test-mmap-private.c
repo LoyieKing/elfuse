@@ -19,12 +19,10 @@
  * valid in each side after fork, and a 64 MiB private mapping of a fresh sparse
  * file reports every page absent through mincore.
  *
- * Each case runs in two shapes. The edge shape uses a 4 KiB file offset and a
- * length that is not a 16 KiB multiple, which keeps the snapshot path and the
- * host page edges in play. The aligned shape uses offset zero and 64 KiB, which
- * makes the direct host-file path eligible. A whole page beyond EOF is not
- * touched: Linux faults there, and that fault path is not part of this test, so
- * only the common EOF tail is asserted.
+ * The edge shape uses a 4 KiB file offset and a length that is not a 16 KiB
+ * multiple; the aligned shape uses offset zero and 64 KiB. ELF segment
+ * replacement also covers whole pages past EOF, which must retain SIGBUS
+ * delivery while neighbouring private bytes survive.
  *
  * Syscalls exercised: openat, mkstemp, read64, write64, ftruncate, pread64,
  *                     pwrite64, mmap, munmap, madvise, mprotect, mremap,
@@ -33,6 +31,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1323,6 +1323,105 @@ static void test_untouched_large_mapping_io(void)
     close(fd);
 }
 
+static sigjmp_buf eof_recover;
+static volatile sig_atomic_t eof_signal;
+static volatile sig_atomic_t eof_code;
+
+static void eof_handler(int sig, siginfo_t *info, void *context)
+{
+    (void) context;
+    eof_signal = sig;
+    eof_code = info->si_code;
+    siglongjmp(eof_recover, 1);
+}
+
+/* ELF loaders reserve the entire DSO before replacing a data segment whose
+ * virtual address differs from its file offset by a segment-alignment gap.
+ */
+static void test_elf_segment_replacement(void)
+{
+    const size_t file_len = 4 * page_size + 123;
+    const size_t map_len = 12 * page_size;
+    struct sigaction action = {.sa_sigaction = eof_handler,
+                               .sa_flags = SA_SIGINFO};
+    struct sigaction old_bus, old_segv;
+    int ro = -1, rw = -1;
+    unsigned char *p;
+
+    TEST("ELF data segment replaces past EOF");
+    if (!make_seed_file(file_len, &ro, &rw)) {
+        FAIL("seed file");
+        return;
+    }
+    p = mmap(NULL, map_len, PROT_READ | PROT_WRITE, MAP_PRIVATE, ro, 0);
+    if (p == MAP_FAILED) {
+        FAIL("mmap private");
+        goto close_files;
+    }
+    p[0] = 0xe7;
+    unsigned char *data =
+        mmap(p + 9 * page_size, 2 * page_size, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_FIXED, ro, 3 * page_size);
+    EXPECT_TRUE(data == p + 9 * page_size &&
+                    matches_seed(data, 3 * page_size, page_size + 123) &&
+                    all_zero(data + page_size + 123, page_size - 123) &&
+                    p[0] == 0xe7 && file_matches_seed(rw, file_len),
+                "ELF segment bytes or private neighbour lost");
+
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGBUS, &action, &old_bus);
+    sigaction(SIGSEGV, &action, &old_segv);
+    TEST("unreplaced EOF page remains SIGBUS");
+    eof_signal = 0;
+    eof_code = 0;
+    if (sigsetjmp(eof_recover, 1) == 0) {
+        volatile unsigned char value = p[8 * page_size];
+        (void) value;
+    }
+    EXPECT_TRUE(eof_signal == SIGBUS && eof_code == BUS_ADRERR,
+                "EOF page lost SIGBUS semantics");
+    TEST("EOF page stays faulting after mprotect");
+    bool protected =
+        mprotect(p + 8 * page_size, page_size, PROT_NONE) == 0 &&
+        mprotect(p + 8 * page_size, page_size, PROT_READ | PROT_WRITE) == 0;
+    eof_signal = 0;
+    eof_code = 0;
+    if (protected && sigsetjmp(eof_recover, 1) == 0) {
+        volatile unsigned char value = p[8 * page_size];
+        (void) value;
+    }
+    EXPECT_TRUE(protected && eof_signal == SIGBUS && eof_code == BUS_ADRERR,
+                "mprotect exposed an EOF page");
+
+    TEST("ELF replacement preserves dirty EOF tail");
+    p[4 * page_size + 100] = 0xd3;
+    p[4 * page_size + 200] = 0xd4;
+    data = mmap(p + 5 * page_size, 2 * page_size, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_FIXED, ro, 3 * page_size);
+    EXPECT_TRUE(data == p + 5 * page_size &&
+                    matches_seed(data, 3 * page_size, page_size + 123) &&
+                    all_zero(data + page_size + 123, page_size - 123) &&
+                    p[4 * page_size + 100] == 0xd3 &&
+                    p[4 * page_size + 200] == 0xd4 &&
+                    file_matches_seed(rw, file_len),
+                "ELF replacement lost a dirty neighbouring page");
+    TEST("trailing EOF page remains SIGBUS");
+    eof_signal = 0;
+    eof_code = 0;
+    if (sigsetjmp(eof_recover, 1) == 0) {
+        volatile unsigned char value = p[7 * page_size];
+        (void) value;
+    }
+    EXPECT_TRUE(eof_signal == SIGBUS && eof_code == BUS_ADRERR,
+                "trailing EOF page became accessible");
+    sigaction(SIGBUS, &old_bus, NULL);
+    sigaction(SIGSEGV, &old_segv, NULL);
+    munmap(p, map_len);
+close_files:
+    close(ro);
+    close(rw);
+}
+
 int main(void)
 {
     long host_page = sysconf(_SC_PAGESIZE);
@@ -1357,6 +1456,7 @@ int main(void)
     }
     test_untouched_file_mapping_absent();
     test_untouched_large_mapping_io();
+    test_elf_segment_replacement();
     test_mremap_keeps_data();
 
     SUMMARY("test-mmap-private");
