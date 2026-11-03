@@ -192,6 +192,7 @@ test-fd-pin-lock
 
 [section] Multithreaded fork tests
 test-mt-fork
+test-fork-quiesce-memory
 
 [section] SysV shared memory tests
 test-sysv-shm

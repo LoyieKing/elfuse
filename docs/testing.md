@@ -1076,6 +1076,12 @@ guest preemption, wake balance, CPU clocks, RR rotation and retained quantum,
 and DEADLINE throttle/yield scenarios. RT/DEADLINE ran with --fakeroot.
 make check-format passed with COMMENTFLOW=/private/tmp/commentflow.
 
+The fork backing-pause regression passes four host checks; restoring the old
+entry gate fails the quiescence assertion. Twelve real forks pass snapshot
+ordering, backing reset completion and child reaping checks. vfork siblings,
+multi-threaded fork, CoW isolation and SYNC_CORE tests pass. The threaded exec
+chain completes 200 execs with eight live siblings per exec.
+
 
 
 ## OCI Images

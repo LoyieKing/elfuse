@@ -471,11 +471,9 @@ typedef struct {
     /* RX mmap high-water mark serialized through fork IPC. */
     uint64_t mmap_rx_next;
     uint64_t mmap_rx_end; /* Current page-table-covered RX mmap limit */
-    /* Gap-finder allocator hints. First free GPA past the last successful mmap
-     * in each region; munmap and mremap rewind the hint when a lower address is
-     * freed. mprotect does not, since permission changes do not free address
-     * space. Per-guest so multi-guest test harnesses (or any future second VM
-     * in the same process) cannot cross-pollute each other's allocator state.
+    /* Earliest reusable gap seen in each mmap arena. A search retains smaller
+     * skipped holes; munmap and mremap rewind the hint when a lower address is
+     * freed. mprotect does not free address space. Per-guest allocator state.
      */
     uint64_t mmap_rw_gap_hint, mmap_rx_gap_hint;
 

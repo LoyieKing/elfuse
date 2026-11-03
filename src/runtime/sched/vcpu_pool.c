@@ -633,26 +633,30 @@ void vcpu_pool_account_phase(bool entering_guest)
     if (!owner_slot || !current_thread)
         return;
     struct vcpu_slot *slot = owner_slot;
-    {
-        /* Seq-cst makes the requester see this entry or this owner see its
-         * pause. No guest entry crosses the detach/remap window.
-         */
-        atomic_store_explicit(&slot->memory_guest, entering_guest,
-                              memory_order_seq_cst);
+    if (entering_guest) {
+        for (;;) {
+            thread_fork_barrier_check();
+
+            /* Seq-cst makes the requester see this entry or this owner see its
+             * pause. A backing wait must return through the fork gate.
+             */
+            atomic_store_explicit(&slot->memory_guest, true,
+                                  memory_order_seq_cst);
+            if (!atomic_load_explicit(&memory_paused, memory_order_seq_cst))
+                break;
+            pthread_mutex_lock(&memory_lock);
+            atomic_store_explicit(&slot->memory_guest, false,
+                                  memory_order_seq_cst);
+            pthread_cond_broadcast(&memory_cond);
+            while (atomic_load_explicit(&memory_paused, memory_order_seq_cst))
+                pthread_cond_wait(&memory_cond, &memory_lock);
+            pthread_mutex_unlock(&memory_lock);
+        }
+    } else {
+        atomic_store_explicit(&slot->memory_guest, false, memory_order_seq_cst);
         if (atomic_load_explicit(&memory_paused, memory_order_seq_cst)) {
             pthread_mutex_lock(&memory_lock);
-            if (entering_guest) {
-                atomic_store_explicit(&slot->memory_guest, false,
-                                      memory_order_seq_cst);
-                pthread_cond_broadcast(&memory_cond);
-                while (
-                    atomic_load_explicit(&memory_paused, memory_order_seq_cst))
-                    pthread_cond_wait(&memory_cond, &memory_lock);
-                atomic_store_explicit(&slot->memory_guest, true,
-                                      memory_order_seq_cst);
-            } else {
-                pthread_cond_broadcast(&memory_cond);
-            }
+            pthread_cond_broadcast(&memory_cond);
             pthread_mutex_unlock(&memory_lock);
         }
     }

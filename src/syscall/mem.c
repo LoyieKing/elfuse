@@ -91,13 +91,10 @@ static size_t host_page_size_cached(void)
  * munmap'd ranges become reusable (critical for runtimes that reserve, trim,
  * and re-reserve in the same address window).
  *
- * Per-guest hints (mmap_rw_gap_hint / mmap_rx_gap_hint in guest_t) amortize the
- * O(n) scan to O(1) for sequential allocations: after each success the hint is
- * set to the end of the allocation. munmap/mremap rewinds the hint when a lower
- * address is freed. Stored in guest_t so multiple guest instances in one
- * process (test harnesses, future multi-VM use) cannot cross-pollute each
- * other's allocator state. Reset to 0 by guest_init, guest_init_from_shm (via
- * memset), and guest_reset.
+ * Per-guest hints retain the earliest reusable gap seen by a search. Sequential
+ * allocations start at the last allocation's end; a request that skips a
+ * smaller hole leaves that hole available to subsequent requests. munmap and
+ * mremap rewind the hint when a lower address is freed.
  */
 
 typedef struct {
@@ -746,7 +743,8 @@ static uint64_t find_free_gap_inner(const guest_t *g,
                                     uint64_t length,
                                     uint64_t min_addr,
                                     uint64_t max_addr,
-                                    uint64_t align)
+                                    uint64_t align,
+                                    uint64_t *skipped_gap)
 {
     /* Host-page alignment prevents allocations from sharing an overlay tail.
      * Guest 4 KiB alignment alone is insufficient on a 16 KiB host.
@@ -784,6 +782,11 @@ static uint64_t find_free_gap_inner(const guest_t *g,
             g->regions[i].start >= gap_start + length)
             return gap_start;
 
+        if (skipped_gap && *skipped_gap == UINT64_MAX &&
+            g->regions[i].start > gap_start &&
+            g->regions[i].start - gap_start >= GUEST_PAGE_SIZE)
+            *skipped_gap = gap_start;
+
         /* Region overlaps; advance past it and round to the next aligned
          * boundary so the caller's alignment promise holds across allocations.
          * A round-up that would leave the address space ends the search: with
@@ -800,14 +803,8 @@ static uint64_t find_free_gap_inner(const guest_t *g,
     return UINT64_MAX; /* No suitable gap found */
 }
 
-/* Find a free gap, probing the cached post-allocation hint before a full scan.
- * The hint tracks the first address after the last successful mapping in each
- * region, which avoids rescanning the same prefix on sequential mmap activity.
- * A miss falls back to the region base so holes reopened by munmap are still
- * reusable. The align argument is the per-call start boundary the result must
- * satisfy; some sys_mmap callers first pass BLOCK_2MIB as a best-effort
- * placement preference for MAP_SHARED file-backed allocations, then retry with
- * host-page alignment when no 2 MiB-aligned gap is available.
+/* Keep smaller skipped holes searchable, or varying-size temporary mappings
+ * can advance through the arena indefinitely with constant live coverage.
  */
 static uint64_t find_free_gap(guest_t *g,
                               uint64_t length,
@@ -819,32 +816,27 @@ static uint64_t find_free_gap(guest_t *g,
     uint64_t *hint =
         (min_addr < MMAP_BASE) ? &g->mmap_rx_gap_hint : &g->mmap_rw_gap_hint;
 
-    /* Advance the hint to the next host-page boundary so the following
-     * sequential allocation lands on an address that the kernel accepts for
-     * mmap MAP_FIXED (Apple Silicon enforces 16 KiB host pages). Round to the
-     * host page even when the current call requested a larger align (e.g.
-     * BLOCK_2MIB for MAP_SHARED file-backed): a subsequent MAP_PRIVATE 4 KiB
-     * allocation should still be able to occupy the trailing space inside the 2
-     * MiB block. find_free_gap_inner re-applies the caller's align on its next
-     * entry, so a subsequent MAP_SHARED allocation skips past the small tenant
-     * and lands on the next 2 MiB boundary anyway.
-     */
     size_t hps = host_page_size_cached();
+    uint64_t skipped_gap = UINT64_MAX;
 
     /* Try cached hint first (only if within the valid range) */
     if (*hint >= min_addr && *hint < max_addr) {
-        uint64_t result =
-            find_free_gap_inner(g, length, *hint, max_addr, align);
+        uint64_t result = find_free_gap_inner(g, length, *hint, max_addr, align,
+                                              &skipped_gap);
         if (result != UINT64_MAX) {
-            *hint = ALIGN_UP(result + length, hps);
+            *hint = skipped_gap != UINT64_MAX ? skipped_gap
+                                              : ALIGN_UP(result + length, hps);
             return result;
         }
     }
 
     /* Full scan from base */
-    uint64_t result = find_free_gap_inner(g, length, min_addr, max_addr, align);
+    skipped_gap = UINT64_MAX;
+    uint64_t result =
+        find_free_gap_inner(g, length, min_addr, max_addr, align, &skipped_gap);
     if (result != UINT64_MAX)
-        *hint = ALIGN_UP(result + length, hps);
+        *hint = skipped_gap != UINT64_MAX ? skipped_gap
+                                          : ALIGN_UP(result + length, hps);
     return result;
 }
 
@@ -3747,7 +3739,7 @@ int64_t sys_mmap(guest_t *g,
                         (hint_off < MMAP_BASE) ? MMAP_BASE : g->mmap_limit;
                     if (result_off == UINT64_MAX)
                         result_off = find_free_gap_inner(g, length, hint_off,
-                                                         hint_max, align);
+                                                         hint_max, align, NULL);
                 }
             }
             if (result_off == UINT64_MAX)

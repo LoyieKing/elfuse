@@ -1022,6 +1022,7 @@ run_unit_tests()
 
     printf "\nMultithreaded fork\n"
     test_rc "$runner" "test-mt-fork" 0 "$bindir/test-mt-fork"
+    test_rc "$runner" "test-fork-quiesce-memory" 0 "$bindir/test-fork-quiesce-memory"
     test_rc "$runner" "test-vfork-sibling" 0 "$bindir/test-vfork-sibling"
 
     printf "\nExit-group teardown reachability\n"

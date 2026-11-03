@@ -192,12 +192,58 @@ static void test_shared_hint_coherence(void)
     close(fd);
 }
 
+static void test_varying_size_churn(void)
+{
+    TEST("varying-size mmap churn retains bounded live coverage");
+    const size_t unit = 2 * 1024 * 1024 + 16384;
+    void *live[2] = {NULL, NULL};
+    size_t lengths[2] = {0, 0};
+    bool ok = true;
+    size_t iteration;
+    for (iteration = 0; iteration < 16384; iteration++) {
+        size_t slot = iteration % 2;
+        size_t length = iteration % 4 == 3 ? 2 * unit : unit;
+        unsigned char *p = mmap(NULL, length, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) {
+            ok = false;
+            break;
+        }
+        p[0] = (unsigned char) iteration;
+        p[length - 1] = (unsigned char) (iteration + 1);
+        if (mprotect(p, 4096, PROT_READ) != 0 ||
+            mprotect(p, 4096, PROT_READ | PROT_WRITE) != 0 ||
+            p[0] != (unsigned char) iteration ||
+            p[length - 1] != (unsigned char) (iteration + 1)) {
+            munmap(p, length);
+            ok = false;
+            break;
+        }
+        if (live[slot] && munmap(live[slot], lengths[slot]) != 0) {
+            munmap(p, length);
+            ok = false;
+            break;
+        }
+        live[slot] = p;
+        lengths[slot] = length;
+    }
+    for (size_t slot = 0; slot < 2; slot++) {
+        if (live[slot] && munmap(live[slot], lengths[slot]) != 0)
+            ok = false;
+    }
+    if (!ok)
+        printf("mmap churn stopped at iteration %zu: errno=%d\n", iteration,
+               errno);
+    EXPECT_TRUE(ok, "bounded live mappings exhausted page tables");
+}
+
 int main(void)
 {
     test_low_hint_exact();
     test_shared_file_hint_falls_back_from_2m_alignment();
     test_guest_page_hint();
     test_shared_hint_coherence();
+    test_varying_size_churn();
     SUMMARY("test-mmap-hint");
     return fails ? 1 : 0;
 }

@@ -1177,7 +1177,23 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         return reserve_rc;
     }
     extern char **environ;
-    pid_t child_host_pid;
+    pid_t child_host_pid = -1;
+
+    /* Refuse an unsafe snapshot before creating a helper that expects a header.
+     * The window remains owned through spawn and every snapshot failure.
+     */
+    if (!thread_quiesce_siblings()) {
+        posix_spawn_file_actions_destroy(&file_actions);
+        posix_spawnattr_destroy(&spawn_attr);
+        proc_cancel_child(child_guest_pid);
+        close(sock_fds[0]);
+        close(sock_fds[1]);
+        if (vfork_notify_fds[0] >= 0)
+            close(vfork_notify_fds[0]);
+        if (vfork_notify_fds[1] >= 0)
+            close(vfork_notify_fds[1]);
+        return thread_exec_stop_requested() ? -LINUX_EINTR : -LINUX_EAGAIN;
+    }
 
     /* macOS posix_spawn returns EAGAIN under brief process-table pressure
      * (rapid SoftNS fork+kill+wait, e.g. pidfd_poll_test x 10k). Retry a few
@@ -1206,6 +1222,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
             close(vfork_notify_fds[0]);
         if (vfork_notify_fds[1] >= 0)
             close(vfork_notify_fds[1]);
+        thread_resume_siblings();
         return -LINUX_ENOMEM;
     }
 
@@ -1225,27 +1242,9 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     mmap_fork_anon_shared_txn_t *anon_shared_txn = NULL;
     guest_region_t *regions_snapshot = NULL;
     int snapshot_shm_fd = -1;
-    bool siblings_quiesced = false;
     bool mmap_locked = false;
     int64_t fail_rc = -LINUX_ENOMEM;
     int clone_pidfd = -1;
-
-    /* Quiesce sibling vCPUs for snapshot consistency. In multithreaded guests,
-     * sibling vCPUs may be actively mutating guest memory during the fork
-     * snapshot (CoW or legacy IPC copy). Without quiescing them, the child
-     * process can receive a torn snapshot with partially-updated data
-     * structures. This matches POSIX fork semantics where only the calling
-     * thread survives.
-     */
-    if (!thread_quiesce_siblings()) {
-        /* A service operation or concurrent teardown prevents a safe snapshot.
-         */
-        fail_rc = -LINUX_EAGAIN;
-        if (thread_exec_stop_requested())
-            fail_rc = -LINUX_EINTR;
-        goto fail_snapshot;
-    }
-    siblings_quiesced = true;
 
     /* Convert MAP_SHARED|MAP_ANONYMOUS regions that have no backing fd into
      * memfd-backed overlay regions. The conversion seeds a private temp file
@@ -1488,8 +1487,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
      * backing fds. Keep siblings quiesced until that send completes so a
      * concurrent munmap/remap cannot close or recycle the captured fd numbers.
      */
-    if (siblings_quiesced)
-        thread_resume_siblings();
+    thread_resume_siblings();
     mmap_fork_commit_anon_shared(&anon_shared_txn);
 
     close(ipc_sock);
@@ -1533,22 +1531,15 @@ fail_snapshot:
             "clone: anon-shared rollback partial failure (%d); parent "
             "may have stale memfd-backed regions",
             abort_rc);
-    if (siblings_quiesced)
-        thread_resume_siblings();
+    thread_resume_siblings();
     close(ipc_sock);
     if (vfork_notify_fds[0] >= 0)
         close(vfork_notify_fds[0]);
     if (vfork_notify_fds[1] >= 0)
         close(vfork_notify_fds[1]);
 
-    /* posix_spawn at the top of sys_clone always succeeds before any goto
-     * fail_snapshot fires, so child_host_pid is a live process here. The IPC
-     * socket just closed; the child reads EOF on fork_ipc_read_all and returns
-     * nonzero from fork_child_main. Without an explicit waitpid the exited
-     * child becomes a zombie: proc_register_child only runs on the success
-     * path, so neither proc_reap_finished nor sys_wait4 will ever pick this PID
-     * up, and the guest's fork(2) already reported failure. Reap it here to
-     * keep host PIDs from accumulating across repeated failures.
+    /* The helper has not passed admission on any failure path. Closing IPC
+     * terminates its receive, and waitpid collects the unregistered host child.
      */
     pid_t reaped;
     do {

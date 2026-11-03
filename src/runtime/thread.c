@@ -984,12 +984,14 @@ bool thread_quiesce_siblings(void)
             if (rc == ETIMEDOUT) {
                 atomic_store_explicit(&fork_quiesce_active, false,
                                       memory_order_release);
+                sched_domain_freeze(false);
+                fork_quiesced_count = 0;
+                fork_target_count = 0;
                 THREAD_FOR_EACH (t)
                     t->fork_counted = false;
                 pthread_cond_broadcast(&fork_cond);
                 pthread_cond_broadcast(&fork_window_closed_cond);
                 pthread_mutex_unlock(&thread_lock);
-                sched_domain_freeze(false);
                 return false;
             }
         }
@@ -1007,10 +1009,7 @@ void thread_resume_siblings(void)
     fork_quiesced_count = 0;
     fork_target_count = 0;
 
-    /* Clear any fork_counted still set on siblings that never reached the
-     * barrier (blocked in a host syscall and released by the timeout) so the
-     * next barrier generation starts from a clean slate.
-     */
+    /* Reset the per-window acknowledgement before another forker can arm. */
     THREAD_FOR_EACH (t)
         t->fork_counted = false;
     pthread_cond_broadcast(&fork_cond);

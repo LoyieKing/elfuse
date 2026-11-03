@@ -252,6 +252,13 @@ $(BUILD_DIR)/test-sched-placement-host: tests/test-sched-placement-host.c \
 	@echo "  CC      $<"
 	$(Q)$(CC) $(CFLAGS) -Isrc -Itests -o $@ $< $(BUILD_DIR)/runtime/sched/fair.o
 
+$(BUILD_DIR)/test-fork-quiesce-host: tests/test-fork-quiesce-host.c \
+        src/runtime/sched/vcpu_pool.c src/runtime/forkipc.c tests/test-harness.h \
+        $(filter-out $(BUILD_DIR)/main.o $(BUILD_DIR)/runtime/sched/vcpu_pool.o $(BUILD_DIR)/runtime/forkipc.o,$(OBJS)) | $(BUILD_DIR)
+	@echo "  CC      $<"
+	$(Q)$(CC) $(CFLAGS) -Isrc -Itests -o $@ $< \
+		$(filter-out $(BUILD_DIR)/main.o $(BUILD_DIR)/runtime/sched/vcpu_pool.o $(BUILD_DIR)/runtime/forkipc.o,$(OBJS)) $(HVF_LDFLAGS)
+
 
 ## Build the buffered GDB session host regression
 $(BUILD_DIR)/test-gdbstub-host: $(BUILD_DIR)/test-gdbstub-host.o \
@@ -559,6 +566,10 @@ $(BUILD_DIR)/test-uevent-socket: tests/test-uevent-socket.c | $(BUILD_DIR)
 
 # test-pthread needs -lpthread
 $(BUILD_DIR)/test-pthread: tests/test-pthread.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+$(BUILD_DIR)/test-fork-quiesce-memory: tests/test-fork-quiesce-memory.c tests/test-harness.h | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 

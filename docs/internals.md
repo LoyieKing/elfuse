@@ -183,6 +183,17 @@ Guest memory is identity-mapped (guest VA == guest IPA). Large areas use 2 MiB
 block descriptors by default; mappings that need mixed permissions are split
 to 4 KiB L3 pages (see [Page Table Splitting](#page-table-splitting)).
 
+Host guest-memory access caches one permission-checked, physically contiguous
+span per host thread, keyed by guest identity, page-table generation, and the
+exact requested permission mask. A bounded request wholly inside the cached
+span skips the remaining leaf walk only when its first translated GPA matches
+the cached offset and an acquire generation recheck still matches. Misses walk
+adjacent leaves and publish the extent only if the generation is unchanged.
+Every lookup still translates the first address and clamps the result to its
+current host backing region. The cache does not pin mappings or serialize with
+concurrent page-table mutations; callers must resolve addresses again after a
+mapping or permission change.
+
 Low, fixed addresses:
 
 ```
@@ -277,6 +288,13 @@ Splitting is triggered by:
 `guest_update_perms()` orchestrates the full workflow: it checks whether a
 block needs splitting, splits it if so, then updates the affected L3 page
 entries. Whole-block permission changes are done in place without splitting.
+
+Unmapping clears L3 leaves but retains their table pages until exec. The pool
+therefore bounds cumulative split address coverage, including empty tables.
+The mmap gap hint retains the earliest smaller hole skipped by a larger
+request so temporary buffers of varying sizes reuse that coverage. Sequential
+allocations skip the occupied prefix by binary search; allocations following
+fragmentation may scan smaller holes again.
 
 `mmap` itself uses a gap-finding allocator that walks the sorted region array
 to find free address space. `PROT_EXEC` requests go to the RX region
@@ -592,7 +610,8 @@ Aligned file-backed `MAP_SHARED` installs a host shared file mapping;
 `MAP_PRIVATE` installs a host CoW file mapping, including writable private
 views opened through an `O_RDONLY` descriptor. Replacement refreshes only the
 host-page-aligned HVF range. Apple Silicon uses 16 KiB host pages, so the
-gap-finder advances to the next host-page boundary after each allocation.
+gap-finder uses host-page-aligned candidates and advances past an allocation
+only when the search did not skip an earlier reusable hole.
 
 Free private mmap hints are honored at the guest's 4 KiB granularity, including
 executable mappings. Shared mappings prefer host-page-aligned placement so
@@ -761,8 +780,10 @@ clone the live VM. `elfuse` implements it through `posix_spawn` plus IPC
 state transfer:
 
 1. Parent creates a `socketpair(AF_UNIX, SOCK_STREAM)`.
-2. Parent `posix_spawn`s a new `elfuse --fork-child <fd>` process.
-3. Parent serializes VM state over IPC (see paths below).
+2. Parent freezes scheduler dispatch and waits for mounted siblings to finish
+   admitted host work. Failure returns `EAGAIN` before any host child exists.
+3. Parent `posix_spawn`s a new `elfuse --fork-child <fd>` process and serializes
+   VM state over IPC while the snapshot window remains owned.
 4. Child receives state, creates its own VM, restores registers directly
    into EL0 (bypassing the shim `_start` so callee-saved GPRs survive), and
    enters the vCPU loop with `X0 = 0` (the child return from `clone`).
@@ -771,6 +792,11 @@ state transfer:
    IPC succeeds it commits the child's host PID, releases the child into guest
    code, and returns the child PID. Allocation or admission failure returns
    `EAGAIN` without allowing an untracked child to run.
+
+Backing-pause waiters recheck the fork gate after the pause ends, before guest
+entry. A failed snapshot closes IPC and reaps the unadmitted helper. The
+snapshot window and scheduler freeze close under the thread-table lock before
+another caller can claim a new window.
 
 CLONE_VFORK suspends only the calling task until the child's exec notification
 or pipe EOF on exit. The caller parks with a task-owned notification fd and

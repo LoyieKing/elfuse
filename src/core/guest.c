@@ -1288,9 +1288,17 @@ static _Thread_local struct {
     uint64_t gen;         /* guest_t.pt_gen at population time */
 } gva_tlb;
 
+/* Reuse validated spans across partial I/O; pt_gen invalidates permissions. */
+static _Thread_local struct {
+    const guest_t *owner;
+    uint64_t base_gva, base_gpa, size, gen;
+    int perms;
+} gva_span;
+
 static void guest_tlb_flush(void)
 {
     gva_tlb.size = 0;
+    gva_span.size = 0;
 }
 
 static int gva_translate_perm(const guest_t *g,
@@ -1428,7 +1436,8 @@ static uint64_t gva_contiguous_avail(const guest_t *g,
                                      uint64_t gva,
                                      int required_perms,
                                      const gva_translation_t *first,
-                                     uint64_t limit)
+                                     uint64_t limit,
+                                     uint64_t gen)
 {
     uint64_t total = 0, next_gva = gva;
     uint64_t expect_gpa = first->gpa;
@@ -1436,6 +1445,17 @@ static uint64_t gva_contiguous_avail(const guest_t *g,
 
     if (limit == 0)
         return 0;
+
+    if (gva_span.owner == g && gva_span.gen == gen &&
+        gva_span.perms == required_perms && gva >= gva_span.base_gva &&
+        gva - gva_span.base_gva < gva_span.size) {
+        uint64_t offset = gva - gva_span.base_gva;
+        /* The first-page translation may observe a newer generation. */
+        if (limit <= gva_span.size - offset &&
+            first->gpa == gva_span.base_gpa + offset &&
+            atomic_load_explicit(&g->pt_gen, memory_order_acquire) == gen)
+            return limit;
+    }
 
     for (;;) {
         uint64_t chunk = cur.chunk;
@@ -1490,6 +1510,16 @@ static uint64_t gva_contiguous_avail(const guest_t *g,
             break;
     }
 
+    /* Acquire pairs with guest_pt_gen_bump after page-table mutations. */
+    if (atomic_load_explicit(&g->pt_gen, memory_order_acquire) == gen) {
+        gva_span.owner = g;
+        gva_span.base_gva = gva;
+        gva_span.base_gpa = first->gpa;
+        gva_span.size = total;
+        gva_span.gen = gen;
+        gva_span.perms = required_perms;
+    }
+
     return total;
 }
 
@@ -1513,6 +1543,7 @@ static void *gva_resolve_perm(const guest_t *g,
      * guest_split_block. Skipping the walk would bypass W^X enforcement for all
      * normal guest addresses.
      */
+    uint64_t gen = atomic_load_explicit(&g->pt_gen, memory_order_acquire);
     gva_translation_t first;
     if (gva_translate_perm(g, gva, required_perms, &first) < 0)
         return NULL;
@@ -1522,7 +1553,7 @@ static void *gva_resolve_perm(const guest_t *g,
      * final value to the returned pointer.
      */
     uint64_t bytes = avail ? gva_contiguous_avail(g, gva, required_perms,
-                                                  &first, avail_limit)
+                                                  &first, avail_limit, gen)
                            : 0;
 
     if (first.gpa < g->guest_size) {

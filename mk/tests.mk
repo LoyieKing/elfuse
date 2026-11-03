@@ -251,7 +251,7 @@ endef
 CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
         test-tlbi-encoder-host \
         test-vcpu-run-hooks-host test-identity-override-host \
-        test-sched-fair-host test-sched-placement-host \
+        test-sched-fair-host test-sched-placement-host test-fork-quiesce-host \
         test-stdio-nonblock-host \
         test-rlimit-unchanged-host test-casefold-host \
         test-casefold-walk-host test-absock-names-host \
@@ -270,6 +270,7 @@ $(call run-host-unit,test-vcpu-run-hooks-host,vCPU run-loop hook API unit test)
 $(call run-host-unit,test-identity-override-host,identity override unit test)
 $(call run-host-unit,test-sched-fair-host,fair scheduler math unit test)
 $(call run-host-unit,test-sched-placement-host,scheduler CPU placement and stealing)
+$(call run-host-unit,test-fork-quiesce-host,fork and backing-pause ordering)
 $(call run-host-unit,test-casefold-host,filename codec unit test)
 $(call run-host-unit,test-casefold-walk-host,case-exact path resolution unit test)
 $(call run-host-unit,test-absock-names-host,absock derived-name unit test)

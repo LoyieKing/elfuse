@@ -257,6 +257,34 @@ static void test_urandom_small_read_crosses_boundary(void)
                 "urandom small boundary read did not fall back safely");
 }
 
+static void test_revalidated_io_span(void)
+{
+    TEST("cached I/O span observes interior permission and mapping changes");
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    unsigned char *map = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    int fd = open("/dev/zero", O_RDONLY);
+    if (map == MAP_FAILED || fd < 0) {
+        if (map != MAP_FAILED)
+            munmap(map, 3 * page);
+        if (fd >= 0)
+            close(fd);
+        FAIL("setup failed");
+        return;
+    }
+    bool ok = read(fd, map, 3 * page) == (ssize_t) (3 * page);
+    ok = ok && mprotect(map + page, page, PROT_READ) == 0;
+    ok = ok && read(fd, map, 3 * page) == (ssize_t) page;
+    ok = ok && mprotect(map + page, page, PROT_READ | PROT_WRITE) == 0;
+    ok = ok && read(fd, map, 3 * page) == (ssize_t) (3 * page);
+    ok = ok && munmap(map + page, page) == 0;
+    ok = ok && read(fd, map, 3 * page) == (ssize_t) page;
+    close(fd);
+    munmap(map, 3 * page);
+    EXPECT_TRUE(ok,
+                "I/O span retained revoked permissions or an unmapped page");
+}
+
 int main(void)
 {
     printf("large I/O boundary tests\n\n");
@@ -265,6 +293,7 @@ int main(void)
     test_large_read_from_split_block();
     test_urandom_read_crosses_boundary();
     test_urandom_small_read_crosses_boundary();
+    test_revalidated_io_span();
 
     SUMMARY("test-large-io-boundary");
     return fails ? 1 : 0;
