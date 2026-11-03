@@ -451,13 +451,11 @@ INVENTORY = {
         "signal the guest can observe, so the handler case is the one that "
         "can reach the return, and the mask is restored on the way out.",
     ),
-    "syscall/mem.c::sys_mmap_high_va": (
-        "not-a-wait",
-        "Refuses the overlay because an execve is reaping this thread.",
-    ),
     "runtime/forkipc.c::sys_clone": (
-        "not-a-wait",
-        "Refuses the fork because an execve is reaping this thread.",
+        "forbids",
+        "An admitted vfork child parks its caller with a task-owned continuation. "
+        "Reissue consumes the notification and returns that child PID; the "
+        "completed spawn must not be repeated by an EINTR restart.",
     ),
     "syscall/syscall.c::syscall_dispatch": (
         "not-a-wait",

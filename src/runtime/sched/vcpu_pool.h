@@ -101,7 +101,8 @@ int vcpu_pool_membarrier(bool sync_core);
 
 /* Stop guest entry while private backing is replaced. Host syscall handlers may
  * keep running; their host VAs remain stable. Caller holds mmap_lock and pairs
- * every pause with resume, including failures.
+ * every pause with resume, including failures. Nested rollback helpers keep the
+ * outer pause until its matching resume.
  */
 void vcpu_pool_memory_pause(void);
 void vcpu_pool_memory_resume(void);

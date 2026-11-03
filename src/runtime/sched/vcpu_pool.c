@@ -96,12 +96,13 @@ struct vcpu_slot {
      */
     _Atomic bool kick_pending;
 
-    /* Published by the owner while run_one_task owns this slot. A guest barrier
-     * waits only for slots that can currently execute guest code; a parked task
-     * re-runs the SYNC_CORE trampoline before its next entry.
+    /* Mount lifetime includes host handlers; barrier targets use memory_guest.
      */
     _Atomic bool in_exec;
-    _Atomic bool memory_guest; /* Guest entry handshake with memory_paused */
+
+    /* Seq-cst pairs guest entry with barrier requests and backing replacement.
+     */
+    _Atomic bool memory_guest;
 
     /* Host-fence and guest SYNC_CORE generations this owner has executed. The
      * guest generation is published only by the shim trampoline after IC
@@ -122,12 +123,16 @@ struct vcpu_slot {
     bool slice_armed;
 
 
-    /* Owner CPU-time baseline for the live-execution query, and the last
-     * settled sample reported to the scheduler.
+    /* Owner CPU-time baseline for the live-execution query. Time since this
+     * sample lands in the batch below instead of reaching the scheduler at
+     * every phase boundary; @accounting_seq brackets each batch update and a
+     * whole settlement, so a live sampler never reads half of one.
      */
     _Atomic uint64_t cpu_account_base_ns;
     _Atomic bool accounting_guest;
     _Atomic uint64_t accounting_seq;
+    _Atomic uint64_t pending_exec_ns;
+    _Atomic uint64_t pending_service_ns;
     /* Absolute CLOCK_MONOTONIC slice deadline; protected by slice_lock. */
     uint64_t slice_deadline_ns;
 
@@ -188,15 +193,21 @@ static void slot_kick(struct vcpu_slot *slot);
 static pthread_mutex_t barrier_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t barrier_cond = PTHREAD_COND_INITIALIZER;
 static _Atomic uint64_t barrier_request;
+static _Atomic uint64_t barrier_sync_request;
 static uint64_t barrier_seq; /* protected by barrier_lock */
 
 static pthread_mutex_t memory_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t memory_cond = PTHREAD_COND_INITIALIZER;
 static _Atomic bool memory_paused;
+static unsigned memory_pause_depth; /* Protected by memory_lock. */
 
 void vcpu_pool_memory_pause(void)
 {
     pthread_mutex_lock(&memory_lock);
+    if (memory_pause_depth++ != 0) {
+        pthread_mutex_unlock(&memory_lock);
+        return;
+    }
     atomic_store_explicit(&memory_paused, true, memory_order_seq_cst);
     for (int i = 0; i < slot_count; i++) {
         if (&slots[i] != owner_slot &&
@@ -219,8 +230,10 @@ void vcpu_pool_memory_pause(void)
 void vcpu_pool_memory_resume(void)
 {
     pthread_mutex_lock(&memory_lock);
-    atomic_store_explicit(&memory_paused, false, memory_order_seq_cst);
-    pthread_cond_broadcast(&memory_cond);
+    if (--memory_pause_depth == 0) {
+        atomic_store_explicit(&memory_paused, false, memory_order_seq_cst);
+        pthread_cond_broadcast(&memory_cond);
+    }
     pthread_mutex_unlock(&memory_lock);
 }
 
@@ -246,7 +259,7 @@ static uint64_t slot_sync_core_entry(hv_vcpu_t vcpu)
 /* Redirect the owner's paused vCPU into the trampoline. Saving the complete
  * context preserves live ELR/SPSR even when execution was interrupted in EL1.
  */
-static bool slot_start_sync_core(struct vcpu_slot *slot, guest_t *g)
+static bool slot_start_sync_core(struct vcpu_slot *slot, uint64_t gen)
 {
     /* Owner-thread code: the slot handle is this thread's private state; the
      * public bool-out accessor is for callers outside a mount.
@@ -255,9 +268,6 @@ static bool slot_start_sync_core(struct vcpu_slot *slot, guest_t *g)
     if (!slot->vcpu_live)
         return false;
 
-    uint64_t gen =
-        atomic_load_explicit(&barrier_request, memory_order_acquire) &
-        POOL_BARRIER_GEN_MASK;
     if (gen == 0)
         return false;
 
@@ -280,28 +290,26 @@ static void slot_host_barrier_ack(struct vcpu_slot *slot, uint64_t gen)
     barrier_signal();
 }
 
-/* Run whatever barrier the owner owes before it may execute guest code.
- * Returns true when the caller must not enter the guest in this iteration: the
- * vCPU now points at the sync-core trampoline instead.
+/* Redirect to any owed SYNC_CORE trampoline, otherwise acknowledge the latest
+ * host fence. True means the trampoline owns the next vCPU entry.
  */
-static bool slot_barrier_before_guest(struct vcpu_slot *slot, guest_t *g)
+static bool slot_barrier_before_guest(struct vcpu_slot *slot)
 {
     if (atomic_load_explicit(&slot->barrier_inflight, memory_order_acquire))
         return true;
-    uint64_t req = atomic_load_explicit(&barrier_request, memory_order_acquire);
+    uint64_t req = atomic_load_explicit(&barrier_request, memory_order_seq_cst);
     if (req == 0)
         return false;
     uint64_t gen = req & POOL_BARRIER_GEN_MASK;
     if (gen == 0)
         return false;
 
-    if (req & POOL_BARRIER_SYNC_CORE) {
-        uint64_t ack =
-            atomic_load_explicit(&slot->barrier_sync_ack, memory_order_acquire);
-        if (ack >= gen)
-            return false;
-        return slot_start_sync_core(slot, g);
-    }
+    uint64_t sync_gen =
+        atomic_load_explicit(&barrier_sync_request, memory_order_acquire);
+    uint64_t sync_ack =
+        atomic_load_explicit(&slot->barrier_sync_ack, memory_order_acquire);
+    if (sync_ack < sync_gen)
+        return slot_start_sync_core(slot, sync_gen);
 
     uint64_t ack =
         atomic_load_explicit(&slot->barrier_fence_ack, memory_order_acquire);
@@ -356,7 +364,7 @@ static bool barrier_slot_outstanding(const struct vcpu_slot *slot,
 {
     if (slot == self)
         return false; /* the caller's own CPU syncs before its next entry */
-    if (!atomic_load_explicit(&slot->in_exec, memory_order_acquire))
+    if (!atomic_load_explicit(&slot->memory_guest, memory_order_seq_cst))
         return false;
     uint64_t gen = req & POOL_BARRIER_GEN_MASK;
     uint64_t ack = (req & POOL_BARRIER_SYNC_CORE)
@@ -381,7 +389,10 @@ int vcpu_pool_membarrier(bool sync_core)
     pthread_mutex_lock(&barrier_lock);
     barrier_seq++;
     req = barrier_seq | (sync_core ? POOL_BARRIER_SYNC_CORE : 0);
-    atomic_store_explicit(&barrier_request, req, memory_order_release);
+    if (sync_core)
+        atomic_store_explicit(&barrier_sync_request, barrier_seq,
+                              memory_order_release);
+    atomic_store_explicit(&barrier_request, req, memory_order_seq_cst);
     pthread_mutex_unlock(&barrier_lock);
 
     for (int i = 0; i < slot_count; i++) {
@@ -856,13 +867,14 @@ static int pool_run_tick(guest_t *g, void *opaque)
     struct vcpu_slot *slot = (struct vcpu_slot *) opaque;
     if (!slot)
         return VCPU_TICK_CONTINUE;
+    thread_fork_barrier_check();
 
     /* A published guest barrier runs before any guest instruction of this
      * iteration. SYNC_CORE redirects the vCPU through the shim trampoline,
      * which executes the guest-side IC/DSB/ISB and acknowledges at HVC #14;
      * this iteration must enter the vCPU so that trampoline runs.
      */
-    if (slot_barrier_before_guest(slot, g))
+    if (slot_barrier_before_guest(slot))
         return VCPU_TICK_CONTINUE;
 
     /* de_thread: a non-leader must leave before the next guest entry even when
@@ -1489,6 +1501,7 @@ int vcpu_pool_start_with_main(guest_t *g,
     atomic_store_explicit(&slot0->barrier_inflight, 0, memory_order_relaxed);
     barrier_seq = 0;
     atomic_store_explicit(&barrier_request, 0, memory_order_release);
+    atomic_store_explicit(&barrier_sync_request, 0, memory_order_release);
     slots_in_use++;
     pool_running = true;
 

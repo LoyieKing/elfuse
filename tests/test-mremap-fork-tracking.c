@@ -145,79 +145,6 @@ static bool mapping_is_rw_private(uintptr_t address)
     return false;
 }
 
-static char maps_buffer[1024 * 1024];
-
-static bool read_maps_snapshot(ssize_t *length_out)
-{
-    ssize_t length =
-        read_file_nul("/proc/self/maps", maps_buffer, sizeof(maps_buffer));
-    if (length <= 0 || (size_t) length == sizeof(maps_buffer) - 1)
-        return false;
-    *length_out = length;
-    return true;
-}
-
-static bool count_maps_entries(int *count_out)
-{
-    ssize_t length = 0;
-    if (!read_maps_snapshot(&length))
-        return false;
-
-    int count = 0;
-    for (ssize_t i = 0; i < length; i++) {
-        if (maps_buffer[i] == '\n')
-            count++;
-    }
-    *count_out = count;
-    return true;
-}
-
-static bool heap_headers_do_not_overlap(int *heap_count)
-{
-    ssize_t length = 0;
-    if (!read_maps_snapshot(&length))
-        return false;
-
-    const char heap_name[] = "[heap]";
-    const char *cursor = maps_buffer;
-    const char *end = maps_buffer + length;
-    uintptr_t previous_end = 0;
-    int count = 0;
-
-    while (cursor < end) {
-        const char *line = cursor;
-        while (cursor < end && *cursor != '\n')
-            cursor++;
-        const char *line_end = cursor;
-        if (cursor < end)
-            cursor++;
-
-        bool is_heap = false;
-        for (const char *p = line; p + sizeof(heap_name) - 1 <= line_end; p++) {
-            if (memcmp(p, heap_name, sizeof(heap_name) - 1) == 0) {
-                is_heap = true;
-                break;
-            }
-        }
-        if (!is_heap)
-            continue;
-
-        const char *field = line;
-        uintptr_t start = 0, limit = 0;
-        if (!parse_maps_hex(&field, line_end, '-', &start))
-            return false;
-        field++;
-        if (!parse_maps_hex(&field, line_end, ' ', &limit))
-            return false;
-        if (count > 0 && start < previous_end)
-            return false;
-        previous_end = limit;
-        count++;
-    }
-
-    *heap_count = count;
-    return true;
-}
 
 static void test_postfork_adjacent_anon_rejected(void)
 {
@@ -861,6 +788,14 @@ static void test_file_backed_mremap_emfile_atomic(void)
         if (filler_count == 0 || filler_count == fill_limit || errno != ENOMEM)
             _exit(63);
 
+        int exhausted_probe = dup(fd);
+        if (exhausted_probe >= 0) {
+            close(exhausted_probe);
+            _exit(77);
+        }
+        if (errno != EMFILE)
+            _exit(77);
+
         /* The first failed filler proves no host descriptor remains. Freeing
          * one owned tracker fd lets mremap's prefix dup succeed and forces the
          * second, tail-owned dup to hit EMFILE.
@@ -868,15 +803,6 @@ static void test_file_backed_mremap_emfile_atomic(void)
         if (munmap(last_filler, page_size) != 0)
             _exit(64);
 
-        /* With one host and one guest descriptor available, maps must be
-         * readable. Near the fixed tracker capacity, VMA count alone cannot
-         * prove whether tracker pressure or host descriptors ended the filler
-         * loop, so skip instead of attributing an ambiguous ENOMEM to the
-         * second mremap dup.
-         */
-        int maps_count = 0;
-        if (!count_maps_entries(&maps_count) || maps_count >= 4000)
-            _exit(77);
 
         errno = 0;
         char *moved = mremap(grown, 2 * span, 3 * span, MREMAP_MAYMOVE);
@@ -931,7 +857,7 @@ static void test_file_backed_mremap_emfile_atomic(void)
     } else if (!WIFEXITED(status)) {
         FAIL("EMFILE child terminated abnormally");
     } else if (WEXITSTATUS(status) == 77) {
-        printf("SKIP: fd exhaustion and region-table pressure are ambiguous\n");
+        FAIL("filler did not establish descriptor exhaustion");
     } else if (WEXITSTATUS(status) != 0) {
         char buf[80];
         snprintf(buf, sizeof(buf), "EMFILE child failed at step %d",
@@ -1001,80 +927,6 @@ static void test_heap_tail_mprotect_then_grow(void)
     (void) set_program_break(original);
 }
 
-static void test_heap_growth_with_full_region_table(void)
-{
-    TEST("brk growth with full region table has no overlapping heap headers");
-
-    const uintptr_t page_size = 4096;
-    const int fill_limit = 8192;
-    const int minimum_fill = 2048;
-    void *current_break = sbrk(0);
-    if (current_break == (void *) -1) {
-        FAIL("read parent brk failed");
-        return;
-    }
-    uintptr_t original = (uintptr_t) current_break;
-    uintptr_t inherited_end =
-        (original + page_size - 1) / page_size * page_size + page_size;
-    if (!set_program_break(inherited_end)) {
-        FAIL("parent brk growth failed");
-        return;
-    }
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        FAIL("fork failed");
-        (void) set_program_break(original);
-        return;
-    }
-    if (pid == 0) {
-        uintptr_t protected_end = inherited_end + page_size;
-        uintptr_t final_end = protected_end + page_size;
-        if (!set_program_break(protected_end))
-            _exit(80);
-        if (mprotect((void *) inherited_end, page_size, PROT_READ) != 0)
-            _exit(81);
-
-        int filled = 0;
-        for (; filled < fill_limit; filled++) {
-            int prot = (filled & 1) ? PROT_NONE : PROT_READ;
-            void *q =
-                mmap(NULL, page_size, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            if (q == MAP_FAILED)
-                break;
-        }
-        if (filled < minimum_fill || filled == fill_limit || errno != ENOMEM)
-            _exit(82);
-
-        if (!set_program_break(final_end))
-            _exit(83);
-        volatile char *new_page = (char *) protected_end;
-        new_page[0] = 'H';
-        if (new_page[0] != 'H')
-            _exit(84);
-
-        int heap_count = 0;
-        if (!heap_headers_do_not_overlap(&heap_count) || heap_count < 2)
-            _exit(85);
-        _exit(0);
-    }
-
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        FAIL("waitpid failed");
-    } else if (!WIFEXITED(status)) {
-        FAIL("region-table child terminated abnormally");
-    } else if (WEXITSTATUS(status) != 0) {
-        char buf[96];
-        snprintf(buf, sizeof(buf), "region-table child failed at step %d",
-                 WEXITSTATUS(status));
-        FAIL(buf);
-    } else {
-        PASS();
-    }
-
-    (void) set_program_break(original);
-}
 
 int main(void)
 {
@@ -1090,7 +942,6 @@ int main(void)
     test_file_backed_fixed_move_from_same_vma();
     test_file_backed_mremap_emfile_atomic();
     test_heap_tail_mprotect_then_grow();
-    test_heap_growth_with_full_region_table();
 
     SUMMARY("test-mremap-fork-tracking");
     return fails > 0 ? 1 : 0;

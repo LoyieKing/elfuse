@@ -405,6 +405,13 @@ returning through a trampoline `ERET` would overwrite that tail's EL0 return
 state. An in-flight trampoline finishes before another barrier can redirect
 the vCPU. An unmounted task runs the trampoline before its next instruction.
 
+Barrier participation uses the seq-cst guest-entry handshake, not mount
+lifetime. A CPU in a host handler need not acknowledge before the caller
+returns; it consumes the published generation before re-entering the guest.
+Concurrent callers therefore cannot wait on each other's host handlers.
+The latest SYNC_CORE generation is retained separately so a later plain
+barrier cannot erase the trampoline owed by an inactive CPU.
+
 ### Critical Vector-Entry Rule
 
 Vector entry stubs that lead to `svc_handler` MUST NOT clobber any GPR. The
@@ -572,6 +579,15 @@ goes above the structured area, never below. Post-push masking
 
 ### `mmap` Notes
 
+Semantic VMAs are start-sorted records in a heap-backed array protected by
+`mmap_lock`. `guest_region_reserve()` grows capacity geometrically up to the
+65,536-record safety bound. Growth invalidates pointers into the array;
+mapping operations reserve required split and insertion slots before changing
+page tables. A failed reservation returns `ENOMEM` (or leaves `brk` unchanged)
+without discarding live metadata. Fork restores records into child-owned
+storage. Replacement preflight uses binary searches for the overlapping VMA
+count; rollback snapshots contain only records intersecting the changed range.
+
 Aligned file-backed `MAP_SHARED` installs a host shared file mapping;
 `MAP_PRIVATE` installs a host CoW file mapping, including writable private
 views opened through an `O_RDONLY` descriptor. Replacement refreshes only the
@@ -597,7 +613,7 @@ the file's last page. Retained whole pages beyond EOF stay invalid and deliver
 
 Fork snapshots copy file-backed pages only through the rounded guest EOF page,
 including private writes in its zero-filled tail. Whole EOF pages are omitted
-from both clonefile synchronization and the region-copy fallback; the child
+from both sparse snapshot population and the region-copy fallback; the child
 restores their invalid PTEs after receiving backing descriptors. Anonymous
 compressed or paged-out data is still copied rather than treated as a hole.
 
@@ -613,6 +629,14 @@ anonymous memory stays coherent. Both promotion and overlay are
 disabled for Rosetta because HVF caches host VA-to-PA at `hv_vm_map`
 time. Validation: `tests/test-msync.c`,
 `tests/test-cross-fork-mapshared.c`.
+
+`memfd_create` preserves its Linux name through dup and fork; proc fd links
+report `/memfd:<name> (deleted)`. Android's `ASHMEM_GET_SIZE` probe reads the
+actual memfd size and rejects ordinary files with `ENOTTY`.
+`F_SEAL_FUTURE_WRITE` rejects descriptor writes and new shared writable
+mappings with `EPERM`. Post-seal shared mappings cannot gain write permission
+through `mprotect` (`EACCES`); existing shared mappings retain write access,
+and private mappings retain COW semantics.
 
 ## Threads And Futexes
 
@@ -685,6 +709,10 @@ how `pthread_join()` waits via the TID address.
 Atomicity: the bucket mutex is held across the futex word read and the
 waiter enqueue, so the compare-and-wait is a single critical section.
 
+Eventfd objects share counters across descriptor aliases. Their state table is
+bounded by the guest descriptor table (`FD_TABLE_SIZE`), so applications can
+create more than 32 independent eventfds without a separate object limit.
+
 ### Lock Map
 
 | Resource | Lock | File |
@@ -744,6 +772,12 @@ state transfer:
    code, and returns the child PID. Allocation or admission failure returns
    `EAGAIN` without allowing an untracked child to run.
 
+CLONE_VFORK suspends only the calling task until the child's exec notification
+or pipe EOF on exit. The caller parks with a task-owned notification fd and
+child PID; VFORK deadlines reissue that continuation without spawning again.
+Signals remain pending until the child releases the caller. A parked vfork
+does not occupy a CPU or prevent a sibling's fork snapshot from quiescing.
+
 ### Process Lifecycle And Guest PID 1
 
 The first guest process in an elfuse invocation has guest PID 1 and therefore
@@ -780,25 +814,24 @@ reaper is currently provided.
 
 ### CoW Fork Path
 
-The primary slab starts as a shared sparse file. Anonymous resets can replace
-parts of its host VA with private anonymous backing; file-private mappings
-also have independent CoW pages. Fork clones the slab file with APFS
-`fclonefileat`, then synchronizes the current primary backing into that
-independent snapshot before sending its fd through `SCM_RIGHTS`.
+Fork creates an independent sparse file and copies current primary backing
+while sibling tasks are quiesced. Anonymous replacements and private-file CoW
+bytes are included, along with page tables, shim state and Rosetta/kbuf memory.
+The populated fd reaches the child through `SCM_RIGHTS`.
 
-The synchronization walks bounded batches of Mach page dispositions. Resident,
-paged-out and external-file pages are copied; absent anonymous pages become
-holes in the snapshot. Residency alone is insufficient because compressed
-pages still contain data. Host-page edge bytes are copied exactly.
-The child maps an independent clone shared so nested fork can clone it again;
-later anonymous resets remain private to that process. Private file mappings
-retain snapshot bytes rather than reattaching the original file over them.
-If cloning is unavailable, fork uses the region-copy path and never lends the
-child a live parent slab file. The child restores `ttbr0` from the IPC header.
-- `MAP_SHARED|MAP_ANONYMOUS` regions are promoted to a memfd-style
-  overlay before fork (`mmap_fork_prepare_anon_shared_locked`) and
-  reattached in the child via SCM_RIGHTS (`mmap_fork_restore_overlays`) so
-  cross-fork shared-memory coherence is preserved.
+Bounded Mach page-disposition batches distinguish resident, paged-out and
+external-file pages from absent anonymous pages. Compressed pages retain data
+and are copied. A wholly empty anonymous Mach region stays a hole without a
+per-page query. Host-page edge bytes are copied exactly.
+
+The child maps the independent snapshot shared and retains its fd for nested
+fork; later anonymous resets remain private to that process. Private file
+mappings retain snapshot bytes rather than reattaching the original file.
+Snapshot allocation failure uses region copy, never a live parent slab fd.
+The child restores `ttbr0` from the IPC header.
+`MAP_SHARED|MAP_ANONYMOUS` regions are promoted to a memfd-style overlay before
+fork (`mmap_fork_prepare_anon_shared_locked`) and reattached in the child
+(`mmap_fork_restore_overlays`) for cross-fork coherence.
 
 
 macOS rejects `MAP_PRIVATE` on `shm_open` fds (`EINVAL`), so the backing
@@ -1647,6 +1680,8 @@ prints the field's separating space as `VmFlags: `.
 `mincore`, `VmRSS` and stat RSS use backing residency; query failures return an
 error rather than report unmeasured pages as absent. Proportional sharing and
 dirty counters remain estimates. `smaps_rollup` is not implemented.
+Whole host regions use Mach resident counts. Partial regions use bounded
+`mincore` batches and charge only the guest pages inside the requested range.
 
 Synthetic proc directories have explicit snapshot boundaries. The backing
 trees reached by opening `/proc` or `/proc/self` are materialized once, on the
@@ -2225,6 +2260,12 @@ guest path. The initial process is loaded by the core bootstrap
 concatenation plus a `/lib/<basename>` fallback, and only when both
 probes miss does it fall through to `path_translate_at()`, materializing
 a FUSE interpreter and refusing one in `/dev/shm`.
+
+`/proc/self/exe` opens resolve the published executable through the same
+path translator after guest `execve`. Bionic `realpath()` opens an `O_PATH`
+descriptor, reads `/proc/self/fd/N`, then checks the returned path's inode
+against that descriptor. `make test-sysroot-procfs-exec` exercises this
+identity alongside the replacement image's auxiliary vector and environment.
 
 ### Known Limitations
 

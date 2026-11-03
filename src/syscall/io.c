@@ -2254,11 +2254,12 @@ static uint32_t mac_lflag_to_linux(tcflag_t mf)
 
 /* read/write and positional variants. */
 
-/* Open a host fd reference for regular I/O, rejecting path-only fds and
- * write-sealed memfds.
+/* Open a host fd reference for regular I/O, rejecting path-only fds and fds
+ * whose memfd seals deny writing.
  *
  * Returns -LINUX_EBADF for path-only or closed fds, -LINUX_EPERM for
- * write-sealed ones, 0 on success. st_out, when given, receives the
+ * write-sealed ones (F_SEAL_WRITE or F_SEAL_FUTURE_WRITE: shmem_write_begin
+ * refuses both, mm/shmem.c), 0 on success. st_out, when given, receives the
  * classification taken with the descriptor rather than looked up afterwards; a
  * transfer needs that pairing, since the guest fd number can be reused for
  * another kind of object in between. The checks read that same state, so the
@@ -2274,7 +2275,7 @@ static int64_t host_fd_ref_open_checked(int guest_fd,
     if (ref_err < 0)
         return ref_err;
 
-    if (st.type == FD_PATH || (st.seals & LINUX_F_SEAL_WRITE)) {
+    if (st.type == FD_PATH || fd_seals_deny_write(st.seals)) {
         int64_t err = (st.type == FD_PATH) ? -LINUX_EBADF : -LINUX_EPERM;
         host_fd_ref_close(ref);
         return err;
@@ -3929,6 +3930,33 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         return 0;
     }
 
+    /* ASHMEM_GET_SIZE is how libcutils's __has_memfd_support decides the kernel
+     * serves Android's ashmem ioctls on a memfd: it compares this answer with
+     * the ftruncate size. Answer only a memfd_create slot, from the actual host
+     * file size; every other file gets ENOTTY, which is what Linux answers when
+     * the file has no ashmem ioctl handler.
+     */
+    if (request == LINUX_ASHMEM_GET_SIZE) {
+        fd_entry_t snap;
+        host_fd_ref_t ref;
+        int64_t ref_err = host_fd_ref_open_entry((guest_fd_t) fd, &ref, &snap);
+        if (ref_err < 0)
+            return ref_err;
+        if (snap.type == FD_PATH || !snap.is_memfd) {
+            int64_t err = snap.type == FD_PATH ? -LINUX_EBADF : -LINUX_ENOTTY;
+            host_fd_ref_close(&ref);
+            return err;
+        }
+        struct stat st;
+        int rc = fstat(ref.fd, &st);
+        host_fd_ref_close(&ref);
+        if (rc < 0)
+            return linux_errno();
+        if (st.st_size > INT_MAX)
+            return -LINUX_EOVERFLOW;
+        return (int64_t) st.st_size;
+    }
+
     /* PIDFD_GET_INFO: type 0xFF nr 11, _IOWR. Match by type+nr; size varies
      * across uapi versions (VER0=64 .. VER3=88+).
      */
@@ -4676,7 +4704,8 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
 int64_t sys_fallocate(int fd, int mode, int64_t offset, int64_t len)
 {
     host_fd_ref_t host_ref;
-    int64_t err = host_fd_ref_open_io(fd, &host_ref);
+    fd_block_state_t falloc_st;
+    int64_t err = host_fd_ref_open_io_state(fd, &host_ref, NULL, &falloc_st);
     if (err < 0)
         return err;
 
@@ -4706,6 +4735,14 @@ int64_t sys_fallocate(int fd, int mode, int64_t offset, int64_t len)
     const int kPunchHole =
         LINUX_FALLOC_FL_PUNCH_HOLE | LINUX_FALLOC_FL_KEEP_SIZE;
     if (mode == kPunchHole) {
+        /* shmem_fallocate refuses a punch hole under either write seal with
+         * EPERM before it changes any page (mm/shmem.c), so a sealed memfd
+         * cannot be zeroed through fallocate either.
+         */
+        if (fd_seals_deny_write(falloc_st.seals)) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_EPERM;
+        }
         struct fpunchhole hole = {
             .fp_flags = 0,
             .reserved = 0,
@@ -5161,6 +5198,14 @@ int64_t sys_sendfile(guest_t *g,
         return err;
     }
 
+    /* The destination is written through the same page-cache write path as
+     * write(2), so a memfd write seal on it denies the transfer with EPERM.
+     */
+    if (fd_seals_deny_write(out_st.seals)) {
+        err = -LINUX_EPERM;
+        goto out_sendfile;
+    }
+
     /* macOS sendfile() requires a socket destination, so sendfile emulation
      * uses a pread/write loop for general file-to-file copies.
      */
@@ -5304,6 +5349,12 @@ int64_t sys_copy_file_range(guest_t *g,
     if (err < 0) {
         host_fd_ref_close(&in_ref);
         return err;
+    }
+
+    /* Same EPERM as write(2) on the output descriptor (see sendfile). */
+    if (fd_seals_deny_write(out_st.seals)) {
+        err = -LINUX_EPERM;
+        goto out_copy_file_range;
     }
 
     /* Read optional offsets from guest memory */
@@ -5612,6 +5663,15 @@ int64_t sys_splice(guest_t *g,
         if (err < 0) {
             host_fd_ref_close(&in_ref);
             return err;
+        }
+
+        /* Same EPERM write(2) gets when the splice destination is a sealed
+         * memfd; the pipe and socket ends of a splice carry no seals.
+         */
+        if (fd_seals_deny_write(out_st.seals)) {
+            host_fd_ref_close(&out_ref);
+            host_fd_ref_close(&in_ref);
+            return -LINUX_EPERM;
         }
 
         /* Handle offsets */

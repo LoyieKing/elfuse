@@ -307,7 +307,13 @@ int fork_ipc_recv_memory_regions(int ipc_fd, guest_t *g)
 
 int fork_ipc_send_fd_table(int ipc_sock)
 {
-    ipc_fd_entry_t fd_entries[FD_TABLE_SIZE];
+    /* Heap rather than stack: the memfd identity adds a kernel name to every
+     * entry, and FD_TABLE_SIZE copies of the resulting layout are too much
+     * stack for the fork path.
+     */
+    ipc_fd_entry_t *fd_entries = calloc(FD_TABLE_SIZE, sizeof(*fd_entries));
+    if (!fd_entries)
+        return -1;
     int host_fds_to_send[FD_TABLE_SIZE];
     fd_lifetime_t *host_fd_pins[FD_TABLE_SIZE];
     uint32_t num_fds = 0;
@@ -353,6 +359,12 @@ int fork_ipc_send_fd_table(int ipc_sock)
         fd_entries[num_fds].nonblock_owned = fd_table[i].nonblock_owned;
         fd_entries[num_fds].path_poll_capable = fd_table[i].path_poll_capable;
         fd_entries[num_fds].seals = fd_table[i].seals;
+        fd_entries[num_fds].is_memfd = fd_table[i].is_memfd;
+        if (fd_table[i].is_memfd)
+            memcpy(fd_entries[num_fds].memfd_name, fd_table[i].memfd_name,
+                   sizeof(fd_entries[num_fds].memfd_name));
+        else
+            fd_entries[num_fds].memfd_name[0] = '\0';
         {
             int st = -1;
             if (t == FD_SOCKET)
@@ -398,12 +410,14 @@ int fork_ipc_send_fd_table(int ipc_sock)
     for (uint32_t fi = 0; fi < num_fds; fi++)
         if (host_fd_pins[fi])
             fd_lifetime_release(host_fd_pins[fi]);
+    free(fd_entries);
     return 0;
 
 fail:
     for (uint32_t fi = 0; fi < num_fds; fi++)
         if (host_fd_pins[fi])
             fd_lifetime_release(host_fd_pins[fi]);
+    free(fd_entries);
     return -1;
 }
 
@@ -427,6 +441,19 @@ static int fork_rebuild_pidfd(int gfd,
     if (rc < 0)
         close(h);
     return rc;
+}
+
+/* The child's slot starts without memfd identity; restore the parent's record
+ * before any guest code can inspect the inherited descriptor.
+ */
+static void fork_restore_memfd_identity(int gfd, const ipc_fd_entry_t *e)
+{
+    fd_table[gfd].is_memfd = e->is_memfd != 0;
+    if (e->is_memfd)
+        memcpy(fd_table[gfd].memfd_name, e->memfd_name,
+               sizeof(fd_table[gfd].memfd_name));
+    else
+        fd_table[gfd].memfd_name[0] = '\0';
 }
 
 int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
@@ -543,6 +570,7 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
             fd_table[gfd].path_poll_capable =
                 fd_entries[i].path_poll_capable != 0;
             fd_table[gfd].seals = fd_entries[i].seals;
+            fork_restore_memfd_identity(gfd, &fd_entries[i]);
         } else if (fd_entries[i].type == FD_PIDFD) {
             /* The descriptor that arrived is the parent's pipe, whose write end
              * the parent's monitor completes and whose last parent close would
@@ -626,6 +654,7 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
             fd_table[gfd].path_poll_capable =
                 fd_entries[i].path_poll_capable != 0;
             fd_table[gfd].seals = fd_entries[i].seals;
+            fork_restore_memfd_identity(gfd, &fd_entries[i]);
             if (fd_entries[i].type == FD_URANDOM)
                 urandom_fd_reset_cache(gfd);
 
@@ -855,8 +884,19 @@ static int fork_ipc_send_backing_fds(int ipc_sock,
                                      const guest_region_t *regions_snapshot,
                                      uint32_t num_guest_regions)
 {
-    int backing_fds[GUEST_MAX_REGIONS];
+    /* A safety-bound-sized fd list exceeds the worker's default 512 KiB stack.
+     */
+    int *backing_fds = NULL;
     uint32_t nbacking = 0;
+
+    if (num_guest_regions > 0) {
+        backing_fds = malloc((size_t) num_guest_regions * sizeof(*backing_fds));
+        if (!backing_fds) {
+            log_error("clone: backing fd list alloc failed for %u regions",
+                      num_guest_regions);
+            return -1;
+        }
+    }
 
     /* DONTFORK regions send their fd too: the child consumes this bundle before
      * it drops them, so count and order stay tied to the serialized region
@@ -867,23 +907,30 @@ static int fork_ipc_send_backing_fds(int ipc_sock,
             if (fcntl(regions_snapshot[i].backing_fd, F_GETFD) < 0) {
                 log_error("clone: region %u carries stale backing_fd=%d: %s", i,
                           regions_snapshot[i].backing_fd, strerror(errno));
+                free(backing_fds);
                 return -1;
             }
             backing_fds[nbacking++] = regions_snapshot[i].backing_fd;
         }
     }
 
-    if (fork_ipc_write_all(ipc_sock, &nbacking, sizeof(nbacking)) < 0)
+    if (fork_ipc_write_all(ipc_sock, &nbacking, sizeof(nbacking)) < 0) {
+        free(backing_fds);
         return -1;
-    if (nbacking == 0)
+    }
+    if (nbacking == 0) {
+        free(backing_fds);
         return 0;
+    }
 
     log_debug("clone: sending %u backing fds for %u regions", nbacking,
               num_guest_regions);
     if (fork_ipc_send_fds(ipc_sock, backing_fds, (int) nbacking) < 0) {
         log_error("clone: send backing fds failed: %s", strerror(errno));
+        free(backing_fds);
         return -1;
     }
+    free(backing_fds);
     return 0;
 }
 
@@ -893,6 +940,16 @@ int fork_ipc_send_process_state(int ipc_sock,
                                 bool regions_tracker_stale_snapshot,
                                 bool clear_sighand)
 {
+    /* The wire carries a snapshot count and a matching record blob; refusing an
+     * oversized count here keeps the send from serializing a table the peer
+     * could never accept.
+     */
+    if (num_guest_regions > GUEST_MAX_REGIONS) {
+        log_error("clone: region snapshot too large (%u > %d)",
+                  num_guest_regions, GUEST_MAX_REGIONS);
+        return -1;
+    }
+
     char cwd[LINUX_PATH_MAX] = {0};
     getcwd(cwd, sizeof(cwd));
     mode_t cur_umask = umask(0);
@@ -1079,6 +1136,17 @@ static bool fork_ipc_drop_dontfork_regions(guest_t *g)
         kept++;
     }
     g->nregions = kept;
+    for (int i = 0; i < g->nregions; i++) {
+        guest_region_t *r = &g->regions[i];
+        if (!r->wipeonfork)
+            continue;
+        if (guest_memory_reset_range(g, r->gpa_base, r->end - r->start) < 0) {
+            mmap_lock_release();
+            log_error("fork-child: cannot clear WIPEONFORK range");
+            return false;
+        }
+        r->inherited_at_fork = false;
+    }
     mmap_lock_release();
 
     /* The child's VM has no TLB history, so the ranges accumulated for the
@@ -1183,11 +1251,17 @@ int fork_ipc_recv_process_state(int ipc_fd,
     uint32_t recv_regions = num_guest_regions;
     if (recv_regions > GUEST_MAX_REGIONS)
         recv_regions = GUEST_MAX_REGIONS;
-    if (recv_regions > 0 &&
-        fork_ipc_read_all(ipc_fd, g->regions,
-                          recv_regions * sizeof(guest_region_t)) < 0) {
-        log_error("fork-child: failed to read regions");
-        return -1;
+    if (recv_regions > 0) {
+        if (guest_region_reserve(g, (int) recv_regions) < 0) {
+            log_error("fork-child: cannot reserve %u region slots",
+                      recv_regions);
+            return -1;
+        }
+        if (fork_ipc_read_all(ipc_fd, g->regions,
+                              recv_regions * sizeof(guest_region_t)) < 0) {
+            log_error("fork-child: failed to read regions");
+            return -1;
+        }
     }
 
     /* Drain any excess records the parent serialized beyond the local cap.

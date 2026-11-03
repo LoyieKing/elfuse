@@ -543,7 +543,7 @@ static void timerfd_close(int guest_fd)
  * slot's guest_fd field is retained for sfd_alloc_slot's "free if guest_fd ==
  * -1" convention and tracks the most recently allocated primary owner.
  */
-#define EVENTFD_MAX 32
+#define EVENTFD_MAX FD_TABLE_SIZE
 static struct {
     int guest_fd;     /* Primary guest fd, -1 when slot is free */
     int refcount;     /* Number of guest_fds bound to this slot */

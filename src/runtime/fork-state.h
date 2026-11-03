@@ -21,7 +21,7 @@
 /* Fork IPC protocol identity. Bump this whenever the header layout or ordered
  * fork payload changes incompatibly.
  */
-#define FORK_IPC_PROTOCOL_MAGIC 0x454C4656U /* "ELFV": memory_mode */
+#define FORK_IPC_PROTOCOL_MAGIC 0x454C4659U /* "ELFY": sparse snapshot */
 
 #define IPC_HDR_SOFT_NEWPID 0x1u
 
@@ -73,13 +73,6 @@ typedef struct {
      */
     uint64_t clone_flags;
     uint64_t ctid_gva;
-
-    /* Nonzero when the shm fd sent below is an independent fclonefileat clone
-     * (not the parent's live fd). Only then may the child map it MAP_SHARED and
-     * retain it for its own nested CoW fork; the live-fd fallback must stay
-     * MAP_PRIVATE so the child does not share writes with the parent.
-     */
-    uint32_t shm_is_clone;
 
     /* guest_memory_mode_t the child passes to guest_init, so both sides of the
      * fork retire ranges to zero the same way. Validated against the enum
@@ -140,6 +133,13 @@ typedef struct {
      */
     int32_t sock_type;
     char proc_path[FD_VIRTUAL_PATH_MAX];
+
+    /* memfd_create identity. The host backing is an unlinked regular file, so
+     * neither the name nor the memfd bit can be recovered from the descriptor
+     * the child receives.
+     */
+    int32_t is_memfd;
+    char memfd_name[LINUX_MFD_NAME_MAX + 1];
 
     /* FD_PIDFD only: the target a pidfd names lives in the parent's registry,
      * not in the pipe that travels over SCM_RIGHTS, so the child rebuilds the

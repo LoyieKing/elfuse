@@ -4095,6 +4095,7 @@ static void fire_wait_one(thread_entry_t *t, void *ctx)
         sysvipc_park_on_deadline(t);
         break;
     case PARK_KIND_WAIT:
+    case PARK_KIND_VFORK:
         wait_park_on_deadline(t);
         break;
     case PARK_KIND_SIGNAL:

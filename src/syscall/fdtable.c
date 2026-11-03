@@ -362,6 +362,8 @@ static inline void fd_init_entry(int fd,
     fd_table[fd].path_poll_capable =
         fd_alias_pending && fd_alias_spec.path_poll_capable;
     fd_table[fd].seals = 0;
+    fd_table[fd].is_memfd = false;
+    fd_table[fd].memfd_name[0] = '\0';
 
     /* Whether a host read/write can block, so the fast-path and slow-path
      * readers can decide whether to divert into the interruptible wait without
@@ -891,6 +893,7 @@ fd_lifetime_t *fd_mark_closed_unlocked(int fd)
     fd_table[fd].path_poll_capable = false;
     fd_table[fd].linux_flags = 0;
     fd_table[fd].seals = 0;
+    fd_table[fd].is_memfd = false;
     fd_table[fd].fasync_owner_type = FASYNC_OWNER_NONE;
     fd_table[fd].fasync_owner = 0;
     fd_bitmap_set_free(fd);
@@ -1383,6 +1386,28 @@ void fd_publish_linux_flags(int guest_fd, int linux_flags)
     pthread_mutex_lock(&fd_lock);
     fd_table[guest_fd].linux_flags =
         fd_flags_with_accmode(fd_table[guest_fd].type, linux_flags);
+    pthread_mutex_unlock(&fd_lock);
+}
+
+/* Record that a freshly allocated slot is a memfd_create region and carry the
+ * name its /proc/self/fd magic link reports. @generation proves the slot still
+ * holds the allocation the caller made; @name has already been bounded by the
+ * caller to LINUX_MFD_NAME_MAX bytes.
+ */
+void fd_publish_memfd(int guest_fd, uint64_t generation, const char *name)
+{
+    if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
+        return;
+    size_t len = strlen(name);
+    if (len > LINUX_MFD_NAME_MAX)
+        len = LINUX_MFD_NAME_MAX;
+    pthread_mutex_lock(&fd_lock);
+    if (fd_table[guest_fd].type != FD_CLOSED &&
+        fd_table[guest_fd].generation == generation) {
+        fd_table[guest_fd].is_memfd = true;
+        memcpy(fd_table[guest_fd].memfd_name, name, len);
+        fd_table[guest_fd].memfd_name[len] = '\0';
+    }
     pthread_mutex_unlock(&fd_lock);
 }
 

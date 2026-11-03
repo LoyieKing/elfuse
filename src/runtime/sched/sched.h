@@ -115,9 +115,10 @@ enum {
     PARK_KIND_SLEEP,
     PARK_KIND_IO,
     PARK_KIND_MQUEUE,
-    PARK_KIND_STOP, /* ptrace/group stop: plain resume, no X0 injection */
-    PARK_KIND_WAIT, /* wait driver re-check: reissue, no X0 injection */
-    PARK_KIND_IPC,  /* SysV IPC wait: timeout reissues, signal gives EINTR */
+    PARK_KIND_STOP,  /* ptrace/group stop: plain resume, no X0 injection */
+    PARK_KIND_WAIT,  /* wait driver re-check: reissue, no X0 injection */
+    PARK_KIND_VFORK, /* Signals wait for the child's exec or exit. */
+    PARK_KIND_IPC,   /* SysV IPC wait: timeout reissues, signal gives EINTR */
     PARK_KIND_SERVICE,
     PARK_KIND_SIGNAL,
 };

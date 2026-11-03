@@ -28,6 +28,7 @@
  * Syscalls exercised: brk(214), mmap(222), mremap(216)
  */
 
+#include <errno.h>
 #include <fcntl.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -647,131 +648,437 @@ static void test_grow_past_a_seal(void)
     EXPECT_TRUE(clean, "the seal check left the heap sealed or grown");
 }
 
-/* Fill the region table until brk is refused.
- *
- * Returns 0 once it is refused, 1 if the table never filled, -1 if the mapping
- * could not be made.
- *
- * Splitting one big mapping with alternating mprotect is the cheap way there:
- * every other page becomes its own record until the table is full, and from
- * that point a munmap split cannot be recorded, which is what sets
- * regions_tracker_stale.
- */
-static int brk_grows_with_full_table(void)
+static int guarded_maps_match(unsigned char *base, size_t count)
 {
-    unsigned long span = 64u << 20, page = 4096;
-    unsigned char *p = mmap(NULL, span, PROT_READ | PROT_WRITE,
-                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p == MAP_FAILED)
-        return -1;
-
-    /* Probe after every split rather than filling the table and then looking.
-     * Each split past the cap logs, so stopping at the first refusal keeps the
-     * test to one line of that instead of thousands.
-     */
-    for (unsigned long off = 0; off + 2 * page <= span; off += 2 * page) {
-        if (mprotect(p + off, page, PROT_READ) != 0)
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f)
+        return 0;
+    unsigned long cursor = (unsigned long) base;
+    unsigned long limit = cursor + count * 8192;
+    char line[512];
+    int ok = 1;
+    while (cursor < limit && fgets(line, sizeof(line), f)) {
+        unsigned long start, end;
+        char prot[8];
+        if (sscanf(line, "%lx-%lx %7s", &start, &end, prot) != 3 ||
+            end <= cursor)
+            continue;
+        if (start > cursor) {
+            ok = 0;
             break;
+        }
+        unsigned long stop = end < limit ? end : limit;
+        for (; cursor < stop; cursor += 4096) {
+            int data = ((cursor - (unsigned long) base) / 4096) % 2 == 0;
+            if (prot[0] != (data ? 'r' : '-') ||
+                prot[1] != (data ? 'w' : '-') || prot[2] != '-')
+                ok = 0;
+        }
+    }
+    fclose(f);
+    return ok && cursor == limit;
+}
 
-        unsigned long cur = guest_brk(0);
-        int grew = guest_brk(cur + page) >= cur + page;
-        guest_brk(cur);
-        if (!grew)
+static void test_vma_growth(void)
+{
+    const size_t count = 5000, page = 4096, span = count * 2 * page;
+    unsigned char *base =
+        mmap(NULL, span, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    TEST("guarded mappings retain permissions beyond 4096 VMAs");
+    if (base == MAP_FAILED) {
+        FAIL("cannot reserve guarded mapping");
+        return;
+    }
+    int ok = 1;
+    for (size_t i = 0; i < count; i++) {
+        if (mprotect(base + i * 2 * page, page, PROT_READ | PROT_WRITE)) {
+            ok = 0;
+            break;
+        }
+        *(uint64_t *) (base + i * 2 * page) = i;
+    }
+    EXPECT_TRUE(ok && guarded_maps_match(base, count),
+                "maps lost guarded-page coverage or permissions");
+    if (!ok) {
+        munmap(base, span);
+        return;
+    }
+
+    TEST("a late protection split updates hardware and maps");
+    unsigned char *late = base + (count - 1) * 2 * page;
+    char prot[8];
+    ok = mprotect(late, page, PROT_READ | PROT_EXEC) == 0;
+    const char *got = map_perms_at((unsigned long) late, prot);
+    EXPECT_TRUE(ok && got && got[0] == 'r' && got[1] == '-' && got[2] == 'x' &&
+                    write_faults(late),
+                "late seal was lost by the region tracker or PTEs");
+    ok = mprotect(late, page, PROT_READ | PROT_WRITE) == 0;
+
+    TEST("fork preserves a large guarded VMA table and private data");
+    pid_t pid = ok ? fork() : -1;
+    if (pid == 0) {
+        int valid = guarded_maps_match(base, count);
+        for (size_t i = 0; i < count; i++) {
+            if (*(uint64_t *) (base + i * 2 * page) != i)
+                valid = 0;
+        }
+        *(uint64_t *) late = 0xfeed;
+        _exit(valid ? 0 : 1);
+    }
+    int status = 0;
+    ok = pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+         WEXITSTATUS(status) == 0 && *(uint64_t *) late == count - 1;
+    EXPECT_TRUE(ok, "fork truncated the VMA table or shared private bytes");
+
+    TEST("fixed replacement preserves neighboring guarded pages");
+    unsigned char *replaced = base + (count - 2) * 2 * page;
+    void *p = mmap(replaced, page, PROT_READ | PROT_WRITE,
+                   MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    EXPECT_TRUE(p == replaced && *(uint64_t *) replaced == 0 &&
+                    *(uint64_t *) late == count - 1 &&
+                    guarded_maps_match(base, count),
+                "fixed replacement lost metadata or neighboring data");
+
+    TEST("interior unmap retains both sides after VMA growth");
+    unsigned char *island = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ok = island != MAP_FAILED;
+    if (ok) {
+        island[0] = 0x12;
+        island[2 * page] = 0x34;
+        ok = munmap(island + page, page) == 0 && island[0] == 0x12 &&
+             island[2 * page] == 0x34 && write_faults(island + page);
+        got = map_perms_at((unsigned long) island + 2 * page, prot);
+        ok = ok && got && got[1] == 'w';
+        munmap(island, 3 * page);
+    }
+    EXPECT_TRUE(ok, "interior unmap dropped a live tail or exposed the hole");
+    TEST("guarded VMA cleanup");
+    EXPECT_EQ(munmap(base, span), 0, "guarded mapping cleanup failed");
+}
+
+/* A fixed replacement is one remove range, so these are the single-interval
+ * cases of the removal count: the endpoint forms below decide how many records
+ * survive and how large the rollback snapshot has to be. The islands stay small
+ * and are reserved at runtime; the 5000-VMA shape above is already the
+ * expensive part of this binary.
+ */
+#define REPLACE_PAGE 4096u
+
+/* On Apple Silicon the host page is 16 KiB. A replacement that is not aligned
+ * to it takes the pread copy path instead of the file-overlay path, so align
+ * the islands and use 16 KiB replacement ranges where the overlay is under
+ * test. On a 4 KiB host the same alignment is merely stronger.
+ */
+#define REPLACE_ALIGN (16u * 1024)
+
+/* One mapping at a runtime-chosen address, aligned so the fixed replacements
+ * below can reach the file-overlay path. The prefix and tail of the reservation
+ * are unmapped, so the kept range is one record.
+ */
+static unsigned char *replacement_island(size_t pages)
+{
+    size_t len = pages * REPLACE_PAGE;
+    unsigned char *raw = mmap(NULL, len + REPLACE_ALIGN, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (raw == MAP_FAILED)
+        return MAP_FAILED;
+
+    unsigned char *base =
+        (unsigned char *) (((uintptr_t) raw + REPLACE_ALIGN - 1) &
+                           ~(uintptr_t) (REPLACE_ALIGN - 1));
+    size_t prefix = (size_t) (base - raw);
+    size_t tail = (size_t) (raw + len + REPLACE_ALIGN - (base + len));
+    if ((prefix && munmap(raw, prefix) != 0) ||
+        (tail && munmap(base + len, tail) != 0)) {
+        munmap(base, len);
+        return MAP_FAILED;
+    }
+    return base;
+}
+
+/* Per-page marker. A boundary that moves by even one page is visible. */
+static void marker_fill(unsigned char *p, size_t pages, unsigned char seed)
+{
+    for (size_t i = 0; i < pages; i++)
+        memset(p + i * REPLACE_PAGE, (unsigned char) (seed + i), REPLACE_PAGE);
+}
+
+static int marker_holds(const unsigned char *p,
+                        size_t pages,
+                        unsigned char seed)
+{
+    for (size_t i = 0; i < pages; i++) {
+        unsigned char want = (unsigned char) (seed + i);
+        for (size_t j = 0; j < REPLACE_PAGE; j++) {
+            if (p[i * REPLACE_PAGE + j] != want)
+                return 0;
+        }
+    }
+    return 1;
+}
+
+static int bytes_hold(const unsigned char *p, size_t n, unsigned char want)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (p[i] != want)
             return 0;
     }
     return 1;
 }
 
-/* The refusal a stale tracker imposes, the doubt a fork child inherits with the
- * table, and the clear that stops either outliving an execve. All three are new
- * with the brk bound, and all three are one-way: a guest that never gets its
- * brk back would look exactly like a guest whose allocator chose mmap.
- */
-static void test_stale_tracker(char **argv)
+static int map_prot_is(unsigned long addr, char r, char w, char x)
 {
-    const char *name = "a full table refuses a grow";
-
-    /* elfuse-internal: a real kernel has no region table to fill, so the child
-     * below would split its mapping to no end and report that the break still
-     * grows, which on Linux is simply correct. The "[stack-guard]" line is the
-     * same marker the floor check uses to tell the two apart.
-     */
-    if (!guard_map_start(NULL)) {
-        give_up(name, "no region table to fill", 1);
-        return;
-    }
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        cannot_build(name, "fork failed", 1);
-        return;
-    }
-    if (pid == 0) {
-        int grew = brk_grows_with_full_table();
-        if (grew < 0)
-            _exit(2);
-        if (grew)
-            _exit(3); /* the refusal never took */
-
-        /* Still refused in a child of this child, which inherits the flag with
-         * the table rather than re-deriving it.
-         */
-        pid_t grandchild = fork();
-        if (grandchild == 0) {
-            unsigned long cur = guest_brk(0);
-            _exit(guest_brk(cur + 4096) >= cur + 4096 ? 4 : 0);
-        }
-        int gst = 0;
-        if (grandchild < 0 || waitpid(grandchild, &gst, 0) != grandchild)
-            _exit(2);
-        if (!WIFEXITED(gst) || WEXITSTATUS(gst) != 0)
-            _exit(WIFEXITED(gst) ? WEXITSTATUS(gst) : 2);
-
-        /* And growing again on the far side of an execve. */
-        char *av[] = {argv[0], (char *) "--post-exec", NULL};
-        execv(argv[0], av);
-        _exit(2);
-    }
-
-    int st = 0;
-    if (waitpid(pid, &st, 0) != pid) {
-        cannot_build(name, "wait failed", 1);
-        return;
-    }
-    if (!WIFEXITED(st)) {
-        cannot_build(name, "child died on a signal", 1);
-        return;
-    }
-
-    int code = WEXITSTATUS(st);
-    if (code == 2) {
-        cannot_build(name, "child could not fill the table", 1);
-        return;
-    }
-
-    TEST(name);
-    EXPECT_TRUE(code != 3, "a full table still let the break grow");
-
-    TEST("a fork child inherits the refusal");
-    EXPECT_TRUE(code != 4, "the child re-derived a clean tracker");
-
-    TEST("an execve clears the refusal");
-    EXPECT_EQ(code, 0, "the break still would not grow after execve");
+    char perms[8];
+    const char *got = map_perms_at(addr, perms);
+    return got && got[0] == r && got[1] == w && got[2] == x;
 }
 
-int main(int argc, char **argv)
+/* The replacement is strictly inside one record: the tracker has to split at
+ * both endpoints, and the snapshot it keeps for rollback covers one record, not
+ * the three pieces the two splits create. Both survivors are older bytes.
+ */
+static void test_fixed_inside_mapping(void)
 {
-    (void) argc;
-
-    /* The re-exec arm of test_stale_tracker, first so the replacement image
-     * does not run the whole file again on its way to it. Getting here at all
-     * means the exec cleared the stale flag, since this process has not filled
-     * anything.
-     */
-    if (argv[1] && !strcmp(argv[1], "--post-exec")) {
-        unsigned long cur = guest_brk(0);
-        return guest_brk(cur + 4096) >= cur + 4096 ? 0 : 1;
+    const size_t pages = 8;
+    unsigned char *base = replacement_island(pages);
+    TEST("fixed replacement keeps both sides of one mapping");
+    if (base == MAP_FAILED) {
+        FAIL("cannot reserve replacement island");
+        return;
     }
+
+    marker_fill(base, pages, 0x31);
+    unsigned char *mid = base + 3 * REPLACE_PAGE;
+    void *got = mmap(mid, 2 * REPLACE_PAGE, PROT_READ | PROT_WRITE,
+                     MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    int ok = got == mid && bytes_hold(mid, 2 * REPLACE_PAGE, 0);
+    if (ok) {
+        memset(mid, 0x7c, REPLACE_PAGE);
+        ok = bytes_hold(mid, REPLACE_PAGE, 0x7c) &&
+             bytes_hold(mid + REPLACE_PAGE, REPLACE_PAGE, 0);
+    }
+    ok = ok && marker_holds(base, 3, 0x31) &&
+         marker_holds(base + 5 * REPLACE_PAGE, 3, 0x36) &&
+         map_prot_is((unsigned long) base, 'r', 'w', '-') &&
+         map_prot_is((unsigned long) mid, 'r', 'w', '-') &&
+         map_prot_is((unsigned long) base + 7 * REPLACE_PAGE, 'r', 'w', '-');
+    int clean = munmap(base, pages * REPLACE_PAGE) == 0;
+    EXPECT_TRUE(ok && clean, "replacement lost a side or its bytes");
+}
+
+/* The range starts inside one record and ends inside another with different
+ * protection. The snapshots must cover both, and the surviving right half must
+ * stay executable/read-only rather than inherit the replacement's RW.
+ */
+static void test_fixed_across_protections(void)
+{
+    const size_t pages = 8;
+    unsigned char *base = replacement_island(pages);
+    TEST("fixed replacement spans differently protected records");
+    if (base == MAP_FAILED) {
+        FAIL("cannot reserve replacement island");
+        return;
+    }
+
+    marker_fill(base, pages, 0x41);
+    unsigned char *mid = base + 2 * REPLACE_PAGE;
+    int ok = mprotect(base + 4 * REPLACE_PAGE, 4 * REPLACE_PAGE,
+                      PROT_READ | PROT_EXEC) == 0;
+    void *got = ok ? mmap(mid, 4 * REPLACE_PAGE, PROT_READ | PROT_WRITE,
+                          MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+                   : MAP_FAILED;
+    ok = ok && got == mid && bytes_hold(mid, 4 * REPLACE_PAGE, 0) &&
+         marker_holds(base, 2, 0x41) &&
+         marker_holds(base + 6 * REPLACE_PAGE, 2, 0x47) &&
+         map_prot_is((unsigned long) base, 'r', 'w', '-') &&
+         map_prot_is((unsigned long) mid, 'r', 'w', '-') &&
+         map_prot_is((unsigned long) base + 6 * REPLACE_PAGE, 'r', '-', 'x') &&
+         write_faults(base + 7 * REPLACE_PAGE);
+    int clean = munmap(base, pages * REPLACE_PAGE) == 0;
+    EXPECT_TRUE(ok && clean, "a protected survivor was trimmed or rewritable");
+}
+
+/* No overlap at all: the snapshot bound has nothing to capture and the removal
+ * has nothing to remove. Neighbors on both sides of the hole must be intact.
+ */
+static void test_fixed_into_hole(void)
+{
+    const size_t pages = 8;
+    unsigned char *base = replacement_island(pages);
+    TEST("fixed replacement fills a hole between neighbors");
+    if (base == MAP_FAILED) {
+        FAIL("cannot reserve replacement island");
+        return;
+    }
+
+    marker_fill(base, pages, 0x51);
+    unsigned char *hole = base + 3 * REPLACE_PAGE;
+    int ok = munmap(hole, 2 * REPLACE_PAGE) == 0 && write_faults(hole);
+    void *got = ok ? mmap(hole, 2 * REPLACE_PAGE, PROT_READ | PROT_WRITE,
+                          MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+                   : MAP_FAILED;
+    ok = ok && got == hole && bytes_hold(hole, 2 * REPLACE_PAGE, 0) &&
+         marker_holds(base, 3, 0x51) &&
+         marker_holds(base + 5 * REPLACE_PAGE, 3, 0x56) &&
+         map_prot_is((unsigned long) base, 'r', 'w', '-') &&
+         map_prot_is((unsigned long) base + 7 * REPLACE_PAGE, 'r', 'w', '-');
+    int clean = munmap(base, pages * REPLACE_PAGE) == 0;
+    EXPECT_TRUE(ok && clean, "a hole replacement moved a neighbor boundary");
+}
+
+/* Endpoints land exactly on record boundaries on both sides. Nothing beyond the
+ * replaced record may be removed or renamed, even though no split is needed to
+ * express the range.
+ */
+static void test_fixed_exact_record(void)
+{
+    const size_t pages = 8;
+    unsigned char *base = replacement_island(pages);
+    TEST("fixed replacement of one whole record keeps its neighbors");
+    if (base == MAP_FAILED) {
+        FAIL("cannot reserve replacement island");
+        return;
+    }
+
+    marker_fill(base, pages, 0x61);
+    unsigned char *record = base + 2 * REPLACE_PAGE;
+    int ok = mprotect(record, 2 * REPLACE_PAGE, PROT_READ) == 0 &&
+             write_faults(record) &&
+             map_prot_is((unsigned long) record, 'r', '-', '-');
+    void *got = ok ? mmap(record, 2 * REPLACE_PAGE, PROT_READ | PROT_WRITE,
+                          MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+                   : MAP_FAILED;
+    ok = ok && got == record && bytes_hold(record, 2 * REPLACE_PAGE, 0) &&
+         marker_holds(base, 2, 0x61) &&
+         marker_holds(base + 4 * REPLACE_PAGE, 4, 0x65) &&
+         map_prot_is((unsigned long) record, 'r', 'w', '-') &&
+         map_prot_is((unsigned long) base, 'r', 'w', '-') &&
+         map_prot_is((unsigned long) base + 7 * REPLACE_PAGE, 'r', 'w', '-');
+    int clean = munmap(base, pages * REPLACE_PAGE) == 0;
+    EXPECT_TRUE(ok && clean, "an exact-boundary replacement ate a neighbor");
+}
+
+/* A fixed replacement that fails after the old record was removed must put the
+ * bytes, the protection, and the maps entry back. mmap of /dev/null fails with
+ * ENODEV on real Linux and on the host, after the tracker has already removed
+ * the replaced record, so it exercises the restore path rather than an early
+ * argument check.
+ */
+static void test_fixed_failure_rollback(void)
+{
+    const size_t pages = 12;
+    unsigned char *base = replacement_island(pages);
+    TEST("failed fixed replacement restores the replaced record");
+    if (base == MAP_FAILED) {
+        FAIL("cannot reserve replacement island");
+        return;
+    }
+
+    marker_fill(base, pages, 0xa1);
+    unsigned char *record = base + 4 * REPLACE_PAGE;
+    int fd = open("/dev/null", O_RDWR);
+    int ok = fd >= 0 &&
+             mprotect(record, 4 * REPLACE_PAGE, PROT_READ | PROT_EXEC) == 0 &&
+             write_faults(record) &&
+             map_prot_is((unsigned long) record, 'r', '-', 'x');
+    errno = 0;
+    void *got = ok ? mmap(record, 4 * REPLACE_PAGE, PROT_READ | PROT_WRITE,
+                          MAP_FIXED | MAP_SHARED, fd, 0)
+                   : MAP_FAILED;
+    int failed = ok && got == MAP_FAILED && errno == ENODEV;
+    ok = failed && marker_holds(base, pages, 0xa1) &&
+         map_prot_is((unsigned long) record, 'r', '-', 'x') &&
+         map_prot_is((unsigned long) base, 'r', 'w', '-') &&
+         map_prot_is((unsigned long) base + 11 * REPLACE_PAGE, 'r', 'w', '-') &&
+         write_faults(record);
+    if (fd >= 0)
+        close(fd);
+    int clean = munmap(base, pages * REPLACE_PAGE) == 0;
+    EXPECT_TRUE(ok && clean, "failed replacement changed bytes or permissions");
+}
+
+/* The failed range is interior to one record, so the rollback has to rejoin two
+ * RX survivors around it rather than leave a hole or an RW strip.
+ */
+static void test_fixed_failure_inside(void)
+{
+    const size_t pages = 12;
+    unsigned char *base = replacement_island(pages);
+    TEST("failed replacement inside a record restores both sides");
+    if (base == MAP_FAILED) {
+        FAIL("cannot reserve replacement island");
+        return;
+    }
+
+    marker_fill(base, pages, 0xb1);
+    unsigned char *record = base + 4 * REPLACE_PAGE;
+    int fd = open("/dev/null", O_RDWR);
+    int ok = fd >= 0 &&
+             mprotect(base, pages * REPLACE_PAGE, PROT_READ | PROT_EXEC) == 0 &&
+             write_faults(record);
+    errno = 0;
+    void *got = ok ? mmap(record, 4 * REPLACE_PAGE, PROT_READ | PROT_WRITE,
+                          MAP_FIXED | MAP_SHARED, fd, 0)
+                   : MAP_FAILED;
+    int failed = ok && got == MAP_FAILED && errno == ENODEV;
+    ok = failed && marker_holds(base, pages, 0xb1) &&
+         map_prot_is((unsigned long) base, 'r', '-', 'x') &&
+         map_prot_is((unsigned long) record, 'r', '-', 'x') &&
+         map_prot_is((unsigned long) base + 11 * REPLACE_PAGE, 'r', '-', 'x') &&
+         write_faults(record);
+    if (fd >= 0)
+        close(fd);
+    int clean = munmap(base, pages * REPLACE_PAGE) == 0;
+    EXPECT_TRUE(ok && clean, "failed interior replacement lost a side");
+}
+
+/* A failing replacement into an unmapped range installs nothing: the hole stays
+ * a hole and neither neighbor's bytes or permissions move.
+ */
+static void test_fixed_failure_in_hole(void)
+{
+    const size_t pages = 12;
+    unsigned char *base = replacement_island(pages);
+    TEST("failed replacement in a hole leaves it unmapped");
+    if (base == MAP_FAILED) {
+        FAIL("cannot reserve replacement island");
+        return;
+    }
+
+    marker_fill(base, pages, 0xc1);
+    unsigned char *hole = base + 4 * REPLACE_PAGE;
+    int fd = open("/dev/null", O_RDWR);
+    int ok =
+        fd >= 0 && munmap(hole, 4 * REPLACE_PAGE) == 0 && write_faults(hole);
+    errno = 0;
+    void *got = ok ? mmap(hole, 4 * REPLACE_PAGE, PROT_READ | PROT_WRITE,
+                          MAP_FIXED | MAP_SHARED, fd, 0)
+                   : MAP_FAILED;
+    int failed = ok && got == MAP_FAILED && errno == ENODEV;
+    ok = failed && write_faults(hole) && marker_holds(base, 4, 0xc1) &&
+         marker_holds(base + 8 * REPLACE_PAGE, 4, 0xc9) &&
+         map_prot_is((unsigned long) base, 'r', 'w', '-') &&
+         map_prot_is((unsigned long) base + 11 * REPLACE_PAGE, 'r', 'w', '-');
+    if (fd >= 0)
+        close(fd);
+    int clean = munmap(base, pages * REPLACE_PAGE) == 0;
+    EXPECT_TRUE(ok && clean, "failed hole replacement moved a boundary");
+}
+
+static void test_fixed_replacement(void)
+{
+    test_fixed_inside_mapping();
+    test_fixed_across_protections();
+    test_fixed_into_hole();
+    test_fixed_exact_record();
+    test_fixed_failure_rollback();
+    test_fixed_failure_inside();
+    test_fixed_failure_in_hole();
+}
+
+int main(void)
+{
     printf("brk neighbor tests\n\n");
 
     test_straddling_heap();
@@ -781,7 +1088,8 @@ int main(int argc, char **argv)
     test_hole_shrink_regrow();
     test_grow_past_a_seal();
     test_maps_do_not_overlap();
-    test_stale_tracker(argv);
+    test_vma_growth();
+    test_fixed_replacement();
 
     /* A local array is the cheapest witness that main's own frame survived the
      * growth: sys_brk zeroed it in place when it overran. The barrier is what

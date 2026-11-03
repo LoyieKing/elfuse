@@ -216,14 +216,10 @@ typedef struct {
 
 /* Semantic region tracking. */
 
-/* Maximum number of tracked memory regions (heap/stack/mmap/ELF/etc.). Adjacent
- * anonymous regions with matching permissions are automatically coalesced (see
- * regions_mergeable in core/guest.c). Threaded runtimes create many thread
- * stacks with guard pages; with coalescing, typical workloads use ~50 regions.
- * 4096 provides ample headroom for edge cases (many interleaved guard pages,
- * file-backed mappings, etc.).
+/* Safety bound near Linux's traditional map-count limit. Storage grows on
+ * demand; this is not a fixed host stack allocation.
  */
-#define GUEST_MAX_REGIONS 4096
+#define GUEST_MAX_REGIONS 65536
 
 /* A semantic memory region tracked for munmap/mprotect and /proc/self/maps.
  * Distinct from mem_region_t which is used purely for page table construction.
@@ -249,12 +245,16 @@ typedef struct {
     bool shared;       /* MAP_SHARED (writes should propagate) */
     bool noreserve;    /* MAP_NORESERVE: PTEs deferred until fault */
     bool dontfork;     /* MADV_DONTFORK: omit this range from a fork child. */
-    bool backing_ro;   /* MAP_SHARED region whose backing_fd was opened
-                        * without write access, so its Linux max_prot is
-                        * capped to PROT_READ. sys_mprotect must reject any
-                        * later PROT_WRITE request against it with EACCES,
-                        * matching a real kernel's VMA max_prot tracking.
-                        */
+    bool wipeonfork; /* MADV_WIPEONFORK: zero private anonymous child bytes. */
+    bool backing_ro; /* MAP_SHARED region whose Linux max_prot is capped
+                      * to PROT_READ: the backing_fd was opened without
+                      * write access, or the file carried a memfd write
+                      * seal (F_SEAL_WRITE / F_SEAL_FUTURE_WRITE) when
+                      * this mapping was made. sys_mprotect must reject
+                      * any later PROT_WRITE request against it with
+                      * EACCES, matching a real kernel's VMA max_prot
+                      * tracking.
+                      */
     bool inherited_at_fork; /* Region existed at the most recent fork
                              * snapshot. Used by synthetic smaps to report
                              * only VMAs that can participate in that fork's
@@ -432,7 +432,7 @@ typedef enum {
 /* Guest state. */
 typedef struct {
     void *host_base; /* Host pointer to allocated guest memory */
-    int shm_fd; /* File fd backing host_base for CoW fork (-1 if MAP_ANON) */
+    int shm_fd;      /* Primary backing fd for sparse fork (-1 if MAP_ANON) */
 
     uint64_t guest_size; /* Total size (determined by IPA capacity) */
     uint64_t ipa_base;   /* IPA base for hv_vm_map (GUEST_IPA_BASE) */
@@ -530,19 +530,13 @@ typedef struct {
     uint64_t overflow_ipa_next;
 
     /* Semantic region tracking for munmap/mprotect/proc-self-maps */
-    guest_region_t regions[GUEST_MAX_REGIONS];
+    guest_region_t *regions;
+    int regions_capacity;
     int nregions;         /* Number of active regions */
     uint64_t next_vma_id; /* Last logical-VMA lineage ID allocated. */
-    /* Set when a full region table stopped a mutation from being recorded:
-     * guest_region_set_prot unable to split (leaving a region's old prot, or
-     * applying the new one to a tail no PTE work covered), a munmap split
-     * dropping its tail, or sys_brk failing to add a heap record. After that
-     * the tracker no longer faithfully reflects PTE state, so the mprotect fast
-     * path must fall back to unconditional PTE work and sys_brk must refuse to
-     * grow into a neighbor it can no longer see. Propagated across fork IPC
-     * with the semantic region snapshot so children inherit the same guard as
-     * the parent, and cleared in guest_region_clear along with the table it
-     * doubts, so it binds this image rather than the process.
+    /* Metadata may lag PTE state if a heap record cannot be added or protection
+     * tracking fails after a PTE update. Disable metadata-only fast paths until
+     * exec clears the table; fork propagates this flag with the snapshot.
      */
     bool regions_tracker_stale;
 
@@ -860,22 +854,16 @@ int guest_init(guest_t *g,
                uint32_t ipa_bits,
                guest_memory_mode_t memory_mode);
 
-/* Initialize guest from a shared memory fd (CoW fork path). Creates the HVF VM
- * and maps the fd to the hypervisor. The child gets an instant CoW snapshot of
- * the parent's guest memory without copying.
+/* Initialize guest from an independent sparse fork snapshot. Creates the HVF VM
+ * and retains a MAP_SHARED mapping and fd for nested fork. Takes ownership of
+ * shm_fd on every path.
  *
- * retain_shared selects the mapping: an independent APFS clone is mapped
- * MAP_SHARED and retained in g->shm_fd for nested fork; otherwise the supplied
- * snapshot is mapped MAP_PRIVATE and closed. memory_mode is stored in
- * g->memory_mode as in guest_init. This function takes ownership of shm_fd on
- * every path.
  * Returns 0 on success, -1 on failure.
  */
 int guest_init_from_shm(guest_t *g,
                         int shm_fd,
                         uint64_t size,
                         uint32_t ipa_bits,
-                        bool retain_shared,
                         guest_memory_mode_t memory_mode);
 
 /* Tear down VM and free guest memory. The caller has already destroyed every
@@ -1282,8 +1270,9 @@ int guest_region_add_elf_segment(guest_t *g,
 
 /* Like guest_region_add_ex, but consumes owned_backing_fd on success or
  * failure. inherited_at_fork identifies bytes copied from the latest fork
- * snapshot; dontfork excludes the range from future fork children. vma_id
- * preserves logical-VMA provenance across splits and moves; 0 creates a VMA.
+ * snapshot; dontfork excludes the range and wipeonfork clears child bytes.
+ * vma_id preserves logical-VMA provenance across splits and moves; 0 creates a
+ * VMA.
  */
 int guest_region_add_ex_owned(guest_t *g,
                               uint64_t start,
@@ -1295,6 +1284,7 @@ int guest_region_add_ex_owned(guest_t *g,
                               int owned_backing_fd,
                               bool inherited_at_fork,
                               bool dontfork,
+                              bool wipeonfork,
                               uint64_t vma_id);
 int guest_region_add_ex_owned_gpa(guest_t *g,
                                   uint64_t start,
@@ -1307,7 +1297,19 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
                                   int owned_backing_fd,
                                   bool inherited_at_fork,
                                   bool dontfork,
+                                  bool wipeonfork,
                                   uint64_t vma_id);
+
+/* Under mmap_lock, replace an exact identity-mapped anonymous record with no
+ * backing fd or overlay. Resets fork advice and lineage like remove plus add.
+ */
+void guest_region_replace_anon(guest_t *g, int index, int prot, int flags);
+
+/* Under mmap_lock, reserve at most GUEST_MAX_REGIONS records. Growth
+ * invalidates pointers into regions; failure leaves the allocation and contents
+ * unchanged.
+ */
+int guest_region_reserve(guest_t *g, int capacity);
 
 /* Re-seed the logical-VMA allocator from a restored region snapshot. Fork IPC
  * restores regions by value, so next_vma_id must be advanced past every
@@ -1315,9 +1317,11 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
  */
 void guest_reseed_next_vma_id(guest_t *g);
 
-/* Reserve any backing fd needed by an interior split in [start, end). The
- * reservation must be consumed by guest_region_remove_reserved().
- * Returns 0 on success, -1 when the backing fd cannot be duplicated.
+/* Reserve table capacity and any backing fd for an interior split in [start,
+ * end). The reservation invalidates region pointers and must be consumed by
+ * guest_region_remove_reserved().
+ *
+ * Returns 0 or an allocation/fd failure from the host primitive.
  */
 int guest_region_remove_prepare(guest_t *g,
                                 uint64_t start,
@@ -1330,9 +1334,9 @@ int guest_region_remove_prepare(guest_t *g,
  */
 int guest_region_remove(guest_t *g, uint64_t start, uint64_t end);
 
-/* Commit a removal using a backing fd reserved by
- * guest_region_remove_prepare(). Ownership of reserved_backing_fd is consumed
- * even when this call does not need an interior split.
+/* Commit a removal after guest_region_remove_prepare() under the same mmap_lock
+ * hold. Capacity is already reserved; no allocation occurs here. Ownership of
+ * reserved_backing_fd is consumed even without an interior split.
  */
 int guest_region_remove_reserved(guest_t *g,
                                  uint64_t start,

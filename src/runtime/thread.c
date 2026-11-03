@@ -92,13 +92,10 @@ static _Atomic int active_thread_count = 0;
 static uint64_t departed_user_ns; /* Protected by thread_lock. */
 static uint64_t departed_sys_ns;
 
-/* Fork barrier state. Protected by thread_lock. Declared here (rather than
- * beside thread_quiesce_siblings) because thread_deactivate, earlier in the
- * file, hands its count back when a counted sibling exits before the barrier.
- */
-static bool fork_quiesce_active = false; /* True while a fork is in progress */
-static int fork_quiesced_count = 0;      /* Siblings blocked on barrier */
-static int fork_target_count = 0;        /* Number of siblings to quiesce */
+/* Atomic idle gate; counters remain protected by thread_lock. */
+static _Atomic bool fork_quiesce_active;
+static int fork_quiesced_count = 0; /* Siblings blocked on barrier */
+static int fork_target_count = 0;   /* Number of siblings to quiesce */
 static pthread_cond_t fork_cond = PTHREAD_COND_INITIALIZER;
 
 /* Signalled when a deferred stack-unmap transaction clears. Declared here
@@ -467,7 +464,8 @@ void thread_fork_release_counted_locked(thread_entry_t *t)
      * arrive. Guarded by fork_counted so a slot created after the barrier armed
      * (never counted) does not over-decrement. No-op when no barrier is armed.
      */
-    if (fork_quiesce_active && t->fork_counted) {
+    if (atomic_load_explicit(&fork_quiesce_active, memory_order_relaxed) &&
+        t->fork_counted) {
         t->fork_counted = false;
         fork_target_count--;
         if (fork_quiesced_count >= fork_target_count)
@@ -557,6 +555,10 @@ void thread_exit_task(thread_entry_t *t, guest_t *g, int wait_status)
     mqueue_task_cancel_wait(t);
     sysvipc_task_cancel_wait(t);
     fuse_task_cancel_wait(t);
+    if (t->vfork_wait_fd_plus1) {
+        close(t->vfork_wait_fd_plus1 - 1);
+        t->vfork_wait_fd_plus1 = 0;
+    }
     if (t->robust_list_head)
         robust_list_walk(g, t);
     futex_pi_owner_exit(g, t);
@@ -901,6 +903,14 @@ bool thread_quiesce_siblings(void)
 
     pthread_mutex_lock(&thread_lock);
 
+    /* A concurrent forker must acknowledge the current window before waiting;
+     * otherwise its owner waits for this task while this task waits to fork.
+     */
+    while (atomic_load_explicit(&fork_quiesce_active, memory_order_relaxed)) {
+        thread_fork_release_counted_locked(current_thread);
+        pthread_cond_wait(&fork_window_closed_cond, &thread_lock);
+    }
+
     /* Refuse while an execve teardown is reaping. The caller is one of the
      * threads being reaped, and a window armed now would park its siblings in a
      * barrier that only the caller can release, which it will not do because it
@@ -938,17 +948,17 @@ bool thread_quiesce_siblings(void)
         t->fork_counted = true;
         targets++;
     }
+    fork_quiesced_count = 0;
+    fork_target_count = targets;
 
     if (targets == 0) {
-        fork_quiesce_active = true;
+        atomic_store_explicit(&fork_quiesce_active, true, memory_order_release);
         pthread_mutex_unlock(&thread_lock);
         return true;
     }
 
     /* Arm the barrier */
-    fork_quiesce_active = true;
-    fork_quiesced_count = 0;
-    fork_target_count = targets;
+    atomic_store_explicit(&fork_quiesce_active, true, memory_order_release);
 
     vcpu_pool_kick_all_mounted();
 
@@ -958,15 +968,22 @@ bool thread_quiesce_siblings(void)
     pthread_mutex_lock(&thread_lock);
     if (fork_quiesced_count < fork_target_count) {
         struct timespec deadline;
-        timespec_deadline_in_ms(&deadline, 100);
+
+        /* Mounted memory handlers can be draining a backing pause. Keep a
+         * finite bound without treating a host scheduling delay as fork
+         * failure.
+         */
+        timespec_deadline_in_ms(&deadline, 2000);
         while (fork_quiesced_count < fork_target_count) {
             int rc = pthread_cond_timedwait(&fork_all_quiesced_cond,
                                             &thread_lock, &deadline);
             if (rc == ETIMEDOUT) {
-                fork_quiesce_active = false;
+                atomic_store_explicit(&fork_quiesce_active, false,
+                                      memory_order_release);
                 THREAD_FOR_EACH (t)
                     t->fork_counted = false;
                 pthread_cond_broadcast(&fork_cond);
+                pthread_cond_broadcast(&fork_window_closed_cond);
                 pthread_mutex_unlock(&thread_lock);
                 sched_domain_freeze(false);
                 return false;
@@ -981,7 +998,7 @@ bool thread_quiesce_siblings(void)
 void thread_resume_siblings(void)
 {
     pthread_mutex_lock(&thread_lock);
-    fork_quiesce_active = false;
+    atomic_store_explicit(&fork_quiesce_active, false, memory_order_release);
     sched_domain_freeze(false);
     fork_quiesced_count = 0;
     fork_target_count = 0;
@@ -1003,8 +1020,10 @@ void thread_resume_siblings(void)
 
 bool thread_fork_barrier_check(void)
 {
+    if (!atomic_load_explicit(&fork_quiesce_active, memory_order_acquire))
+        return false;
     pthread_mutex_lock(&thread_lock);
-    if (!fork_quiesce_active) {
+    if (!atomic_load_explicit(&fork_quiesce_active, memory_order_relaxed)) {
         pthread_mutex_unlock(&thread_lock);
         return false;
     }
@@ -1040,7 +1059,8 @@ bool thread_fork_barrier_check(void)
      * waiting on. exit_group is still honored: that is process death, and no
      * snapshot outlives it.
      */
-    while (fork_quiesce_active && !proc_exit_group_requested()) {
+    while (atomic_load_explicit(&fork_quiesce_active, memory_order_relaxed) &&
+           !proc_exit_group_requested()) {
         if (!thread_exec_stop_requested()) {
             pthread_cond_wait(&fork_cond, &thread_lock);
             continue;
@@ -1277,7 +1297,7 @@ int thread_exec_de_thread(void)
         return 0;
 
     pthread_mutex_lock(&thread_lock);
-    while (fork_quiesce_active)
+    while (atomic_load_explicit(&fork_quiesce_active, memory_order_relaxed))
         pthread_cond_wait(&fork_window_closed_cond, &thread_lock);
     atomic_store_explicit(&exec_de_thread_active, true, memory_order_release);
     pthread_mutex_unlock(&thread_lock);

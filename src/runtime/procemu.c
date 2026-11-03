@@ -108,6 +108,7 @@ typedef struct {
     uint64_t resident_pages; /* host-resident guest pages, when queried */
     bool inherited_at_fork;
     bool dontfork;
+    bool wipeonfork;
     char name[64];
 } maps_entry_t;
 
@@ -138,7 +139,8 @@ static int maps_entries_append_entry(maps_entries_t *entries,
                                      uint64_t resident_pages,
                                      const char *name,
                                      bool inherited_at_fork,
-                                     bool dontfork)
+                                     bool dontfork,
+                                     bool wipeonfork)
 {
     if (end <= start)
         return 0;
@@ -159,6 +161,7 @@ static int maps_entries_append_entry(maps_entries_t *entries,
         .offset = offset,
         .inherited_at_fork = inherited_at_fork,
         .dontfork = dontfork,
+        .wipeonfork = wipeonfork,
     };
     if (name && name[0])
         str_copy_trunc(value.name, name, sizeof(value.name));
@@ -1620,23 +1623,8 @@ static int proc_region_resident_pages(const guest_t *g,
                                       uint64_t end,
                                       uint64_t *pages_out)
 {
-    unsigned char vec[512];
-    uint64_t resident = 0;
-    while (start < end) {
-        uint64_t pages = (end - start + GUEST_PAGE_SIZE - 1) / GUEST_PAGE_SIZE;
-        if (pages > sizeof(vec))
-            pages = sizeof(vec);
-        uint64_t len = pages * GUEST_PAGE_SIZE;
-        int rc = guest_memory_residency(g, r->gpa_base + (start - r->start),
-                                        len, vec);
-        if (rc < 0)
-            return rc;
-        for (uint64_t i = 0; i < pages; i++)
-            resident += vec[i] & 1;
-        start += len;
-    }
-    *pages_out = resident;
-    return 0;
+    return guest_memory_resident_pages(g, r->gpa_base + (start - r->start),
+                                       end - start, pages_out);
 }
 
 /* Build the VMA list shared by /proc/self/maps and /proc/self/smaps, merging
@@ -1694,14 +1682,15 @@ static int proc_build_maps_entries(const guest_t *g,
         if (last && last->end == start && last->prot == r->prot &&
             last->flags == r->flags && last->offset == r->offset &&
             last->inherited_at_fork == r->inherited_at_fork &&
-            last->dontfork == r->dontfork && !strcmp(last->name, r->name)) {
+            last->dontfork == r->dontfork &&
+            last->wipeonfork == r->wipeonfork && !strcmp(last->name, r->name)) {
             last->end = end;
             last->resident_pages += resident;
             continue;
         }
-        if (maps_entries_append_entry(&entries, start, end, r->prot, r->flags,
-                                      r->offset, resident, r->name,
-                                      r->inherited_at_fork, r->dontfork) < 0)
+        if (maps_entries_append_entry(
+                &entries, start, end, r->prot, r->flags, r->offset, resident,
+                r->name, r->inherited_at_fork, r->dontfork, r->wipeonfork) < 0)
             goto out_unlock;
     }
 
@@ -1893,6 +1882,8 @@ static int proc_open_self_smaps(const guest_t *g)
             APPEND_VMFLAG("nr");
         if (e->dontfork)
             APPEND_VMFLAG("dc");
+        if (e->wipeonfork)
+            APPEND_VMFLAG("wf");
 #undef APPEND_VMFLAG
         vmflags[vmflags_len] = '\0';
 
@@ -2545,7 +2536,10 @@ static int intercept_open_dispatch(const guest_t *g,
             errno = ENOENT;
             return -1;
         }
-        return open(exe, O_RDONLY);
+        path_translation_t tx;
+        if (path_translate_at(LINUX_AT_FDCWD, exe, PATH_TR_NONE, &tx) < 0)
+            return -1;
+        return open(tx.host_path, O_RDONLY | (tx.is_dev_shm ? O_NOFOLLOW : 0));
     }
 
     /* /proc/cpuinfo -> synthetic file with CPU count. Buffer sized dynamically
@@ -3575,6 +3569,25 @@ static int proc_readlink_self_exe(char *buf, size_t bufsiz)
     return (int) len;
 }
 
+/* readlink(2) on a memfd reports the shmem dentry, not the host backing:
+ * "/memfd:<name> (deleted)". The kernel creates that dentry as "memfd:<name>"
+ * and unlinks it, so d_path appends the deleted suffix (mm/memfd.c
+ * MFD_NAME_PREFIX, fs/d_path.c).
+ */
+static int proc_readlink_memfd(const fd_entry_t *snap, char *buf, size_t bufsiz)
+{
+    char target[sizeof("/memfd:") + LINUX_MFD_NAME_MAX + sizeof(" (deleted)")];
+    int n = snprintf(target, sizeof(target), "/memfd:%s (deleted)",
+                     snap->memfd_name);
+    if (n < 0) {
+        errno = EIO;
+        return -1;
+    }
+    size_t len = (size_t) n < bufsiz ? (size_t) n : bufsiz;
+    memcpy(buf, target, len);
+    return (int) len;
+}
+
 static int intercept_readlink_dispatch(const char *path,
                                        char *buf,
                                        size_t bufsiz)
@@ -3604,7 +3617,12 @@ static int intercept_readlink_dispatch(const char *path,
         return (int) copy_len;
     }
 
-    /* /proc/self/fd/N -> path of host fd (via fcntl F_GETPATH on macOS) */
+    /* /proc/self/fd/N -> the magic link Linux reports for that file. A memfd
+     * answers from its kernel name; everything else reports the host path
+     * (fcntl F_GETPATH) in the guest's namespace. The descriptor and the
+     * metadata snapshot are pinned in one fd_lock window so a concurrent close
+     * and reuse cannot answer for a different file.
+     */
     if (!strncmp(path, "/proc/self/fd/", 14)) {
         char *endptr;
         long n = strtol(path + 14, &endptr, 10);
@@ -3613,10 +3631,20 @@ static int intercept_readlink_dispatch(const char *path,
             errno = EBADF;
             return -1;
         }
-        int host_fd = fd_to_host((int) n);
-        if (host_fd < 0) {
-            errno = EBADF;
+
+        fd_entry_t fd_snap;
+        host_fd_ref_t host_ref;
+        int64_t ref_err =
+            host_fd_ref_open_entry((guest_fd_t) n, &host_ref, &fd_snap);
+        if (ref_err < 0) {
+            errno = ref_err == -LINUX_ENOMEM ? ENOMEM : EBADF;
             return -1;
+        }
+
+        if (fd_snap.is_memfd) {
+            int rc = proc_readlink_memfd(&fd_snap, buf, bufsiz);
+            host_fd_ref_close(&host_ref);
+            return rc;
         }
 
         /* Descriptors opened through the synthetic USB trees are backed by
@@ -3626,21 +3654,20 @@ static int intercept_readlink_dispatch(const char *path,
          * /sys). Report the stamped guest spelling instead. Kept narrow (USB
          * prefixes only) so the pty and shm reporting stays as it was.
          */
-        {
-            fd_entry_t fd_snap;
-            if (fd_snapshot((int) n, &fd_snap) && fd_snap.proc_path[0] == '/' &&
-                (path_prefix_match(fd_snap.proc_path, "/sys", 4) ||
-                 path_prefix_match(fd_snap.proc_path, "/dev/bus", 8))) {
-                size_t plen = strlen(fd_snap.proc_path);
-                if (plen > bufsiz)
-                    plen = bufsiz;
-                memcpy(buf, fd_snap.proc_path, plen);
-                return (int) plen;
-            }
+        if (fd_snap.proc_path[0] == '/' &&
+            (path_prefix_match(fd_snap.proc_path, "/sys", 4) ||
+             path_prefix_match(fd_snap.proc_path, "/dev/bus", 8))) {
+            size_t plen = strlen(fd_snap.proc_path);
+            if (plen > bufsiz)
+                plen = bufsiz;
+            memcpy(buf, fd_snap.proc_path, plen);
+            host_fd_ref_close(&host_ref);
+            return (int) plen;
         }
 
         char fdpath[MAXPATHLEN];
-        if (fcntl(host_fd, F_GETPATH, fdpath) < 0) {
+        if (fcntl(host_ref.fd, F_GETPATH, fdpath) < 0) {
+            host_fd_ref_close(&host_ref);
             errno = ENOENT;
             return -1;
         }
@@ -3651,8 +3678,11 @@ static int intercept_readlink_dispatch(const char *path,
          * coreutils multi-call dispatch reads back "rosetta" as the applet name
          * and aborts.
          */
-        if (proc_rosetta_active() && !strcmp(fdpath, ROSETTA_PATH))
-            return proc_readlink_self_exe(buf, bufsiz);
+        if (proc_rosetta_active() && !strcmp(fdpath, ROSETTA_PATH)) {
+            int rc = proc_readlink_self_exe(buf, bufsiz);
+            host_fd_ref_close(&host_ref);
+            return rc;
+        }
 
         /* F_GETPATH reports the raw host path; the guest must see its own
          * namespace (sysroot stripped, escaped components decoded).
@@ -3665,6 +3695,7 @@ static int intercept_readlink_dispatch(const char *path,
         if (len > bufsiz)
             len = bufsiz;
         memcpy(buf, report, len);
+        host_fd_ref_close(&host_ref);
         return (int) len;
     }
 

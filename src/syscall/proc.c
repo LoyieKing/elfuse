@@ -3047,10 +3047,16 @@ void wait_park_on_interrupt(thread_entry_t *t)
 
 void wait_park_on_deadline(thread_entry_t *t)
 {
-    if (!t || !exec_park_active_load(t) ||
-        exec_park_kind_load(t) != PARK_KIND_WAIT)
+    if (!t)
         return;
-    (void) sched_park_try_complete_reissue(t);
+    uint64_t seq = sched_park_seq(t);
+    int kind = exec_park_kind_load(t);
+    uint64_t deadline = exec_park_deadline_ns_load(t);
+    if (!exec_park_active_load(t) ||
+        (kind != PARK_KIND_WAIT && kind != PARK_KIND_VFORK) || deadline == 0 ||
+        deadline > sched_now_ns())
+        return;
+    (void) sched_park_try_complete_reissue_seq(t, kind, seq);
 }
 
 /* Hand a blocking wait to the pool. Returning SYSCALL_PARKED makes the HVC arm
@@ -3070,6 +3076,7 @@ static int64_t proc_wait_park(int pid, int options)
     exec_park_reissue_store(t, false);
     t->exec_resume = EXEC_RESUME_PLAIN;
     sched_arm_wait_deadline(t, sched_now_ns() + PROC_WAIT_POLL_NS);
+    (void) sched_park_seq_next(t);
 
     /* Publish the arm last: a waker that acquires park_active observes the kind
      * and result direction above.
@@ -5926,6 +5933,7 @@ static proc_leave_t run_loop_core(hv_vcpu_t vcpu,
         vcpu_pool_account_phase(true);
         HV_CHECK_CTX(hv_vcpu_run(vcpu), vcpu, g);
         vcpu_pool_account_phase(false);
+        thread_fork_barrier_check();
 
         if (is_main)
             atomic_store_explicit(&g_vcpu_progress, iter * 2 + 2,

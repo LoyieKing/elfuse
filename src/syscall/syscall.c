@@ -1918,14 +1918,25 @@ static int64_t sc_memfd_create(guest_t *g,
 
     const unsigned int flags = (unsigned int) x1;
 
-    char first = '\0';
-    if (guest_read_small(g, x0, &first, sizeof(first)) < 0)
+    /* The kernel's MFD_NAME_MAX_LEN is 249 bytes (mm/memfd.c); the extra byte
+     * lets guest_read_str reject 250 without rejecting 249.
+     */
+    char name[LINUX_MFD_NAME_MAX + 2];
+    int name_len = guest_read_str(g, x0, name, sizeof(name));
+    if (name_len == -2)
         return -LINUX_EFAULT;
+    if (name_len < 0) {
+        char first;
+        if (guest_read_small(g, x0, &first, sizeof(first)) < 0)
+            return -LINUX_EFAULT;
+        return -LINUX_EINVAL;
+    }
 
+    uint64_t fd_gen = 0;
     int fd = tmpfile_anon("memfd");
     if (fd < 0)
         return linux_errno();
-    int gfd = fd_alloc(FD_REGULAR, fd, NULL);
+    int gfd = fd_alloc_from(0, FD_REGULAR, fd, NULL, &fd_gen);
     if (gfd < 0) {
         close(fd);
         return linux_errno();
@@ -1941,6 +1952,7 @@ static int64_t sc_memfd_create(guest_t *g,
         LINUX_O_RDWR | ((flags & LINUX_MFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0));
     fd_table[gfd].seals =
         (flags & LINUX_MFD_ALLOW_SEALING) ? 0 : LINUX_F_SEAL_SEAL;
+    fd_publish_memfd(gfd, fd_gen, name);
     return gfd;
 }
 
@@ -2789,7 +2801,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
              * is built to avoid, and a seals read that disagrees enforces the
              * seal of whatever occupied the slot a moment ago.
              */
-            if (nr == SYS_write && (fast_st.seals & LINUX_F_SEAL_WRITE)) {
+            if (nr == SYS_write && fd_seals_deny_write(fast_st.seals)) {
                 host_fd_ref_close(&host_ref);
                 goto slow_path;
             }

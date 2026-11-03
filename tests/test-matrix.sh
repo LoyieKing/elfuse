@@ -954,6 +954,10 @@ run_unit_tests()
     printf "\nRead-only MAP_SHARED overlay\n"
     test_rc "$runner" "test-mmap-shared-ro" 0 "$bindir/test-mmap-shared-ro"
 
+    printf "\nmemfd F_SEAL_FUTURE_WRITE\n"
+    test_rc "$runner" "test-memfd-future-write" 0 \
+        "$bindir/test-memfd-future-write"
+
     printf "\nCross-fork MAP_SHARED coherence\n"
     test_rc "$runner" "test-cross-fork-mapshared" 0 "$bindir/test-cross-fork-mapshared"
 
@@ -1013,8 +1017,12 @@ run_unit_tests()
     printf "\nFD lifecycle\n"
     test_rc "$runner" "test-fd-lifecycle" 0 "$bindir/test-fd-lifecycle"
 
+    printf "\nmemfd ashmem compatibility\n"
+    test_rc "$runner" "test-memfd-ashmem" 0 "$bindir/test-memfd-ashmem"
+
     printf "\nMultithreaded fork\n"
     test_rc "$runner" "test-mt-fork" 0 "$bindir/test-mt-fork"
+    test_rc "$runner" "test-vfork-sibling" 0 "$bindir/test-vfork-sibling"
 
     printf "\nExit-group teardown reachability\n"
     test_rc "$runner" "test-exit-group-teardown-wait" 42 \

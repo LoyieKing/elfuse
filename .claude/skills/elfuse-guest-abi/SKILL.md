@@ -279,11 +279,11 @@ violate:
   `MAP_FIXED` alone would leave guest and host accesses inconsistent.
 - The child must restore `g->ttbr0` from the IPC header.
 
-The snapshot helper in `src/syscall/mem.c` synchronizes current anonymous and
-private-file CoW bytes into an independent APFS clone. Paged-out pages retain
+The snapshot helper in `src/syscall/mem.c` copies current anonymous and
+private-file CoW bytes into an independent sparse file. Paged-out pages retain
 data and must be copied; residency alone cannot authorize a zero-filled hole.
-The child retains an independent clone for nested fork. A clone failure uses
-region copy, never a live parent file.
+The child retains the snapshot for nested fork. Allocation failure uses region
+copy, never a live parent file.
 
 ## Rosetta hosting
 
@@ -297,9 +297,8 @@ mappings and register state, and the ways it breaks are mapping-shaped.
 - Its kbuf is aliased twice, once under TTBR1 and once under TTBR0, so that
   tagged-pointer extraction resolves to the same physical pages from either
   side. kbuf is always RW; nothing executable is installed there.
-- Rosetta uses the independent APFS snapshot with the same backing
-  synchronization as native guests. Both fall back to region copy when a clone
-  cannot be created.
+- Rosetta uses the same independent sparse snapshot as native guests, including
+  TTBR1 and kbuf state. Snapshot allocation failure uses region copy.
 - For dynamic x86_64 guests the host deliberately does not load segments or
   the interpreter. The translator reads PT_INTERP itself and mmaps the loader
   out of `--sysroot` through ordinary guest syscalls.

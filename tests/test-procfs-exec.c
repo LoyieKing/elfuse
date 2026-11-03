@@ -10,12 +10,17 @@
  *   3. /proc/self/environ reflects the replacement image after execve()
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/auxv.h>
+#include <sys/stat.h>
 
 #include "test-harness.h"
 #include "test-util.h"
@@ -105,6 +110,27 @@ static void run_checks(void)
             }
             EXPECT_TRUE(found, "replacement environ missing");
         }
+    }
+
+    TEST("procfs exec: O_PATH executable resolves to live image");
+    {
+        int fd = open("/proc/self/exe", O_PATH | O_CLOEXEC);
+        bool ok = fd >= 0;
+        struct stat image, target;
+        char link[64];
+        if (ok) {
+            snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+            ssize_t n = readlink(link, buf, sizeof(buf) - 1);
+            ok = n > 0;
+            if (ok) {
+                buf[n] = '\0';
+                ok = fstat(fd, &image) == 0 && stat(buf, &target) == 0 &&
+                     image.st_dev == target.st_dev &&
+                     image.st_ino == target.st_ino && S_ISREG(image.st_mode);
+            }
+            close(fd);
+        }
+        EXPECT_TRUE(ok, "O_PATH executable or fd target lost after guest exec");
     }
 }
 

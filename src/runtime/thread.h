@@ -245,6 +245,10 @@ typedef struct thread_entry {
     task_syscall_restart_t syscall_restart;
     _Atomic bool park_restart_forbid;
     int exec_resume;
+    /* Notification fd plus one; zero means no vfork continuation. */
+    int vfork_wait_fd_plus1;
+    int64_t vfork_child_pid;
+    int vfork_child_host_pid;
     uint64_t watchdog_progress_ns;
     uint64_t io_continue_bytes;
     struct io_stream_cont *io_stream_cont;
@@ -545,14 +549,11 @@ void thread_kick_futex_waiters(uint64_t shared_pending);
 
 /* Fork quiesce helpers. */
 
-/* Quiesce all sibling vCPUs for fork snapshot consistency. Calls hv_vcpus_exit
- * on all active threads except the caller, then waits until they are all
- * blocked on the fork barrier. Caller must NOT hold thread_lock. Hold every
- * sibling outside guest code until thread_resume_siblings.
- * Returns false without arming, and without any need to resume, when an execve
- * teardown is reaping: the caller is one of the threads being reaped, and the
- * barrier it would arm is one nobody would release. Callers must abandon the
- * operation the quiet was for.
+/* Freeze dispatch and wait for mounted siblings to finish admitted host work.
+ * Concurrent forkers join the active window before claiming their own. Caller
+ * holds neither thread_lock nor mmap_lock. A successful window stays owned
+ * until thread_resume_siblings; teardown, a pending FUSE service or a failed
+ * freeze returns false with no window to release.
  */
 bool thread_quiesce_siblings(void);
 
@@ -561,10 +562,9 @@ bool thread_quiesce_siblings(void);
  */
 void thread_resume_siblings(void);
 
-/* Check if a fork quiesce is in progress. Called from the vCPU run loop's
- * HV_EXIT_REASON_CANCELED handler. If active, increments the quiesced counter,
- * blocks until the fork completes, then returns true.
- * Returns false if no quiesce is active.
+/* Owner-side gate before guest entry and host dispatch. A counted sibling
+ * acknowledges once and waits until the snapshot window closes. No locks needed
+ * by another task's admitted host work may be held at this gate.
  */
 bool thread_fork_barrier_check(void);
 

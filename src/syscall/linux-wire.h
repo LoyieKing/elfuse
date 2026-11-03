@@ -141,6 +141,13 @@ typedef struct {
 #define LINUX_TIOCNOTTY 0x5422  /* -> macOS TIOCNOTTY (same semantics) */
 #define LINUX_TIOCGSID 0x5429   /* -> macOS TIOCGSID (same semantics) */
 
+/* Android ashmem compatibility on a memfd-backed region: the request
+ * __has_memfd_support probes before it trusts memfd, uapi linux/ashmem.h
+ * _IO(0x77, 4). Elfuse answers it from the memfd's host size and leaves every
+ * other file type to ENOTTY.
+ */
+#define LINUX_ASHMEM_GET_SIZE 0x7704
+
 /* The rest of what do_vfs_ioctl answers for every file before it calls
  * f_op->unlocked_ioctl (fs/ioctl.c), beside FIONBIO and FIOASYNC above. Nothing
  * here serves them; the numbers exist so a file's own ioctl handler can tell a
@@ -360,6 +367,8 @@ typedef struct {
 #define LINUX_MADV_DOFORK 11
 #define LINUX_MADV_HUGEPAGE 14
 #define LINUX_MADV_NOHUGEPAGE 15
+#define LINUX_MADV_WIPEONFORK 18
+#define LINUX_MADV_KEEPONFORK 19
 #define LINUX_MADV_COLD 20
 #define LINUX_MADV_PAGEOUT 21
 
@@ -643,6 +652,11 @@ typedef struct {
 #define LINUX_MFD_CLOEXEC 0x0001U
 #define LINUX_MFD_ALLOW_SEALING 0x0002U
 
+/* memfd_create name ceiling: NAME_MAX minus the "memfd:" prefix the kernel
+ * stores as the shmem dentry name (mm/memfd.c). A longer name is EINVAL.
+ */
+#define LINUX_MFD_NAME_MAX 249
+
 /* fcntl sealing commands */
 #define LINUX_F_ADD_SEALS 1033
 #define LINUX_F_GET_SEALS 1034
@@ -735,6 +749,15 @@ typedef struct {
      * file and answers for itself. path_intercept_poll_capable decides it.
      */
     bool path_poll_capable;
+
+    /* Identity of a memfd_create region. The host backing is an unlinked
+     * regular file, which is indistinguishable from any other unlinked file, so
+     * the name and this bit travel with the slot through dup and fork and are
+     * cleared when the slot is reused. memfd_name excludes the kernel's
+     * "memfd:" prefix and is at most LINUX_MFD_NAME_MAX bytes.
+     */
+    bool is_memfd;
+    char memfd_name[LINUX_MFD_NAME_MAX + 1];
     int seals;      /* F_SEAL_* bits (non-zero only for memfd_create fds) */
     bool can_block; /* host read/write on this fd may block (pipe, socket, fifo,
                      * char/tty); false for regular files and directories. Set

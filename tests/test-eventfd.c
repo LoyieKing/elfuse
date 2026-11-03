@@ -145,6 +145,28 @@ accum_done:
     TEST("eventfd invalid flags");
     EXPECT_ERRNO(eventfd(0, 0x40000000), EINVAL, "expected EINVAL");
 
+    TEST("independent eventfd counters beyond 32 instances");
+    {
+        int fds[64];
+        int created = 0;
+        bool ok = true;
+        for (int i = 0; i < 64; i++) {
+            int fd = eventfd((unsigned int) i + 1, EFD_NONBLOCK | EFD_CLOEXEC);
+            if (fd < 0) {
+                ok = false;
+                break;
+            }
+            fds[created++] = fd;
+        }
+        for (int i = 0; i < created; i++) {
+            uint64_t value = 0;
+            if (read(fds[i], &value, sizeof(value)) != sizeof(value) ||
+                value != (uint64_t) i + 1)
+                ok = false;
+            close(fds[i]);
+        }
+        EXPECT_TRUE(ok, "eventfd capacity or independent counter mismatch");
+    }
     SUMMARY("test-eventfd");
     return fails > 0 ? 1 : 0;
 }

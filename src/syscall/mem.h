@@ -37,8 +37,18 @@ int guest_memory_residency(const guest_t *g,
                            uint64_t len,
                            unsigned char *vec);
 
-/* Synchronize primary guest backing into an independent fork snapshot fd. Whole
- * file pages past EOF and DONTFORK regions are omitted. Caller holds mmap_lock
+/* Count resident guest pages without producing a per-page vector. Page-aligned
+ * range; caller holds mmap_lock.
+ *
+ * Returns 0 or a negative Linux errno.
+ */
+int guest_memory_resident_pages(const guest_t *g,
+                                uint64_t gpa,
+                                uint64_t len,
+                                uint64_t *pages_out);
+
+/* Populate a fresh sparse fork snapshot, including page tables and shim state.
+ * File pages past EOF and DONTFORK regions are omitted. Caller holds mmap_lock
  * and has quiesced siblings.
  *
  * Returns 0 or a negative Linux errno.

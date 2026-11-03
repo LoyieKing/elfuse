@@ -420,6 +420,10 @@ $(BUILD_DIR)/test-memory-mode: tests/test-memory-mode.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
+$(BUILD_DIR)/test-vfork-sibling: tests/test-vfork-sibling.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
 # test-usbdev-ioctl-departed reads the generated vectors out of build/, so it
 # needs that directory on the include path where the other guest binaries do
 # not.

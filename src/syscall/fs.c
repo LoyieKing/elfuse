@@ -1298,6 +1298,12 @@ static bool install_fd_alias_metadata_atomic(int dst_fd,
         fd_table[dst_fd].fasync_owner_type = src_snap->fasync_owner_type;
         fd_table[dst_fd].fasync_owner = src_snap->fasync_owner;
         fd_table[dst_fd].seals = src_snap->seals;
+        fd_table[dst_fd].is_memfd = src_snap->is_memfd;
+        if (src_snap->is_memfd)
+            memcpy(fd_table[dst_fd].memfd_name, src_snap->memfd_name,
+                   sizeof(fd_table[dst_fd].memfd_name));
+        else
+            fd_table[dst_fd].memfd_name[0] = '\0';
         memcpy(fd_table[dst_fd].proc_path, src_snap->proc_path,
                sizeof(fd_table[dst_fd].proc_path));
 
@@ -3134,7 +3140,16 @@ int64_t sys_unlinkat(guest_t *g, int dirfd, uint64_t path_gva, int flags)
 
     int host_flags = translate_at_flags(flags);
     if (unlinkat(unlink_dirfd, tx.host_path, host_flags) < 0) {
+        int err = errno;
+        if (err == EPERM && !(flags & LINUX_AT_REMOVEDIR)) {
+            struct stat st;
+            if (fstatat(unlink_dirfd, tx.host_path, &st, AT_SYMLINK_NOFOLLOW) ==
+                    0 &&
+                S_ISDIR(st.st_mode))
+                err = EISDIR;
+        }
         host_fd_ref_close(&dir_ref);
+        errno = err;
         return linux_errno();
     }
 

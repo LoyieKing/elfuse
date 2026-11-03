@@ -583,6 +583,15 @@ typedef struct {
 
 fd_block_state_t fd_block_state(int guest_fd);
 
+/* True when a memfd seal (F_SEAL_WRITE or F_SEAL_FUTURE_WRITE) denies writing
+ * the file through a descriptor: both make shmem_write_begin answer EPERM, so
+ * every descriptor write path refuses either bit.
+ */
+static inline bool fd_seals_deny_write(unsigned seals)
+{
+    return (seals & (LINUX_F_SEAL_WRITE | LINUX_F_SEAL_FUTURE_WRITE)) != 0;
+}
+
 /* Set or clear the guest's O_NONBLOCK shadow on every slot sharing guest_fd's
  * open file description, anchored on guest_fd's generation so a close+reopen in
  * the window changes nothing. O_NONBLOCK is a per-description flag on Linux, so
@@ -653,6 +662,12 @@ bool fd_apply_guest_nonblock(int guest_fd, bool on);
  * every linux_flags writer on one lock domain.
  */
 void fd_publish_linux_flags(int guest_fd, int linux_flags);
+
+/* Record the identity of a memfd_create region on @guest_fd, provided the slot
+ * still holds @generation. @name is the guest name, already bounded to
+ * LINUX_MFD_NAME_MAX bytes.
+ */
+void fd_publish_memfd(int guest_fd, uint64_t generation, const char *name);
 
 /* Republish the EL1 urandom read fast-path bit for this fd from the current
  * fd_table type and access mode. Only readable /dev/urandom descriptors are

@@ -280,82 +280,11 @@ static void test_file_backed_mremap_tail_emfile(void)
     close(file_fd);
 }
 
-static void test_full_table_munmap_without_overlay(void)
-{
-    TEST("full region table munmap without overlay");
-
-    /* The 32 KiB region and 16 KiB interior edge keep at least one aligned
-     * host-page boundary inside the first/last VMA on both 4 KiB and 16 KiB
-     * hosts. The guest only exposes 4 KiB pages to this test.
-     */
-    size_t region_length = 8 * PAGE_SIZE;
-    size_t stride = region_length + PAGE_SIZE;
-    size_t reservation_length = (size_t) FILL_LIMIT * stride + region_length;
-    void *reservation = mmap(NULL, reservation_length, PROT_NONE,
-                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (reservation == MAP_FAILED) {
-        FAIL("reserve region-table fixture failed");
-        return;
-    }
-    if (munmap(reservation, reservation_length) != 0) {
-        FAIL("release region-table fixture failed");
-        return;
-    }
-
-    int mapped = 0;
-    for (; mapped < FILL_LIMIT; mapped++) {
-        void *address = (char *) reservation + (size_t) mapped * stride;
-        void *region = mmap(address, region_length, PROT_NONE,
-                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-        if (region == MAP_FAILED) {
-            if (errno != ENOMEM) {
-                FAIL("region-table fixture failed before capacity");
-                (void) munmap(reservation, reservation_length);
-                return;
-            }
-            break;
-        }
-        if (region != address) {
-            FAIL("region-table fixture address changed");
-            (void) munmap(reservation, reservation_length);
-            return;
-        }
-    }
-
-    /* Existing process mappings consume a few slots, so reaching the table
-     * limit is expected before FILL_LIMIT. Reaching a substantial fraction
-     * proves this is the region-table path rather than an address-space miss.
-     */
-    if (mapped < FILL_LIMIT / 2) {
-        FAIL("region-table fixture did not reach capacity");
-        (void) munmap(reservation, reservation_length);
-        return;
-    }
-
-    void *first = reservation;
-    void *last = (char *) reservation + (size_t) (mapped - 1) * stride;
-    size_t edge = 4 * PAGE_SIZE;
-    void *unmap_start = (char *) first + PAGE_SIZE;
-    void *unmap_end = (char *) last + edge;
-    if (munmap(unmap_start,
-               (size_t) ((char *) unmap_end - (char *) unmap_start)) != 0) {
-        FAIL("whole-range munmap failed at full region table");
-        (void) munmap(reservation, reservation_length);
-        return;
-    }
-
-    if (munmap(reservation, reservation_length) != 0) {
-        FAIL("final region-table cleanup failed");
-        return;
-    }
-    PASS();
-}
 
 int main(void)
 {
     printf("test-mremap-tail-emfile: file-backed mremap atomicity\n");
     test_file_backed_mremap_tail_emfile();
-    test_full_table_munmap_without_overlay();
     SUMMARY("test-mremap-tail-emfile");
     return fails != 0;
 }

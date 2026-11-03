@@ -475,6 +475,19 @@ static void test_einval(void)
         EXPECT_TRUE(r1 == -22 && r2 == -22 && r3 == -22 && r4 == -22,
                     "expected EINVAL for invalid *at flags");
     }
+    TEST("unlinkat directory without AT_REMOVEDIR -> EISDIR");
+    {
+        char path[] = "/tmp/elfuse-negative-unlink-XXXXXX";
+        if (!mkdtemp(path)) {
+            FAIL("mkdtemp failed");
+        } else {
+            EXPECT_RAW_ERRNO(
+                raw_syscall3(__NR_unlinkat, AT_FDCWD, (long) path, 0), -EISDIR,
+                "directory unlink must return EISDIR");
+            EXPECT_TRUE(rmdir(path) == 0, "directory survives failed unlink");
+        }
+    }
+
 
     TEST("utimensat both UTIME_OMIT ignores NULL-path validation");
     {

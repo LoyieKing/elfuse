@@ -1,5 +1,5 @@
 /*
- * MADV_DONTFORK / MADV_DOFORK fork-exclusion tests
+ * madvise fork inheritance tests
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -448,6 +448,29 @@ static void test_remap_fresh(void)
     EXPECT_TRUE(ok, "address reuse inherited stale DONTFORK");
 }
 
+static void test_fixed_fresh(void)
+{
+    TEST("exact fixed replacement clears fork advice");
+    unsigned char *p = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        FAIL("mmap");
+        return;
+    }
+    bool ok = madvise(p, 2 * page, MADV_DONTFORK) == 0 &&
+              madvise(p, 2 * page, MADV_WIPEONFORK) == 0;
+    unsigned char *q = ok ? mmap(p, 2 * page, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0)
+                          : MAP_FAILED;
+    ok = ok && q == p;
+    if (ok) {
+        fill_values(q, 2);
+        ok = child_layout(q, 0x3, 2) && values_intact(q, 2);
+    }
+    ok = munmap(p, 2 * page) == 0 && ok;
+    EXPECT_TRUE(ok, "replacement omitted or wiped fresh child bytes");
+}
+
 static int shared_child(void *arg)
 {
     unsigned char *p = arg;
@@ -518,6 +541,178 @@ static void test_hole_partial(void)
     munmap(p + 2 * page, page);
 }
 
+static bool wipe_contents(const unsigned char *p, unsigned keep, int pages)
+{
+    for (int i = 0; i < pages; i++) {
+        unsigned char expected = (keep & (1U << i)) ? pattern(i) : 0;
+        for (size_t j = 0; j < page; j++) {
+            if (p[(size_t) i * page + j] != expected)
+                return false;
+        }
+    }
+    return true;
+}
+
+static bool wipe_child(unsigned char *p, unsigned keep, int pages, bool nested)
+{
+    pid_t child = fork();
+    if (child == 0) {
+        if (!wipe_contents(p, keep, pages))
+            _exit(1);
+        if (nested) {
+            for (int i = 0; i < pages; i++)
+                memset(p + (size_t) i * page, pattern(i), page);
+            if (!wipe_child(p, keep, pages, false) ||
+                !wipe_contents(p, (1U << pages) - 1, pages))
+                _exit(2);
+        }
+        _exit(0);
+    }
+    int status;
+    return child > 0 && waitpid(child, &status, 0) == child &&
+           WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static void test_wipe_subrange(void)
+{
+    TEST("WIPEONFORK partial KEEPONFORK and nested inheritance");
+    unsigned char *p = mmap(NULL, 4 * page, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        FAIL("mmap");
+        return;
+    }
+    for (int i = 0; i < 4; i++)
+        memset(p + (size_t) i * page, pattern(i), page);
+    bool ok = madvise(p + page, 3 * page, MADV_WIPEONFORK) == 0 &&
+              madvise(p + 2 * page, page, MADV_KEEPONFORK) == 0 &&
+              madvise(p + page, page, MADV_DONTFORK) == 0 &&
+              madvise(p + page, page, MADV_DOFORK) == 0 &&
+              mprotect(p + page, page, PROT_READ) == 0 &&
+              wipe_child(p, 0x5, 4, false) && wipe_contents(p, 0xf, 4) &&
+              mprotect(p + page, page, PROT_READ | PROT_WRITE) == 0 &&
+              wipe_child(p, 0x5, 4, true) && wipe_child(p, 0x5, 4, false) &&
+              wipe_contents(p, 0xf, 4);
+    EXPECT_TRUE(ok, "wipe lost across splits/forks or changed parent bytes");
+    munmap(p, 4 * page);
+}
+
+static void test_wipe_mremap(void)
+{
+    TEST("WIPEONFORK follows mremap move and growth");
+    unsigned char *p = mmap(NULL, page, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void *target =
+        mmap(NULL, 3 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED || target == MAP_FAILED) {
+        FAIL("mmap");
+        if (p != MAP_FAILED)
+            munmap(p, page);
+        if (target != MAP_FAILED)
+            munmap(target, 3 * page);
+        return;
+    }
+    bool ok = madvise(p, page, MADV_WIPEONFORK) == 0;
+    void *moved = MAP_FAILED;
+    if (ok)
+        moved =
+            mremap(p, page, 3 * page, MREMAP_MAYMOVE | MREMAP_FIXED, target);
+    if (moved != MAP_FAILED) {
+        unsigned char *q = moved;
+        for (int i = 0; i < 3; i++)
+            memset(q + (size_t) i * page, pattern(i), page);
+        ok = moved == target && wipe_child(q, 0, 3, true) &&
+             wipe_contents(q, 7, 3);
+        munmap(q, 3 * page);
+    } else {
+        ok = false;
+        munmap(p, page);
+        munmap(target, 3 * page);
+    }
+    EXPECT_TRUE(ok, "mremap lost wipe inheritance");
+}
+
+static void test_wipe_shared_vm(void)
+{
+    TEST("CLONE_VM retains WIPEONFORK bytes");
+    unsigned char *p = mmap(NULL, page, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void *stack = mmap(NULL, 65536, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED || stack == MAP_FAILED) {
+        FAIL("mmap");
+        if (p != MAP_FAILED)
+            munmap(p, page);
+        if (stack != MAP_FAILED)
+            munmap(stack, 65536);
+        return;
+    }
+    *p = pattern(0);
+    bool ok = madvise(p, page, MADV_WIPEONFORK) == 0;
+    pid_t child = -1;
+    if (ok)
+        child =
+            clone(shared_child, (char *) stack + 65536, CLONE_VM | SIGCHLD, p);
+    int status;
+    ok = child > 0 && waitpid(child, &status, 0) == child &&
+         WIFEXITED(status) && WEXITSTATUS(status) == 0 && *p == 0x55;
+    EXPECT_TRUE(ok, "CLONE_VM incorrectly wiped shared address space");
+    munmap(p, page);
+    munmap(stack, 65536);
+}
+
+static void test_wipe_invalid(void)
+{
+    TEST("WIPEONFORK rejects shared/file mappings and reports holes");
+    FILE *file = tmpfile();
+    if (!file || ftruncate(fileno(file), (off_t) page) != 0) {
+        FAIL("tmpfile");
+        if (file)
+            fclose(file);
+        return;
+    }
+    unsigned char *p = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void *shared = mmap(NULL, page, PROT_READ | PROT_WRITE,
+                        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    void *backed =
+        mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE, fileno(file), 0);
+    bool ok = p != MAP_FAILED && shared != MAP_FAILED && backed != MAP_FAILED;
+    if (ok) {
+        errno = 0;
+        ok = madvise(shared, page, MADV_WIPEONFORK) == -1 && errno == EINVAL;
+        errno = 0;
+        ok = ok && madvise(backed, page, MADV_WIPEONFORK) == -1 &&
+             errno == EINVAL;
+        ok = ok && madvise(shared, page, MADV_KEEPONFORK) == 0 &&
+             madvise(backed, page, MADV_KEEPONFORK) == 0;
+        memset(p, pattern(0), page);
+        memset(p + 2 * page, pattern(2), page);
+        ok = ok && munmap(p + page, page) == 0;
+        errno = 0;
+        ok = ok && madvise(p, 3 * page, MADV_WIPEONFORK) == -1 &&
+             errno == ENOMEM;
+        pid_t child = ok ? fork() : -1;
+        if (child == 0)
+            _exit(wipe_contents(p, 0, 1) && wipe_contents(p + 2 * page, 0, 1)
+                      ? 0
+                      : 1);
+        int status;
+        ok = child > 0 && waitpid(child, &status, 0) == child &&
+             WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+             p[0] == pattern(0) && p[2 * page] == pattern(2);
+    }
+    EXPECT_TRUE(ok,
+                "mapping validation or partial hole update differs from Linux");
+    if (p != MAP_FAILED)
+        munmap(p, 3 * page);
+    if (shared != MAP_FAILED)
+        munmap(shared, page);
+    if (backed != MAP_FAILED)
+        munmap(backed, page);
+    fclose(file);
+}
+
 int main(void)
 {
     page = (size_t) sysconf(_SC_PAGESIZE);
@@ -529,8 +724,13 @@ int main(void)
     test_mremap_grow();
     test_repeated_nested();
     test_remap_fresh();
+    test_fixed_fresh();
     test_shared_vm();
     test_hole_partial();
+    test_wipe_subrange();
+    test_wipe_mremap();
+    test_wipe_shared_vm();
+    test_wipe_invalid();
     SUMMARY("test-madvise-fork");
     return fails != 0;
 }

@@ -619,13 +619,12 @@ int guest_init_from_shm(guest_t *g,
                         int shm_fd,
                         uint64_t size,
                         uint32_t ipa_bits,
-                        bool retain_shared,
                         guest_memory_mode_t memory_mode)
 {
     uint64_t t0;
 
     memset(g, 0, sizeof(*g));
-    g->shm_fd = -1; /* Child does not own the shm unless retain_shared */
+    g->shm_fd = -1;
     g->memory_mode = memory_mode;
     g->ipa_base = GUEST_IPA_BASE;
     g->elf_load_min = ELF_DEFAULT_BASE;
@@ -651,21 +650,10 @@ int guest_init_from_shm(guest_t *g,
     }
     g->pt_pool_next = g->pt_pool_base;
 
-    /* Two mapping modes:
-     *   retain_shared: shm_fd is an independent APFS clone of the parent's
-     *     memory (already isolated from the parent). Map MAP_SHARED so the
-     *     child's writes land in the clone file, then keep the fd so the child
-     *     can fclonefileat it for its own nested CoW fork. guest_destroy closes
-     *     it.
-     *   otherwise: shm_fd may be the parent's live fd (clonefile fallback). Map
-     *     MAP_PRIVATE so writes stay private to this process, then close the
-     * fd. macOS CoW is page-granular either way: only modified pages are
-     * duplicated.
-     */
-    int map_flags = retain_shared ? MAP_SHARED : MAP_PRIVATE;
+    /* The snapshot is independent of the parent; retain it for nested fork. */
     t0 = startup_trace_now_ns();
     g->host_base =
-        mmap(NULL, size, PROT_READ | PROT_WRITE, map_flags, shm_fd, 0);
+        mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
     startup_trace_step("shm_mmap", t0);
     if (g->host_base == MAP_FAILED) {
         perror("guest: mmap shm");
@@ -674,10 +662,7 @@ int guest_init_from_shm(guest_t *g,
         return -1;
     }
 
-    if (retain_shared)
-        g->shm_fd = shm_fd; /* Child owns the clone; guest_destroy closes it */
-    else
-        close(shm_fd); /* MAP_PRIVATE mapping keeps the pages alive */
+    g->shm_fd = shm_fd;
 
     /* Create HVF VM with the same IPA width as the parent */
     hv_return_t ret = HV_ERROR;
@@ -721,7 +706,7 @@ int guest_init_from_shm(guest_t *g,
 
 
     log_debug(
-        "guest: CoW fork: mapped %llu GiB from shm "
+        "guest: fork snapshot: mapped %llu GiB from shm "
         "(ipa=%u bits)",
         (unsigned long long) (size / (1024ULL * 1024 * 1024)), ipa_bits);
 
@@ -791,6 +776,9 @@ void guest_destroy(guest_t *g)
         }
     }
     g->nregions = 0;
+    free(g->regions);
+    g->regions = NULL;
+    g->regions_capacity = 0;
     /* Close the shm fd if guest memory owns one (parent with shm backing) */
     if (g->shm_fd >= 0) {
         close(g->shm_fd);
@@ -1965,6 +1953,8 @@ static bool regions_mergeable_layout(const guest_region_t *a,
         return false;
     if (a->dontfork != b->dontfork)
         return false;
+    if (a->wipeonfork != b->wipeonfork)
+        return false;
     if (a->backing_ro != b->backing_ro)
         return false;
     if (a->inherited_at_fork != b->inherited_at_fork)
@@ -2086,7 +2076,7 @@ int guest_region_add_ex(guest_t *g,
 
     return guest_region_add_ex_owned_gpa(g, start, end, start, prot, flags,
                                          offset, name, owned_backing_fd, false,
-                                         false, 0);
+                                         false, false, 0);
 }
 
 int guest_region_add_ex_gpa(guest_t *g,
@@ -2108,7 +2098,7 @@ int guest_region_add_ex_gpa(guest_t *g,
 
     return guest_region_add_ex_owned_gpa(g, start, end, gpa_base, prot, flags,
                                          offset, name, owned_backing_fd, false,
-                                         false, 0);
+                                         false, false, 0);
 }
 
 int guest_region_add_elf_segment(guest_t *g,
@@ -2161,27 +2151,55 @@ int guest_region_add_ex_owned(guest_t *g,
                               int owned_backing_fd,
                               bool inherited_at_fork,
                               bool dontfork,
+                              bool wipeonfork,
                               uint64_t vma_id)
 {
-    return guest_region_add_ex_owned_gpa(g, start, end, start, prot, flags,
-                                         offset, name, owned_backing_fd,
-                                         inherited_at_fork, dontfork, vma_id);
+    return guest_region_add_ex_owned_gpa(
+        g, start, end, start, prot, flags, offset, name, owned_backing_fd,
+        inherited_at_fork, dontfork, wipeonfork, vma_id);
 }
 
-int guest_region_add_ex_owned_gpa(guest_t *g,
-                                  uint64_t start,
-                                  uint64_t end,
-                                  uint64_t gpa_base,
-                                  int prot,
-                                  int flags,
-                                  uint64_t offset,
-                                  const char *name,
-                                  int owned_backing_fd,
-                                  bool inherited_at_fork,
-                                  bool dontfork,
-                                  uint64_t vma_id)
+int guest_region_reserve(guest_t *g, int capacity)
 {
-    if (g->nregions >= GUEST_MAX_REGIONS) {
+    if (capacity < 0 || capacity > GUEST_MAX_REGIONS) {
+        errno = ENOMEM;
+        return -1;
+    }
+    if (capacity <= g->regions_capacity)
+        return 0;
+    dynamic_array_t storage = {
+        .data = g->regions,
+        .capacity = (size_t) g->regions_capacity,
+        .element_size = sizeof(*g->regions),
+    };
+    if (dynamic_array_reserve(&storage, (size_t) capacity) < 0)
+        return -1;
+    g->regions = storage.data;
+    g->regions_capacity = (int) storage.capacity;
+    return 0;
+}
+
+static int region_store(guest_t *g,
+                        uint64_t start,
+                        uint64_t end,
+                        uint64_t gpa_base,
+                        int prot,
+                        int flags,
+                        uint64_t offset,
+                        const char *name,
+                        int owned_backing_fd,
+                        bool inherited_at_fork,
+                        bool dontfork,
+                        bool wipeonfork,
+                        uint64_t vma_id,
+                        int replace_index)
+{
+    char saved_name[sizeof(((guest_region_t *) 0)->name)];
+    if (name && g->nregions == g->regions_capacity) {
+        str_copy_trunc(saved_name, name, sizeof(saved_name));
+        name = saved_name;
+    }
+    if (replace_index < 0 && guest_region_reserve(g, g->nregions + 1) < 0) {
         log_error(
             "guest: region table full (%d/%d), "
             "cannot track [0x%llx-0x%llx) %s",
@@ -2198,10 +2216,13 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
     else if (vma_id > g->next_vma_id)
         g->next_vma_id = vma_id;
 
-    /* Find insertion point (keep sorted by start address). */
-    int i = region_lower_bound_start(g, start);
-    memmove(&g->regions[i + 1], &g->regions[i],
-            (g->nregions - i) * sizeof(guest_region_t));
+    int i = replace_index;
+    if (i < 0) {
+        i = region_lower_bound_start(g, start);
+        memmove(&g->regions[i + 1], &g->regions[i],
+                (g->nregions - i) * sizeof(guest_region_t));
+        g->nregions++;
+    }
 
     guest_region_t *r = &g->regions[i];
     r->start = start;
@@ -2215,6 +2236,7 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
     r->shared = (flags & LINUX_MAP_SHARED) != 0;
     r->noreserve = (flags & LINUX_MAP_NORESERVE) != 0;
     r->dontfork = dontfork;
+    r->wipeonfork = wipeonfork;
     r->backing_ro = false;
     r->inherited_at_fork = inherited_at_fork;
     guest_region_clear_overlay(r);
@@ -2223,7 +2245,6 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
     } else {
         r->name[0] = '\0';
     }
-    g->nregions++;
 
     /* Preserve the historical coalescing of compatible same-generation
      * anonymous mmap calls: Linux may merge those into one VMA and the region
@@ -2249,6 +2270,32 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
     return 0;
 }
 
+int guest_region_add_ex_owned_gpa(guest_t *g,
+                                  uint64_t start,
+                                  uint64_t end,
+                                  uint64_t gpa_base,
+                                  int prot,
+                                  int flags,
+                                  uint64_t offset,
+                                  const char *name,
+                                  int owned_backing_fd,
+                                  bool inherited_at_fork,
+                                  bool dontfork,
+                                  bool wipeonfork,
+                                  uint64_t vma_id)
+{
+    return region_store(g, start, end, gpa_base, prot, flags, offset, name,
+                        owned_backing_fd, inherited_at_fork, dontfork,
+                        wipeonfork, vma_id, -1);
+}
+
+void guest_region_replace_anon(guest_t *g, int index, int prot, int flags)
+{
+    const guest_region_t *r = &g->regions[index];
+    (void) region_store(g, r->start, r->end, r->start, prot, flags, 0, NULL, -1,
+                        false, false, false, 0, index);
+}
+
 int guest_region_remove_prepare(guest_t *g,
                                 uint64_t start,
                                 uint64_t end,
@@ -2266,10 +2313,10 @@ int guest_region_remove_prepare(guest_t *g,
         if (r->start >= end)
             break;
         if (r->start < start && r->end > end) {
-            /* A full table follows the existing stale-tracker fallback and does
-             * not publish a right-hand record, so no fd is required.
-             */
-            if (g->nregions >= GUEST_MAX_REGIONS || r->backing_fd < 0)
+            if (guest_region_reserve(g, g->nregions + 1) < 0)
+                return -1;
+            r = &g->regions[i];
+            if (r->backing_fd < 0)
                 return 0;
             *reserved_backing_fd = dup(r->backing_fd);
             return *reserved_backing_fd >= 0 ? 0 : -1;
@@ -2314,50 +2361,33 @@ int guest_region_remove_reserved(guest_t *g,
          * regions can overlap [start, end), so the loop is done.
          */
         if (keep_left && keep_right) {
-            if (g->nregions >= GUEST_MAX_REGIONS) {
-                /* Table full: drop the tail [end, r->end) and fall through to
-                 * the simple "trim end" treatment of *r. The tail stays mapped
-                 * in page tables but is now untracked, so a later mprotect over
-                 * that range would otherwise see vacuously uniform prot in the
-                 * tracker and skip PTE work. Mark the tracker stale to disarm
-                 * the mprotect fast path; guest.h's declaration of the flag
-                 * carries what that costs and how long it lasts.
-                 */
-                log_error(
-                    "guest: region table full, "
-                    "munmap split drops tail [0x%llx-0x%llx)",
-                    (unsigned long long) end, (unsigned long long) r->end);
-                g->regions_tracker_stale = true;
-                keep_right = false;
-            } else {
-                guest_region_t orig = *r;
-                int suffix_count = g->nregions - in - 1;
-                if (suffix_count > 0)
-                    memmove(&g->regions[out + 2], &g->regions[in + 1],
-                            suffix_count * sizeof(guest_region_t));
+            guest_region_t orig = *r;
+            int suffix_count = g->nregions - in - 1;
+            if (suffix_count > 0)
+                memmove(&g->regions[out + 2], &g->regions[in + 1],
+                        suffix_count * sizeof(guest_region_t));
 
-                guest_region_t left = orig;
-                left.end = start;
-                guest_region_clip_overlay(&left);
-                g->regions[out] = left;
+            guest_region_t left = orig;
+            left.end = start;
+            guest_region_clip_overlay(&left);
+            g->regions[out] = left;
 
-                guest_region_t right = orig;
-                uint64_t trimmed = end - orig.start;
-                right.offset += trimmed;
-                right.gpa_base += trimmed;
-                right.start = end;
-                if (orig.backing_fd >= 0) {
-                    right.backing_fd = reserved_backing_fd;
-                    reserved_backing_fd = -1;
-                }
-                guest_region_clip_overlay(&right);
-                g->regions[out + 1] = right;
-
-                g->nregions = out + 2 + suffix_count;
-                if (reserved_backing_fd >= 0)
-                    close(reserved_backing_fd);
-                return 0;
+            guest_region_t right = orig;
+            uint64_t trimmed = end - orig.start;
+            right.offset += trimmed;
+            right.gpa_base += trimmed;
+            right.start = end;
+            if (orig.backing_fd >= 0) {
+                right.backing_fd = reserved_backing_fd;
+                reserved_backing_fd = -1;
             }
+            guest_region_clip_overlay(&right);
+            g->regions[out + 1] = right;
+
+            g->nregions = out + 2 + suffix_count;
+            if (reserved_backing_fd >= 0)
+                close(reserved_backing_fd);
+            return 0;
         }
 
         if (!keep_left && !keep_right) {
@@ -2469,6 +2499,20 @@ bool guest_region_range_has_ro_shared_backing(const guest_t *g,
 
 void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot)
 {
+    if (end <= start)
+        return;
+    int splits = 0;
+    const guest_region_t *boundary = guest_region_find(g, start);
+    if (boundary && boundary->start < start)
+        splits++;
+    boundary = guest_region_find(g, end - 1);
+    if (boundary && boundary->end > end)
+        splits++;
+    if (guest_region_reserve(g, g->nregions + splits) < 0) {
+        g->regions_tracker_stale = true;
+        return;
+    }
+
     /* Walk regions overlapping [start, end), split at boundaries, update prot.
      * Track the range of indices that were modified so the code can merge
      * afterward.
@@ -2485,21 +2529,6 @@ void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot)
 
         /* If region extends before start, split at start */
         if (r->start < start) {
-            if (g->nregions >= GUEST_MAX_REGIONS) {
-                /* The region keeps its old prot in the tracker, but PTEs for
-                 * [start, r->end) have already been updated. Mark the tracker
-                 * stale so the mprotect fast path falls back to unconditional
-                 * PTE work and cannot be fooled by a tracker that lags actual
-                 * PTE state. It stays set for the life of this image, not the
-                 * process; see the munmap-split site above.
-                 */
-                log_error(
-                    "guest: region table full, "
-                    "mprotect split skipped at 0x%llx",
-                    (unsigned long long) start);
-                g->regions_tracker_stale = true;
-                continue;
-            }
             memmove(&g->regions[i + 1], &g->regions[i],
                     (g->nregions - i) * sizeof(guest_region_t));
             g->nregions++;
@@ -2526,25 +2555,6 @@ void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot)
 
         /* If region extends past end, split at end */
         if (r->end > end) {
-            if (g->nregions >= GUEST_MAX_REGIONS) {
-                /* Over-apply prot to the whole region: the tail [end, r->end)
-                 * now claims new prot in the tracker even though PTE work did
-                 * not cover it. Mark the tracker stale so the mprotect fast
-                 * path stops trusting prot uniformity.
-                 */
-                log_error(
-                    "guest: region table full, "
-                    "mprotect split skipped at 0x%llx "
-                    "(region [0x%llx-0x%llx) gets prot %d entirely)",
-                    (unsigned long long) end, (unsigned long long) r->start,
-                    (unsigned long long) r->end, prot);
-                g->regions_tracker_stale = true;
-                r->prot = prot;
-                if (first_modified < 0)
-                    first_modified = i;
-                last_modified = i;
-                continue;
-            }
             memmove(&g->regions[i + 1], &g->regions[i],
                     (g->nregions - i) * sizeof(guest_region_t));
             g->nregions++;
@@ -2681,6 +2691,14 @@ static bool finalize_block_perms(guest_t *g, const mem_region_t *regions, int n)
      * requires per-segment perms inside the rosetta image, the maintenance
      * helpers must learn va_base first.
      */
+    int local_idx[128];
+    int *idx = local_idx;
+    if (n > (int) ARRAY_SIZE(local_idx)) {
+        idx = malloc((size_t) n * sizeof(*idx));
+        if (!idx)
+            return false;
+    }
+    bool ok = false;
     for (int r = 0; r < n; r++) {
         if (regions[r].va_base != 0)
             continue;
@@ -2692,7 +2710,6 @@ static bool finalize_block_perms(guest_t *g, const mem_region_t *regions, int n)
              * collect them into idx[] sorted by start so coverage can be
              * checked with a single sweep.
              */
-            int idx[GUEST_MAX_REGIONS];
             int nidx = 0;
             int first_perm = -1;
             bool same_perm = true;
@@ -2751,10 +2768,9 @@ static bool finalize_block_perms(guest_t *g, const mem_region_t *regions, int n)
             /* Split into L3 pages, invalidate the lot, then rebuild the block
              * from per-page unions of the regions covering each page.
              */
-            if (guest_split_block(g, b) < 0)
-                return false;
-            if (guest_invalidate_ptes(g, b, b + BLOCK_2MIB) < 0)
-                return false;
+            if (guest_split_block(g, b) < 0 ||
+                guest_invalidate_ptes(g, b, b + BLOCK_2MIB) < 0)
+                goto out;
 
             int page_perms[BLOCK_2MIB / PAGE_SIZE] = {0};
             for (int i = 0; i < nidx; i++) {
@@ -2803,12 +2819,16 @@ static bool finalize_block_perms(guest_t *g, const mem_region_t *regions, int n)
                 uint64_t run_gpa_end = b + (uint64_t) i * PAGE_SIZE;
                 if (guest_update_perms(g, run_gpa_start, run_gpa_end, perms) <
                     0)
-                    return false;
+                    goto out;
             }
         }
     }
 
-    return true;
+    ok = true;
+out:
+    if (idx != local_idx)
+        free(idx);
+    return ok;
 }
 
 uint64_t guest_build_page_tables(guest_t *g, const mem_region_t *regions, int n)

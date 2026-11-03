@@ -31,9 +31,8 @@ time is not copied as child CPU time.
 The current HVF backend has one VM per host process. src/runtime/forkipc.c
 implements fork using posix_spawn and IPC: another elfuse process creates a
 VM, restores the child registers and resources, and maps a memory snapshot.
-APFS clonefile supplies a copy-on-write snapshot where available. A shared
-memory backing descriptor and a private mapping are not by themselves a
-complete implementation of Linux shared mappings.
+A sparse file holds an independent snapshot of current guest backing. Linux
+shared mappings require their own shared backing and child reattachment.
 
 elfuse keeps this execution mechanism and gives the child an independent
 local scheduler. Attribute inheritance remains required, but parent and

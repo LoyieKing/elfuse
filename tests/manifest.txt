@@ -92,6 +92,8 @@ test-getdents-refcount
 test-dir-fd-budget # host_nofile=elfuse-minimum
 test-dev-shm-paths
 test-fcntl-flags
+test-memfd-ashmem
+test-memfd-future-write
 test-socket-shortwrite
 test-socket-blockwrite-signal
 test-socket-accept-contended
@@ -142,7 +144,7 @@ test-brk-stack
 [section] mremap tests
 test-mremap
 test-mremap-infra
-test-mremap-fork-tracking
+test-mremap-fork-tracking # host_nofile=elfuse-minimum
 test-mremap-tail-emfile # host_nofile=elfuse-minimum
 test-shim-cred-race
 

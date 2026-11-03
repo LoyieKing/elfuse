@@ -8,33 +8,6 @@
  * Implements clone via posix_spawn + IPC state transfer. macOS HVF allows only
  * one VM per process, so fork spawns a new elfuse process and serializes the
  * full VM state (registers, memory, FDs) over a socketpair.
- *
- * Registers and the fd table are small. Guest memory is not, and how it crosses
- * is the whole cost of a fork:
- *
- *                      ┌──────────────┐
- *                      │ guest memory │
- *                      └──────────────┘
- *              ┌──────────────┘ └──────────┐
- *              │                           │
- *   ┌──────────▾─────────┐   ┌─────────────▾─────────────┐
- *   │ no shm fd: copy it │   │ shm fd: try an APFS clone │
- *   └────────────────────┘   └───────────────────────────┘
- *                    ┌────────────────────┘ │
- *                    │                      │
- *        ┌───────────▾──────────┐   ┌───────▾──────┐
- *        │ cloned: send that fd │   │ clone failed │
- *        └──────────────────────┘   └──────────────┘
- *              ┌───────────────────────────┘ │
- *              │                             │
- *              │                          ┌──┘
- *    ┌─────────▾────────┐   ┌─────────────▾────────────┐
- *    │ Rosetta: copy it │   │ native: send the live fd │
- *    └──────────────────┘   └──────────────────────────┘
- *
- * What each branch costs, and why the two fallbacks are not interchangeable, is
- * at the CoW block in sys_clone where the choice is made.
- * tests/bench-fork-cost.sh is what measures it on a given host.
  */
 
 #include <stdbool.h>
@@ -53,8 +26,8 @@
 #include <sys/socket.h>
 #include <dirent.h> /* fdopendir, for DIR* reconstruction in child */
 #include <sys/wait.h>
-#include <sys/clonefile.h> /* fclonefileat for CoW shm snapshots */
 #include <mach-o/dyld.h>
+#include <poll.h>
 
 #include "hvutil.h"
 #include "utils.h"
@@ -222,10 +195,7 @@ int fork_child_main(int ipc_fd,
     guest_t g;
 
     if (hdr.has_shm) {
-        /* CoW fork: receive shm fd via SCM_RIGHTS, then map MAP_PRIVATE. This
-         * gives the child an instant copy-on-write snapshot of the parent's
-         * entire guest memory, with no region enumeration or byte copying.
-         */
+        /* The parent sent an independent populated sparse file. */
         int shm_fd = -1, shm_count = 0;
         if (fork_ipc_recv_fds(ipc_fd, &shm_fd, 1, &shm_count) < 0 ||
             shm_count != 1) {
@@ -234,15 +204,14 @@ int fork_child_main(int ipc_fd,
             return 1;
         }
         if (guest_init_from_shm(&g, shm_fd, hdr.guest_size, hdr.ipa_bits,
-                                hdr.shm_is_clone != 0,
                                 (guest_memory_mode_t) hdr.memory_mode) < 0) {
             log_error("fork-child: guest_init_from_shm failed");
             close(ipc_fd);
             return 1;
         }
-        log_debug("fork-child: CoW fork via shm fd");
+        log_debug("fork-child: sparse snapshot via shm fd");
     } else {
-        /* Legacy fork copies selected guest memory regions over IPC. */
+        /* Region copy also handles guests whose region tracker is stale. */
         if (guest_init(&g, hdr.guest_size, hdr.ipa_bits,
                        (guest_memory_mode_t) hdr.memory_mode) < 0) {
             log_error("fork-child: failed to init guest");
@@ -945,51 +914,47 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu,
 }
 
 
-/* Create an APFS block-level CoW clone of src_fd via fclonefileat (O(metadata),
- * independent of the source once either side writes).
- *
- * Returns the clone fd on success, -1 with errno set on failure (non-APFS /tmp,
- * ENOSYS, ENOSPC, ...). Callers that issue this snapshot are documented at the
- * call site; the helper itself only owns the clone-path lifecycle.
- */
-static int fork_snapshot_shm_via_clonefile(int src_fd)
+/* The child owns this independent sparse file, including across nested fork. */
+static int fork_snapshot_shm_create(uint64_t size)
 {
-    /* fclonefileat needs a destination path on the same APFS volume as the
-     * source. /tmp is APFS on every shipped macOS Apple Silicon configuration;
-     * if a user has remapped /tmp to a different filesystem the call fails and
-     * the caller drops back to the legacy path.
-     *
-     * The destination lives inside a fresh mkdtemp directory (mode 0700) so no
-     * other local user can race to claim the destination basename between path
-     * selection and fclonefileat: an earlier mkstemp + unlink + fclonefileat
-     * sequence left a window where /tmp was world-writable for that name and a
-     * concurrent process could DoS the fast path via EEXIST.
-     */
-    char tmpdir[] = "/tmp/elfuse-fork-XXXXXX";
-    if (!mkdtemp(tmpdir))
+    int fd = tmpfile_anon("fork");
+    if (fd < 0)
         return -1;
-    char clone_path[64];
-    snprintf(clone_path, sizeof(clone_path), "%s/snap", tmpdir);
-    if (fclonefileat(src_fd, AT_FDCWD, clone_path, 0) < 0) {
+    if (fd_set_cloexec(fd) < 0 || ftruncate(fd, (off_t) size) < 0) {
         int saved_errno = errno;
-        rmdir(tmpdir);
+        close(fd);
         errno = saved_errno;
         return -1;
     }
-    int clone_fd = open(clone_path, O_RDWR | O_CLOEXEC);
-    int saved_errno = errno;
+    return fd;
+}
 
-    /* Best-effort cleanup: the clone fd alone keeps the inode alive, so any
-     * unlink/rmdir failure here is a directory-leak nuisance, not a correctness
-     * issue. Caller still gets the open fd.
-     */
-    (void) unlink(clone_path);
-    (void) rmdir(tmpdir);
-    if (clone_fd < 0) {
-        errno = saved_errno;
-        return -1;
+static int64_t fork_vfork_wait(thread_entry_t *t)
+{
+    int fd = t->vfork_wait_fd_plus1 - 1;
+    struct pollfd pfd = {.fd = fd, .events = POLLIN};
+    int ready = poll(&pfd, 1, 0);
+    if (ready <= 0) {
+        exec_park_kind_store(t, PARK_KIND_VFORK);
+        exec_park_result_pending_store(t, false);
+        exec_park_reissue_store(t, false);
+        t->exec_resume = EXEC_RESUME_REISSUE;
+        sched_arm_wait_deadline(t, sched_now_ns() + 10000000ULL);
+        (void) sched_park_seq_next(t);
+        exec_park_active_store(t, true);
+        return SYSCALL_PARKED;
     }
-    return clone_fd;
+
+    close(fd);
+    t->vfork_wait_fd_plus1 = 0;
+    int status;
+    struct rusage ru;
+    pid_t waited = wait4(t->vfork_child_host_pid, &status, WNOHANG, &ru);
+    if (waited == t->vfork_child_host_pid) {
+        proc_children_cpu_add(&ru);
+        proc_mark_child_exited(waited, status);
+    }
+    return t->vfork_child_pid;
 }
 
 /* Over the function-size limit on purpose.
@@ -1011,6 +976,9 @@ int64_t sys_clone(hv_vcpu_t vcpu,
                   uint64_t ctid_gva,
                   bool verbose)
 {
+    if (current_thread && current_thread->vfork_wait_fd_plus1)
+        return fork_vfork_wait(current_thread);
+
     /* Namespaces are not implemented. CLONE_NEWTIME (0x80) lives in the CSIGNAL
      * low byte and, like CLONE_INTO_CGROUP (bit 33) and set_tid, cannot be
      * conveyed through clone(2) at all, so only the higher namespace bits are
@@ -1049,14 +1017,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
                                 verbose);
     }
 
-    /* Rosetta fork takes the helper-process IPC path. The parent cannot remap
-     * its live guest memory under the running vCPU because HVF caches VA->PA at
-     * hv_vm_map time; instead, the fork path snapshots shm with clonefile when
-     * available and otherwise falls back to region copy. The TTBR1 kbuf tree,
-     * translator image, and kbuf bytes ride along as primary-buffer used
-     * regions; the child restores TCR_EL1 / TTBR1_EL1 from ipc_registers_t and
-     * recomputes kbuf_base from kbuf_gpa.
-     */
+    /* Rosetta uses the same independent snapshot, including TTBR1 and kbuf. */
 
     /* elfuse only supports fork-like clone (SIGCHLD) and posix_spawn-like
      * clone (CLONE_VM|CLONE_VFORK|SIGCHLD)
@@ -1315,15 +1276,11 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     if (mmap_fork_prepare_anon_shared_locked(g, &anon_shared_txn) < 0)
         goto fail_snapshot;
 
-    /* Clone the slab file, then synchronize anonymous and private-file backing
-     * that was replaced at the host VA. The independent file preserves CoW
-     * isolation. Without a clone, copy regions rather than send a live file
-     * whose untouched child pages could observe later parent writes.
-     */
-    bool use_shm = (g->shm_fd >= 0);
+    /* Populate an independent sparse file while every sibling is quiesced. */
+    bool use_shm = (g->shm_fd >= 0) && !g->regions_tracker_stale;
 
     if (use_shm) {
-        snapshot_shm_fd = fork_snapshot_shm_via_clonefile(g->shm_fd);
+        snapshot_shm_fd = fork_snapshot_shm_create(g->guest_size);
         if (snapshot_shm_fd >= 0 &&
             guest_memory_snapshot(g, snapshot_shm_fd) < 0)
             goto fail_snapshot;
@@ -1374,7 +1331,6 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         .clone_flags =
             flags & (LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID),
         .ctid_gva = ctid_gva,
-        .shm_is_clone = (snapshot_shm_fd >= 0) ? 1 : 0,
         .memory_mode = (uint32_t) g->memory_mode,
     };
     sched_task_get_attr(current_thread, &hdr.sched_attr);
@@ -1538,46 +1494,19 @@ int64_t sys_clone(hv_vcpu_t vcpu,
 
     close(ipc_sock);
 
-    /* After CoW fork, parent stays on MAP_SHARED because no remap was done. The
-     * shm fd is kept open so subsequent forks can also use CoW. The child has
-     * its own MAP_PRIVATE view of the same file.
-     */
-
-    /* CLONE_VFORK suspends the parent until the child exits or execs. The
-     * emulator cannot observe guest exec completion across the helper process,
-     * so it waits for the helper to exit.
-     */
-    if (is_vfork) {
-        char byte;
-        ssize_t nr;
-        do {
-            nr = read(vfork_notify_fds[0], &byte, 1);
-        } while (nr < 0 && errno == EINTR);
-        close(vfork_notify_fds[0]);
-
-        if (nr <= 0) {
-            int status = 0;
-            struct rusage ru;
-            if (wait4(child_host_pid, &status, 0, &ru) == child_host_pid)
-                proc_children_cpu_add(&ru);
-            proc_mark_child_exited(child_host_pid, status);
-        } else {
-            int status;
-            struct rusage ru;
-            pid_t waited = wait4(child_host_pid, &status, WNOHANG, &ru);
-            if (waited == child_host_pid) {
-                proc_children_cpu_add(&ru);
-                proc_mark_child_exited(child_host_pid, status);
-            }
-        }
-    }
-
     log_debug("clone: child pid=%lld (host=%d)", (long long) child_guest_pid,
               child_host_pid);
 
     free(regions_snapshot);
     if (snapshot_shm_fd >= 0)
         close(snapshot_shm_fd);
+    if (is_vfork) {
+        current_thread->vfork_wait_fd_plus1 = vfork_notify_fds[0] + 1;
+        current_thread->vfork_child_pid = child_guest_pid;
+        current_thread->vfork_child_host_pid = child_host_pid;
+        syscall_restart_forbid();
+        return fork_vfork_wait(current_thread);
+    }
     return child_guest_pid;
 
 fail_snapshot:
@@ -1653,6 +1582,9 @@ int64_t sys_clone3(hv_vcpu_t vcpu,
                    uint64_t cl_args_size,
                    bool verbose)
 {
+    if (current_thread && current_thread->vfork_wait_fd_plus1)
+        return fork_vfork_wait(current_thread);
+
     /* Validate size: at least the v5.3 minimum; larger than a page is E2BIG
      * (same rule as copy_struct_from_user / openat2).
      */
