@@ -213,6 +213,7 @@ typedef struct thread_entry {
                                     * + CPSR(4) + 32xV(16) + FPSR(4) + FPCR(4)
                                     */
     bool gdb_regs_dirty;           /* GDB handler modified snapshot */
+    bool gdb_stopped; /* gdb.lock: owner is waiting with a live snapshot */
 
     /* VM-clone child state. For clone(CLONE_VM) without CLONE_THREAD: shares
      * guest memory but has a separate TID, is waitable via wait4, and can be

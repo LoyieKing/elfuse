@@ -14,6 +14,8 @@
 #include "debug/gdbstub-reg.h"
 #include "debug/gdbstub-rsp.h"
 #include "runtime/sched/vcpu_pool.h"
+#include "runtime/sched/exec.h"
+#include "syscall/signal.h"
 
 void gdb_snap_vcpu(thread_entry_t *t)
 {
@@ -31,10 +33,13 @@ void gdb_snap_vcpu(thread_entry_t *t)
     uint64_t sp = vcpu_get_sysreg(vcpu, HV_SYS_REG_SP_EL0);
     memcpy(s + GDBREGOFFSP, &sp, 8);
 
-    uint64_t pc = vcpu_get_sysreg(vcpu, HV_SYS_REG_ELR_EL1);
+    uint64_t pstate = vcpu_get_reg(vcpu, HV_REG_CPSR);
+    bool el0 = (pstate & 0xfU) == 0;
+    uint64_t pc = el0 ? vcpu_get_reg(vcpu, HV_REG_PC)
+                      : vcpu_get_sysreg(vcpu, HV_SYS_REG_ELR_EL1);
     memcpy(s + GDBREGOFFPC, &pc, 8);
-
-    uint64_t pstate = vcpu_get_sysreg(vcpu, HV_SYS_REG_SPSR_EL1);
+    if (!el0)
+        pstate = vcpu_get_sysreg(vcpu, HV_SYS_REG_SPSR_EL1);
     uint32_t cpsr = (uint32_t) pstate;
     memcpy(s + GDBREGOFFCPSR, &cpsr, 4);
 
@@ -56,17 +61,53 @@ void gdb_snap_vcpu(thread_entry_t *t)
     t->gdb_regs_dirty = false;
 }
 
+void gdb_snap_task(thread_entry_t *t, const guest_t *g)
+{
+    const guest_thread_ctx_t *ctx = &t->guest_ctx;
+    uint8_t *s = t->gdb_reg_snapshot;
+    bool el0 = (ctx->cpsr & 0xfU) == 0;
+    memset(s, 0, GDBREGSNAPSIZE);
+    memcpy(s, ctx->gprs, sizeof(ctx->gprs));
+    /* A parked syscall still has its architectural GPRs in SAVE_GPRS. */
+    if (!el0 && (t->exec_resume == EXEC_RESUME_RESULT ||
+                 t->exec_resume == EXEC_RESUME_REISSUE)) {
+        uint64_t lo, hi;
+        thread_sp_el1_region(g, &lo, &hi);
+        if (hi >= 256 && ctx->sp_el1 >= lo && ctx->sp_el1 <= hi - 256)
+            memcpy(s + 8, (const uint8_t *) g->host_base + ctx->sp_el1 + 8,
+                   sizeof(ctx->gprs) - 8);
+    }
+    memcpy(s + GDBREGOFFSP, &ctx->sp_el0, 8);
+    uint64_t pc = el0 ? ctx->pc : ctx->elr_el1;
+    uint32_t cpsr = (uint32_t) (el0 ? ctx->cpsr : ctx->spsr_el1);
+    memcpy(s + GDBREGOFFPC, &pc, 8);
+    memcpy(s + GDBREGOFFCPSR, &cpsr, 4);
+    memcpy(s + GDBREGOFFV(0), ctx->simd.v, sizeof(ctx->simd.v));
+    uint32_t fpsr = (uint32_t) ctx->simd.fpsr;
+    uint32_t fpcr = (uint32_t) ctx->simd.fpcr;
+    memcpy(s + GDBREGOFFFPSR, &fpsr, 4);
+    memcpy(s + GDBREGOFFFPCR, &fpcr, 4);
+    t->gdb_regs_dirty = false;
+}
+
 void gdb_restore_vcpu(thread_entry_t *t, int tde_stop)
 {
     hv_vcpu_t vcpu;
     if (!vcpu_pool_current_vcpu(&vcpu))
         return;
     const uint8_t *s = t->gdb_reg_snapshot;
+    bool el0 = (vcpu_get_reg(vcpu, HV_REG_CPSR) & 0xfU) == 0;
 
     for (int i = 0; i < 31; i++) {
         uint64_t val;
         memcpy(&val, s + GDBREGOFFGPR(i), 8);
         vcpu_set_gpr(vcpu, (unsigned) i, val);
+    }
+    if (!el0 && (t->exec_resume == EXEC_RESUME_RESULT ||
+                 t->exec_resume == EXEC_RESUME_REISSUE)) {
+        uint64_t gprs[31];
+        memcpy(gprs, s, sizeof(gprs));
+        signal_publish_shim_frame_gprs(vcpu, vcpu_pool_guest(), gprs);
     }
 
     uint64_t sp;
@@ -76,13 +117,13 @@ void gdb_restore_vcpu(thread_entry_t *t, int tde_stop)
     uint64_t pc;
     memcpy(&pc, s + GDBREGOFFPC, 8);
     vcpu_set_sysreg(vcpu, HV_SYS_REG_ELR_EL1, pc);
-    if (tde_stop)
+    if (tde_stop || el0)
         HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_PC, pc));
 
     uint32_t cpsr;
     memcpy(&cpsr, s + GDBREGOFFCPSR, 4);
     vcpu_set_sysreg(vcpu, HV_SYS_REG_SPSR_EL1, (uint64_t) cpsr);
-    if (tde_stop)
+    if (tde_stop || el0)
         HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, (uint64_t) cpsr));
 
     for (int i = 0; i < 32; i++) {

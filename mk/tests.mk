@@ -1282,7 +1282,7 @@ test-gdbstub-host: $(BUILD_DIR)/test-gdbstub-host
 	$(BUILD_DIR)/test-gdbstub-host
 
 ## Run GDB stub integration tests (LLDB <-> elfuse gdbstub)
-test-gdbstub: $(ELFUSE_BIN) $(TEST_DIR)/test-hello $(BUILD_DIR)/test-gdbstub-host
+test-gdbstub: $(ELFUSE_BIN) $(TEST_DIR)/test-hello $(TEST_DIR)/test-gdbstub-threads $(BUILD_DIR)/test-gdbstub-host
 	$(call run-host-unit,test-gdbstub-host,buffered GDB session regression)
 	@bash tests/test-gdbstub.sh -e $(ELFUSE_BIN) -v
 

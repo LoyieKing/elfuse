@@ -2340,10 +2340,13 @@ Boundaries:
 - `gdbstub-rsp.c` -- RSP packet transport and hex helpers
 - `gdbstub-reg.c` -- register snapshot layout, restore flow, `target.xml`
 
-The stub runs in all-stop mode. Because Hypervisor.framework register access
-must happen on the owning thread, the stopped vCPU snapshots its own state;
-the GDB-handler thread reads and updates the snapshot, and the owning thread
-restores the modified state on resume -- the same pattern used by ptrace.
+The stub runs in all-stop mode. An independent scheduler gate prevents new
+mounts while each running task stops and snapshots registers on its HVF owner
+thread. Unmounted tasks supply registers from their saved guest context;
+parked syscall GPRs come from the live shim frame. The stop reply is sent only
+after every active task is either unmounted or waiting in the debugger.
+Continue, detach, and disconnect release the debugger gate without changing
+the fork snapshot gate. Register edits are applied by the owner on resume.
 
 The split mirrors the architectural boundary: transport and encoding are
 independent of guest execution; register layout is independent of socket I/O;

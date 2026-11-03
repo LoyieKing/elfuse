@@ -67,6 +67,9 @@ int gdb_stub_handle_stop(int stop_reason, uint64_t stop_addr);
  */
 int gdb_stub_stop_requested(void);
 
+/* Check a pending stop before guest entry; only EL0 has live guest GPRs. */
+void gdb_stub_check_stop(void);
+
 /* Program hardware debug registers for a specific vCPU. Called when a thread is
  * about to resume execution. This writes the current breakpoint/watchpoint
  * state to the vCPU's debug regs.

@@ -116,6 +116,7 @@ static int sched_host_ncpu_cache;
 static bool sched_initialized;
 static bool sched_shutdown_flag;
 static bool sched_frozen;
+static bool sched_debug_frozen;
 static sched_host_ops_t sched_ops;
 static void (*sched_prio_changed_hook)(thread_entry_t *t);
 static uint64_t sched_dl_admitted_bw;
@@ -1596,6 +1597,7 @@ int sched_domain_init(int ncpu)
     sched_dl_tail = NULL;
     sched_shutdown_flag = false;
     sched_frozen = false;
+    sched_debug_frozen = false;
     for (int i = 0; i < want; i++) {
         int err = pthread_cond_init(&sched_cpus[i].work_cond, NULL);
         if (err != 0) {
@@ -2364,7 +2366,7 @@ thread_entry_t *sched_worker_pick(int cpu_index)
         pthread_mutex_unlock(&sched_lock);
         return t;
     }
-    if (sched_frozen || sched_shutdown_flag) {
+    if (sched_frozen || sched_debug_frozen || sched_shutdown_flag) {
         pthread_mutex_unlock(&sched_lock);
         return NULL;
     }
@@ -2385,7 +2387,7 @@ void sched_worker_wait(int cpu_index)
     for (;;) {
         if (sched_shutdown_flag)
             break;
-        if (sched_frozen) {
+        if (sched_frozen || sched_debug_frozen) {
             pthread_cond_wait(&sched_cond, &sched_lock);
             continue;
         }
@@ -2998,6 +3000,18 @@ bool sched_domain_frozen(void)
     frozen = sched_frozen;
     pthread_mutex_unlock(&sched_lock);
     return frozen;
+}
+
+void sched_domain_debug_freeze(bool frozen)
+{
+    if (!sched_initialized)
+        sched_init();
+    pthread_mutex_lock(&sched_lock);
+    sched_debug_frozen = frozen;
+    pthread_cond_broadcast(&sched_cond);
+    for (int i = 0; i < sched_ncpu; i++)
+        pthread_cond_broadcast(&sched_cpus[i].work_cond);
+    pthread_mutex_unlock(&sched_lock);
 }
 
 static thread_entry_t *drain_one_locked(void)

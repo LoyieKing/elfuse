@@ -22,6 +22,8 @@
 #include "runtime/thread.h"
 #include "runtime/futex.h"
 
+#include "debug/gdbstub.h"
+#include "debug/gdbstub-reg.h"
 #include "core/shim-globals.h"
 #include "hvutil.h"
 #include "syscall/linux-wire.h"
@@ -1013,6 +1015,7 @@ static int pool_run_tick(guest_t *g, void *opaque)
     if (thread_exec_de_thread_active() && current_thread &&
         !thread_current_is_leader())
         return VCPU_TICK_EXIT_ZERO;
+    gdb_stub_check_stop();
 
     if (!atomic_exchange_explicit(&slot->kick_pending, false,
                                   memory_order_acq_rel))
@@ -1167,6 +1170,9 @@ static proc_leave_t run_one_task(struct vcpu_slot *slot,
      * resume work reads the register set.
      */
     thread_ptrace_apply_resume(t, vcpu);
+    if (t->gdb_regs_dirty)
+        gdb_restore_vcpu(t, 0);
+
     /* Publish the mount's accounting state before the task becomes visible to a
      * sampler: a sample taken against a half-published mount would fold the
      * owner's host time between mounts into the task. The whole publication is

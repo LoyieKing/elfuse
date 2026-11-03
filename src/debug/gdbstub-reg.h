@@ -22,6 +22,8 @@
 #define GDBREGSNAPSIZE ((size_t) 788)
 
 void gdb_snap_vcpu(thread_entry_t *t);
+/* Caller holds the debugger gate and has observed the task unmounted. */
+void gdb_snap_task(thread_entry_t *t, const guest_t *g);
 void gdb_restore_vcpu(thread_entry_t *t, int tde_stop);
 int gdb_reg_offset(uint64_t regnum, int *out_off, int *out_size);
 int gdb_reply_target_xml(int fd, const char *pkt);

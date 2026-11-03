@@ -103,6 +103,33 @@ void thread_interrupt_all(void)
     unexpected_call(__func__);
 }
 
+void sched_domain_debug_freeze(bool frozen)
+{
+    unexpected_call(__func__);
+}
+
+bool sched_task_is_running(const thread_entry_t *t)
+{
+    unexpected_call(__func__);
+}
+
+void thread_sp_el1_region(const guest_t *g, uint64_t *lo, uint64_t *hi)
+{
+    unexpected_call(__func__);
+}
+
+guest_t *vcpu_pool_guest(void)
+{
+    unexpected_call(__func__);
+}
+
+void signal_publish_shim_frame_gprs(hv_vcpu_t vcpu,
+                                    const guest_t *g,
+                                    const uint64_t gprs[31])
+{
+    unexpected_call(__func__);
+}
+
 void *guest_ptr_bound(const guest_t *g,
                       uint64_t gva,
                       uint64_t *avail,

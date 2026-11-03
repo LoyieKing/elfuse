@@ -546,6 +546,41 @@ fi
 report "buffered packets: reply without further socket input" $ok
 stop_elfuse
 
+# All-stop must include both the mounted compute task and a parked sleeper.
+checkpoint=$("${CROSS_COMPILE:-aarch64-linux-gnu-}nm" "$TESTDIR/test-gdbstub-threads" \
+    | awk '$3 == "debugger_checkpoint" { print "0x" $1 }')
+progress=$("${CROSS_COMPILE:-aarch64-linux-gnu-}nm" "$TESTDIR/test-gdbstub-threads" \
+    | awk '$3 == "progress" { print "0x" $1 }')
+start_elfuse "$TESTDIR/test-gdbstub-threads"
+run_lldb \
+    -o "breakpoint set --address $checkpoint" \
+    -o "continue" \
+    -o 'script p = lldb.process; before = [(t.GetThreadID(), t.GetFrameAtIndex(0).GetPC(), t.GetFrameAtIndex(0).GetSP()) for t in p]; print("all_stop_valid:", len(before) == 3 and all(pc != 0 and sp != 0 for _, pc, sp in before))' \
+    -o "script counter = $progress; e = lldb.SBError(); before_count = lldb.process.ReadUnsignedFromMemory(counter, 8, e); assert e.Success()" \
+    -o 'script import time; time.sleep(0.1); after = [(t.GetThreadID(), t.GetFrameAtIndex(0).GetPC(), t.GetFrameAtIndex(0).GetSP()) for t in lldb.process]; print("all_stop_stable:", before == after)' \
+    -o 'script e = lldb.SBError(); after_count = lldb.process.ReadUnsignedFromMemory(counter, 8, e); print("compute_frozen:", e.Success() and after_count == before_count and before_count >= 10000)' \
+    -o "breakpoint delete" \
+    -o "process detach" \
+    -o "quit"
+ok=0
+if echo "$LLDB_OUT" | grep -q "all_stop_valid: True" \
+    && echo "$LLDB_OUT" | grep -q "all_stop_stable: True" \
+    && echo "$LLDB_OUT" | grep -q "compute_frozen: True"; then
+    tries=0
+    while kill -0 "$elfuse_pid" 2> /dev/null && [ "$tries" -lt 50 ]; do
+        sleep 0.1
+        tries=$((tries + 1))
+    done
+    if ! kill -0 "$elfuse_pid" 2> /dev/null; then
+        if wait "$elfuse_pid"; then
+            ok=1
+            elfuse_pid=""
+        fi
+    fi
+fi
+report "all-stop: compute and parked threads stop and resume" $ok
+stop_elfuse
+
 # Summary
 echo ""
 if [ "$fails" -eq 0 ]; then

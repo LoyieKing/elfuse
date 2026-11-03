@@ -49,6 +49,7 @@
 
 #include "runtime/thread.h"
 #include "runtime/sched/vcpu_pool.h"
+#include "runtime/sched/sched.h"
 #include "syscall/linux-wire.h" /* linux_user_pt_regs_t, LINUX_* errno */
 
 /* Constants. */
@@ -899,6 +900,7 @@ static void handle_vcont(const char *pkt)
     pthread_mutex_lock(&gdb.lock);
     gdb.all_stopped = 0;
     atomic_store_explicit(&gdb.stop_requested, 0, memory_order_relaxed);
+    sched_domain_debug_freeze(false);
     pthread_cond_broadcast(&gdb.resume_cond);
     pthread_mutex_unlock(&gdb.lock);
 }
@@ -922,6 +924,7 @@ static void handle_continue(const char *pkt)
     pthread_mutex_lock(&gdb.lock);
     gdb.all_stopped = 0;
     atomic_store_explicit(&gdb.stop_requested, 0, memory_order_relaxed);
+    sched_domain_debug_freeze(false);
     pthread_cond_broadcast(&gdb.resume_cond);
     pthread_mutex_unlock(&gdb.lock);
 }
@@ -957,14 +960,36 @@ static void handle_step(const char *pkt)
     pthread_mutex_lock(&gdb.lock);
     gdb.all_stopped = 0;
     atomic_store_explicit(&gdb.stop_requested, 0, memory_order_relaxed);
+    sched_domain_debug_freeze(false);
     pthread_cond_broadcast(&gdb.resume_cond);
     pthread_mutex_unlock(&gdb.lock);
+}
+
+static void gdb_report_stop(void);
+
+static void gdb_select_stop_thread(thread_entry_t *t, void *opaque)
+{
+    (void) opaque;
+    if (gdb.stop_tid == 0)
+        gdb.stop_tid = thread_tid(t);
 }
 
 /* Handle Ctrl+C (0x03): interrupt all threads. */
 static void handle_interrupt(void)
 {
     pthread_mutex_lock(&gdb.lock);
+    if (gdb.all_stopped) {
+        pthread_mutex_unlock(&gdb.lock);
+        return;
+    }
+    gdb.all_stopped = 1;
+    gdb.stop_tid = 0;
+    thread_for_each(gdb_select_stop_thread, NULL);
+    gdb.stop_reason = GDB_STOP_SIGNAL;
+    gdb.stop_addr = 0;
+    gdb.current_g_tid = gdb.stop_tid;
+    gdb.current_c_tid = gdb.stop_tid;
+    sched_domain_debug_freeze(true);
 
     /* Release pairs with the lock-free acquire load in gdb_stub_stop_requested:
      * gdb.lock serializes the writers only, never the polling vCPU threads.
@@ -972,8 +997,7 @@ static void handle_interrupt(void)
     atomic_store_explicit(&gdb.stop_requested, 1, memory_order_release);
     pthread_mutex_unlock(&gdb.lock);
 
-    /* Force all vCPUs out of hv_vcpu_run */
-    thread_interrupt_all();
+    gdb_report_stop();
 }
 
 /* Handle 'D': detach. Disable all breakpoints and continue. */
@@ -989,6 +1013,7 @@ static void handle_detach(void)
     pthread_mutex_lock(&gdb.lock);
     gdb.all_stopped = 0;
     atomic_store_explicit(&gdb.stop_requested, 0, memory_order_relaxed);
+    sched_domain_debug_freeze(false);
     pthread_cond_broadcast(&gdb.resume_cond);
     pthread_mutex_unlock(&gdb.lock);
 
@@ -1253,6 +1278,7 @@ static void *listener_thread_fn(void *arg)
             atomic_store_explicit(&gdb.stop_requested, 0, memory_order_relaxed);
             memset(gdb.breakpoints, 0, sizeof(gdb.breakpoints));
             memset(gdb.watchpoints, 0, sizeof(gdb.watchpoints));
+            sched_domain_debug_freeze(false);
             pthread_cond_broadcast(&gdb.resume_cond);
         }
         pthread_mutex_unlock(&gdb.lock);
@@ -1389,6 +1415,41 @@ int gdb_stub_is_active(void)
     return gdb.initialized && gdb.client_fd >= 0;
 }
 
+/* gdb.lock precedes thread_lock, which precedes sched_lock. */
+static void gdb_collect_stop(thread_entry_t *t, void *opaque)
+{
+    bool *ready = opaque;
+    if (t->gdb_stopped)
+        return;
+    if (sched_task_is_running(t)) {
+        *ready = false;
+        return;
+    }
+    if (t->guest_ctx.valid)
+        gdb_snap_task(t, gdb.guest);
+}
+
+static void gdb_report_stop(void)
+{
+    thread_interrupt_all();
+    pthread_mutex_lock(&gdb.lock);
+    while (gdb.all_stopped) {
+        bool ready = true;
+        thread_for_each(gdb_collect_stop, &ready);
+        if (ready)
+            break;
+        struct timespec interval = {.tv_nsec = 1000000};
+        pthread_cond_timedwait_relative_np(&gdb.stop_cond, &gdb.lock,
+                                           &interval);
+    }
+    if (gdb.all_stopped) {
+        char reply[128];
+        build_stop_reply(reply, sizeof(reply));
+        rsp_reply(reply);
+    }
+    pthread_mutex_unlock(&gdb.lock);
+}
+
 int gdb_stub_handle_stop(int stop_reason, uint64_t stop_addr)
 {
     if (!gdb.initialized || gdb.client_fd < 0)
@@ -1404,6 +1465,9 @@ int gdb_stub_handle_stop(int stop_reason, uint64_t stop_addr)
         gdb_snap_vcpu(current_thread);
 
     pthread_mutex_lock(&gdb.lock);
+    if (current_thread)
+        current_thread->gdb_stopped = true;
+    pthread_cond_broadcast(&gdb.stop_cond);
 
     /* In all-stop mode, only the first stopped thread reports to GDB. Other
      * stopped threads wait here until GDB resumes the inferior.
@@ -1421,7 +1485,8 @@ int gdb_stub_handle_stop(int stop_reason, uint64_t stop_addr)
         gdb.stop_tid = my_tid;
         gdb.stop_reason = stop_reason;
         gdb.stop_addr = stop_addr;
-        atomic_store_explicit(&gdb.stop_requested, 0, memory_order_relaxed);
+        sched_domain_debug_freeze(true);
+        atomic_store_explicit(&gdb.stop_requested, 1, memory_order_release);
 
         /* Update focus thread */
         gdb.current_g_tid = my_tid;
@@ -1430,17 +1495,8 @@ int gdb_stub_handle_stop(int stop_reason, uint64_t stop_addr)
 
     pthread_mutex_unlock(&gdb.lock);
 
-    if (first_to_stop) {
-        /* Stop all other vCPUs (all-stop mode) */
-        thread_interrupt_all();
-
-        /* Send stop reply to GDB. Only the first thread to stop sends it,
-         * avoiding duplicate replies that would corrupt the RSP protocol.
-         */
-        char reply[128];
-        build_stop_reply(reply, sizeof(reply));
-        rsp_reply(reply);
-    }
+    if (first_to_stop)
+        gdb_report_stop();
 
     /* Block this thread until GDB resumes */
     pthread_mutex_lock(&gdb.lock);
@@ -1448,13 +1504,7 @@ int gdb_stub_handle_stop(int stop_reason, uint64_t stop_addr)
         pthread_cond_wait(&gdb.resume_cond, &gdb.lock);
 
     int do_step = gdb.resume_action;
-    pthread_mutex_unlock(&gdb.lock);
 
-    /* Apply any register changes GDB made to the snapshot. TDE debug stops
-     * (breakpoint, step, watchpoint) bypassed EL1, so HV_REG_PC must also be
-     * written for the resume to work. Shim-mediated stops (signals, Ctrl+C)
-     * only need ELR_EL1.
-     */
     int tde =
         (stop_reason == GDB_STOP_BREAKPOINT || stop_reason == GDB_STOP_STEP ||
          stop_reason == GDB_STOP_WATCHPOINT);
@@ -1466,6 +1516,11 @@ int gdb_stub_handle_stop(int stop_reason, uint64_t stop_addr)
     if (current_thread && vcpu_pool_current_vcpu(&vcpu))
         gdb_stub_sync_debug_regs(vcpu);
 
+    if (current_thread)
+        current_thread->gdb_stopped = false;
+    pthread_cond_broadcast(&gdb.stop_cond);
+    pthread_mutex_unlock(&gdb.lock);
+
     return do_step;
 }
 
@@ -1474,6 +1529,16 @@ int gdb_stub_stop_requested(void)
     if (!gdb.initialized)
         return 0;
     return atomic_load_explicit(&gdb.stop_requested, memory_order_acquire);
+}
+
+void gdb_stub_check_stop(void)
+{
+    if (!gdb_stub_stop_requested())
+        return;
+    hv_vcpu_t vcpu;
+    if (vcpu_pool_current_vcpu(&vcpu) &&
+        (vcpu_get_reg(vcpu, HV_REG_CPSR) & 0xfU) == 0)
+        gdb_stub_handle_stop(GDB_STOP_SIGNAL, 0);
 }
 
 void gdb_stub_shutdown(void)
@@ -1497,6 +1562,7 @@ void gdb_stub_shutdown(void)
     pthread_mutex_lock(&gdb.lock);
     gdb.all_stopped = 0;
     atomic_store_explicit(&gdb.stop_requested, 0, memory_order_relaxed);
+    sched_domain_debug_freeze(false);
     pthread_cond_broadcast(&gdb.resume_cond);
     pthread_mutex_unlock(&gdb.lock);
 

@@ -425,7 +425,7 @@ void sched_put_current(struct thread_entry *t, sched_put_disposition_t how);
 struct thread_entry *sched_worker_pick(int cpu);
 
 /* Execution backend: block until @cpu (or any CPU when negative) has a queued
- * task, or until freeze/shutdown.
+ * task and dispatch is unfrozen, or until shutdown.
  *
  * Returns immediately when work is already available. Use this instead of
  * unwinding the worker when every task is blocked.
@@ -500,6 +500,9 @@ bool sched_shutdown_requested(void);
  */
 void sched_domain_freeze(bool frozen);
 bool sched_domain_frozen(void);
+
+/* Independent debugger gate. Existing mounts stop on their owner workers. */
+void sched_domain_debug_freeze(bool frozen);
 
 /* Detach every READY task (pool teardown). The callback runs without the
  * scheduler lock held.
