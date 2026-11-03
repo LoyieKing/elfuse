@@ -31,6 +31,7 @@
 #include "runtime/sched/exec.h"
 
 #include <pthread.h>
+#include <sched.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -130,6 +131,13 @@ static void actions_init(sched_actions_t *a)
 
 static void sched_dispatch(const sched_actions_t *a)
 {
+    if (!a->timer && !a->overrun && !a->prio_changed) {
+        bool cpu_action = false;
+        for (int i = 0; i < (sched_ncpu + 7) / 8; i++)
+            cpu_action |= a->wake[i] != 0 || a->kick[i] != 0;
+        if (!cpu_action)
+            return;
+    }
     sched_host_ops_t ops;
     void (*prio_hook)(thread_entry_t *t);
     bool frozen;
@@ -1151,6 +1159,8 @@ static int enqueue_ready_locked(thread_entry_t *t,
         SCHED_BIT_SET(a->wake, cpu_index);
     thread_entry_t *current = sched_cpus[cpu_index].current;
     if (!sched_frozen && current && current != t) {
+        if (TS(current)->run_class == SCHED_CLASS_FAIR)
+            a->timer = true;
         int ready_class = task_eff_class(t);
         int running_class = task_eff_class(current);
         bool preempt = ready_class > running_class;
@@ -1233,52 +1243,87 @@ static bool task_live_budget_expired_locked(const thread_entry_t *t,
     }
 }
 
+#define SCHED_LIVE_BATCH 16
+
 /* Refresh each CPU's unsettled execution sample. The host callback may take
  * sched_lock itself for its slot lookup, so every call is made with the
- * scheduler lock released.
+ * scheduler lock released. A CPU's mount and settlement generation are captured
+ * before its sample and rechecked after it, one lock section apiece per batch,
+ * so an accepted sample carries no interval that a settlement already owns. A
+ * sample the backend could not take coherently leaves this CPU's unsettled
+ * delta at zero for the pass: budget checks then decide from the settled
+ * counters and are re-evaluated at the next pass.
  */
 static void sched_sample_live_ns(void)
 {
-    uint64_t (*exec_fn)(const thread_entry_t *) = NULL;
-    uint64_t (*service_fn)(const thread_entry_t *) = NULL;
+    sched_live_sample_t (*live_fn)(const thread_entry_t *) = NULL;
+    struct {
+        thread_entry_t *cur;
+        uint64_t seq;
+    } batch[SCHED_LIVE_BATCH];
+    sched_live_sample_t sample[SCHED_LIVE_BATCH];
 
     if (!sched_initialized)
         return;
     pthread_mutex_lock(&sched_lock);
-    exec_fn = sched_ops.live_exec_ns;
-    service_fn = sched_ops.live_service_ns;
+    live_fn = sched_ops.live_sample;
     pthread_mutex_unlock(&sched_lock);
-    if (!exec_fn && !service_fn)
+    if (!live_fn)
         return;
 
-    for (int i = 0; i < sched_ncpu; i++) {
+    for (int base = 0; base < sched_ncpu; base += SCHED_LIVE_BATCH) {
+        int n = sched_ncpu - base;
+        if (n > SCHED_LIVE_BATCH)
+            n = SCHED_LIVE_BATCH;
         pthread_mutex_lock(&sched_lock);
-        thread_entry_t *cur = sched_cpus[i].current;
-        uint64_t seq = sched_cpus[i].account_seq;
+        for (int j = 0; j < n; j++) {
+            sched_cpu_state_t *cpu = &sched_cpus[base + j];
+            thread_entry_t *cur = cpu->current;
+            batch[j].cur = cur && CTS(cur)->run_class == SCHED_CLASS_FAIR &&
+                                   !cpu_has_other_runnable(cpu, cur)
+                               ? NULL
+                               : cur;
+            batch[j].seq = cpu->account_seq;
+        }
         pthread_mutex_unlock(&sched_lock);
 
-        uint64_t exec_ns = cur && exec_fn ? exec_fn(cur) : 0;
-        uint64_t service_ns = cur && service_fn ? service_fn(cur) : 0;
+        for (int j = 0; j < n; j++) {
+            thread_entry_t *cur = batch[j].cur;
+            if (cur) {
+                sample[j] = live_fn(cur);
+            } else {
+                sample[j].exec_ns = 0;
+                sample[j].service_ns = 0;
+                sample[j].generation = 0;
+                sample[j].valid = false;
+            }
+        }
 
         pthread_mutex_lock(&sched_lock);
-        if (sched_cpus[i].current == cur && sched_cpus[i].account_seq == seq) {
-            sched_cpus[i].live_sample_ns = exec_ns;
-            sched_cpus[i].live_service_sample_ns = service_ns;
-            sched_cpus[i].live_sample_seq = seq;
-        } else {
-            /* A settlement landed while sampling: its interval is already in
-             * the settled counters, so this sample would double count.
-             */
-            sched_cpus[i].live_sample_ns = 0;
-            sched_cpus[i].live_service_sample_ns = 0;
-            sched_cpus[i].live_sample_seq = 0;
+        for (int j = 0; j < n; j++) {
+            sched_cpu_state_t *cpu = &sched_cpus[base + j];
+            if (sample[j].valid && cpu->current == batch[j].cur &&
+                cpu->account_seq == batch[j].seq) {
+                cpu->live_sample_ns = sample[j].exec_ns;
+                cpu->live_service_sample_ns = sample[j].service_ns;
+                cpu->live_sample_seq = batch[j].seq;
+            } else {
+                /* A settlement landed while sampling, or the backend was in a
+                 * transition: either way this sample would double count or
+                 * under-report, so the pass runs on the settled counters.
+                 */
+                cpu->live_sample_ns = 0;
+                cpu->live_service_sample_ns = 0;
+                cpu->live_sample_seq = 0;
+            }
         }
         pthread_mutex_unlock(&sched_lock);
     }
 }
 
 /* Unsettled execution charged to runtime budgets: guest execution plus host
- * syscall service since the last settlement, saturating on overflow.
+ * syscall service since the last settlement, including the phase in progress at
+ * the backend, saturating on overflow.
  */
 static uint64_t live_pending_ns(const sched_cpu_state_t *cpu)
 {
@@ -2338,8 +2383,12 @@ void sched_worker_wait(int cpu_index)
 
     pthread_mutex_lock(&sched_lock);
     for (;;) {
-        if (sched_shutdown_flag || sched_frozen)
+        if (sched_shutdown_flag)
             break;
+        if (sched_frozen) {
+            pthread_cond_wait(&sched_cond, &sched_lock);
+            continue;
+        }
         bool ready = false;
         if (cpu_index >= 0 && cpu_index < sched_ncpu) {
             sched_cpu_state_t *cpu = &sched_cpus[cpu_index];
@@ -2384,6 +2433,22 @@ void sched_account_service_ns(thread_entry_t *t, uint64_t ns)
     actions_init(&a);
     pthread_mutex_lock(&sched_lock);
     account_locked(t, ns, true, &a);
+    pthread_mutex_unlock(&sched_lock);
+    sched_dispatch(&a);
+}
+
+void sched_account_interval_ns(thread_entry_t *t,
+                               uint64_t exec_ns,
+                               uint64_t service_ns)
+{
+    sched_actions_t a;
+
+    if (!t || (exec_ns == 0 && service_ns == 0) || !sched_initialized)
+        return;
+    actions_init(&a);
+    pthread_mutex_lock(&sched_lock);
+    account_locked(t, exec_ns, false, &a);
+    account_locked(t, service_ns, true, &a);
     pthread_mutex_unlock(&sched_lock);
     sched_dispatch(&a);
 }
@@ -2435,58 +2500,64 @@ bool sched_resched_requested(void)
 
 bool sched_take_resched(thread_entry_t *t)
 {
-    bool requested = false;
-    uint64_t live_ns = 0;
-    uint64_t (*exec_fn)(const thread_entry_t *) = NULL;
-    uint64_t (*service_fn)(const thread_entry_t *) = NULL;
+    sched_live_sample_t (*live_fn)(const thread_entry_t *) = NULL;
     int sample_cpu = -1;
     uint64_t sample_seq = 0;
+    bool requested;
 
     if (!t || !sched_initialized)
         return false;
 
-    /* The host callbacks may take sched_lock for their slot lookup, so they are
-     * always called with the scheduler lock released.
-     */
-    pthread_mutex_lock(&sched_lock);
-    exec_fn = sched_ops.live_exec_ns;
-    service_fn = sched_ops.live_service_ns;
-    sample_cpu = TS(t)->current_cpu;
-    if (sample_cpu >= 0 && sample_cpu < sched_ncpu)
-        sample_seq = sched_cpus[sample_cpu].account_seq;
-    else
-        sample_cpu = -1;
-    pthread_mutex_unlock(&sched_lock);
-    if (exec_fn)
-        live_ns = exec_fn(t);
-    if (service_fn) {
-        uint64_t service_ns = service_fn(t);
-        live_ns = UINT64_MAX - live_ns < service_ns ? UINT64_MAX
-                                                    : live_ns + service_ns;
-    }
-
     pthread_mutex_lock(&sched_lock);
     requested = TS(t)->resched_requested || TS(t)->block_requested;
     TS(t)->resched_requested = false;
-    int cpu_index = TS(t)->current_cpu;
-    if (cpu_index >= 0 && cpu_index < sched_ncpu) {
-        if (sched_cpus[cpu_index].need_resched)
+    sample_cpu = TS(t)->current_cpu;
+    if (sample_cpu >= 0 && sample_cpu < sched_ncpu) {
+        if (sched_cpus[sample_cpu].need_resched)
             requested = true;
-        sched_cpus[cpu_index].need_resched = false;
+        sched_cpus[sample_cpu].need_resched = false;
+        sample_seq = sched_cpus[sample_cpu].account_seq;
+        live_fn = sched_ops.live_sample;
+
+        /* A solo fair task cannot exhaust a budget against another runnable
+         * task. Enqueue publishes a reschedule request under this lock.
+         */
+        if (TS(t)->run_class == SCHED_CLASS_FAIR &&
+            !cpu_has_other_runnable(&sched_cpus[sample_cpu], t))
+            sample_cpu = -1;
+    } else {
+        sample_cpu = -1;
     }
+    pthread_mutex_unlock(&sched_lock);
+
+    /* A pending request already answers this safe point; the unsettled sample
+     * cannot withdraw it, and only this path needs one.
+     */
+    if (requested || sample_cpu < 0)
+        return requested;
+
+    /* The host callback may take sched_lock for its slot lookup, so it is
+     * always called with the scheduler lock released.
+     */
+    sched_live_sample_t sample = {0};
+    if (live_fn)
+        sample = live_fn(t);
+
+    pthread_mutex_lock(&sched_lock);
 
     /* Re-check the unsettled budget at the owner safe point as well: a remote
      * timer sample may be unavailable or late, and this decision must be made
      * before the next guest entry. A settlement that raced the sample already
      * owns that interval, so the sample is dropped then.
      */
-    bool live_valid = live_ns != 0 && sample_cpu >= 0 &&
-                      sample_cpu == cpu_index &&
-                      sched_cpus[sample_cpu].current == t &&
+    bool live_valid = sample.valid && sched_cpus[sample_cpu].current == t &&
                       sched_cpus[sample_cpu].account_seq == sample_seq;
-    if (!requested)
-        requested =
-            task_live_budget_expired_locked(t, live_valid ? live_ns : 0);
+    uint64_t live_ns = sample.exec_ns;
+    if (UINT64_MAX - live_ns < sample.service_ns)
+        live_ns = UINT64_MAX;
+    else
+        live_ns += sample.service_ns;
+    requested = task_live_budget_expired_locked(t, live_valid ? live_ns : 0);
     pthread_mutex_unlock(&sched_lock);
     return requested;
 }
@@ -2646,6 +2717,8 @@ uint64_t sched_next_timer_ns(void)
         uint64_t pending = live_pending_ns(cpu);
         uint64_t delta = 0;
         if (s->run_class == SCHED_CLASS_FAIR) {
+            if (!cpu_has_other_runnable(cpu, cur))
+                continue;
             uint64_t rem = s->fair_slice_ns > s->fair_used_ns
                                ? s->fair_slice_ns - s->fair_used_ns
                                : 0;
@@ -4151,20 +4224,48 @@ void sched_thread_cputime_split_ns(const thread_entry_t *t,
     uint64_t sys = 0;
     uint64_t live_exec = 0;
     uint64_t live_service = 0;
-    uint64_t (*exec_fn)(const thread_entry_t *) = NULL;
-    uint64_t (*service_fn)(const thread_entry_t *) = NULL;
 
     if (t && sched_initialized) {
+        sched_live_sample_t (*live_fn)(const thread_entry_t *) = NULL;
+
         pthread_mutex_lock(&sched_lock);
-        user = CTS(t)->runtime_user_ns;
-        sys = CTS(t)->runtime_sys_ns;
-        exec_fn = sched_ops.live_exec_ns;
-        service_fn = sched_ops.live_service_ns;
+        live_fn = sched_ops.live_sample;
         pthread_mutex_unlock(&sched_lock);
-        if (exec_fn)
-            live_exec = exec_fn(t);
-        if (service_fn)
-            live_service = service_fn(t);
+
+        /* A settlement moves the batch out of the backend's sample and into
+         * these counters. The sample is taken on both sides of the snapshot:
+         * equal generations mean both belong to one interval that no settlement
+         * overlapped, so the counters and the sample count every nanosecond
+         * once, and successive reads only ever grow. A transition in between
+         * changes the generation, and the pair is taken again; the backend's
+         * window is lock-free, so it always closes.
+         */
+        for (unsigned attempt = 0; live_fn; attempt++) {
+            sched_live_sample_t first = live_fn(t);
+            if (first.valid) {
+                pthread_mutex_lock(&sched_lock);
+                user = CTS(t)->runtime_user_ns;
+                sys = CTS(t)->runtime_sys_ns;
+                pthread_mutex_unlock(&sched_lock);
+
+                sched_live_sample_t last = live_fn(t);
+                if (last.valid && last.generation == first.generation) {
+                    live_exec = first.exec_ns;
+                    live_service = first.service_ns;
+                    break;
+                }
+            }
+            /* Let the owner finish the phase or settlement it is inside. */
+            if (attempt >= 8)
+                sched_yield();
+        }
+        if (!live_fn) {
+            /* No backend: nothing has been executed outside the counters. */
+            pthread_mutex_lock(&sched_lock);
+            user = CTS(t)->runtime_user_ns;
+            sys = CTS(t)->runtime_sys_ns;
+            pthread_mutex_unlock(&sched_lock);
+        }
     }
     if (user_ns)
         *user_ns = user + live_exec;

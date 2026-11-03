@@ -731,6 +731,13 @@ alignment, zero lengths and ranges containing holes. Child reads must fault
 with `SIGSEGV/SEGV_MAPERR` on excluded pages. The test also checks parent data,
 shared backing contents and the `dc` flag in `smaps`.
 
+`MADV_WIPEONFORK` and `MADV_KEEPONFORK` cases verify zero-filled child
+bytes, unchanged parent contents, partial clearing, protection splits,
+repeated/nested fork, mremap move/growth and `CLONE_VM` retention. Shared
+and private file mappings reject WIPEONFORK with `EINVAL`; ranges with
+holes return `ENOMEM` after updating mapped fragments. Synthetic `smaps`
+reports the `wf` flag on retained wipe-on-fork regions.
+
 Build and run the focused case with:
 
 ```sh
@@ -763,6 +770,9 @@ The normal aarch64 matrices include this test for elfuse and Linux.
 barriers against three threads making syscalls and computing a deterministic
 64-bit sequence. It checks syscall results, arithmetic and completed work.
 Both aarch64 matrices run this case.
+Three synchronized callers also issue 300 overlapping expedited and
+SYNC_CORE requests; every caller must complete without blocking another
+inside its host handler.
 
 ```sh
 make elfuse build/test-membarrier-sync-core
@@ -797,9 +807,9 @@ application dex compilation complete under elfuse. The package's
 followed by this abort is not a passing runtime exit. GTK display and APK
 lifecycle remain outside this command-line runtime validation.
 
-Owner CPU accounting uses Darwin's public `CLOCK_THREAD_CPUTIME_ID`;
-cross-worker live samples use the cached Mach thread port. Both exclude
-waiting and host descheduling. The static `fd-create` guardrail allows 15 us
+Slot CPU accounting and cross-worker live samples read `THREAD_BASIC_INFO`
+user plus system time through the owner's cached Mach thread port. The shared
+source excludes waiting and host descheduling. The static `fd-create` guardrail allows 15 us
 above same-host native `open("/dev/null", O_RDWR)` plus close; the dynamic
 glibc allowance is 35 us for sysroot resolution. `bench-fd-create-host` takes
 the median of three passes before and after each guest pass; their average
@@ -843,7 +853,8 @@ retained occasional stalls. CPU placement does not resolve every latency outlier
 `test-sched-placement-host` drives the scheduler without HVF timing and checks
 estimated-load selection with every CPU busy, the 25 us early-out boundary,
 deadline-demand ties, affinity-predicate stealing, exact demand transfer,
-source/target virtual-time conversion, peak/quarter decay, retirement and
+source/target virtual-time conversion, peak/quarter decay, retirement,
+user/service charges through quiet accounting, service-budget expiry and
 exclusion of Linux RT/DL queues from stealing. Per-CPU worker condition
 variables map Zircon target-CPU notifications; freeze and shutdown still wake
 all owners. The existing pipe-bulk performance ceilings remain unchanged.
@@ -953,6 +964,108 @@ Suggested minimum validation:
 | Broad behavioral changes | `make elfuse && make check && make test-matrix` |
 | Debugger or ptrace flow | `make elfuse && make test-gdbstub` |
 | ACSL contracts, `src/proved/`, `mk/verify.mk`, the mutation harness | `make verify && make verify-mutants`, in that order and never beside a runtime lane: both fan out, and the timing lanes fail under the load they create. Add `make check` only when the change touches code rather than annotations |
+
+VMA storage changes have a focused runtime probe in `test-brk-stack`: 5,000
+alternating writable and guarded pages, exact `/proc/self/maps` permissions,
+a late hardware write fault, fork isolation, interior unmap, and fixed
+replacements that exercise the single-interval removal count and snapshot
+bound: interior and exact-boundary replacements, differently protected
+neighbors, holes, and failed replacements that must restore bytes and
+permissions. Run `make elfuse build/test-brk-stack && build/elfuse build/test-brk-stack`.
+The descriptor-exhaustion fork tests use the `host_nofile=elfuse-minimum`
+manifest setting so their filler reaches the host fd limit rather than relying
+on the number of VMA records.
+
+Exact anonymous `MAP_FIXED` replacement retains the original record until
+backing preparation completes, then overwrites it through the normal region
+initializer and neighbor merge rules. It avoids snapshot allocation and two
+suffix copies; partial ranges, file backing and host overlays retain rollback
+snapshots. `test-madvise-fork` checks that exact replacement clears both
+`MADV_DONTFORK` and `MADV_WIPEONFORK`.
+
+`make build/bench-mmap && build/elfuse build/bench-mmap 500` measures repeated
+page replacements at the head, middle and tail of 100- and 5,000-pair guarded
+mapping tables. Each position reports the median of five samples and checks
+zero fill and neighboring bytes; latency is diagnostic, with no timing gate.
+
+On the local M4 Pro, five-sample medians with 1,000 replacements per sample
+were 43.004/21.384/1.588 us at head/middle/tail before exact-record overwrite,
+and 1.376/1.372/1.146 us after it for the 5,000-pair table. Scheduler-only
+quiet accounting measured 18.2 versus 7.9 ns per charge (median of five
+million-iteration user/service batches). These microbenchmarks do not establish
+an application-startup improvement.
+
+The accounting and exact-replacement cutover passed `make check` (109 driver
+entries plus host/shared lanes and the throughput guardrail) and
+`make test-matrix-elfuse-aarch64` (327 PASS, 0 FAIL, 10 SKIP). `test-brk-stack`
+passed 36 checks under lazy and eager backing; `test-madvise-fork` passed 15.
+Standalone ART completed with `ART_ARM64_OK sum=5000050000 threads=40000`.
+Touched C files passed clang-format 22.1.8 and commentflow. Full-tree formatting
+remains blocked by existing comment reflow differences and two long comments
+in `src/runtime/sched/vcpu_pool.c`; those files were left unchanged.
+
+Frozen scheduler domains keep idle workers asleep on `sched_cond` until dispatch
+resumes or shutdown begins. The formatted sources passed `test-exec-handoff`
+(six scenarios), `test-mt-fork` (one snapshot scenario), the `fork-inherit-isolate`
+scenario of `test-sched-fork-domain` (15 checks), and `test-negative` (43 checks).
+The latter covers `unlinkat` returning `EISDIR` for a directory without
+`AT_REMOVEDIR`. `make test-matrix-elfuse-aarch64` completed with 327 PASS,
+0 FAIL and 10 SKIP. The latest `make check` reached the throughput guardrail
+but did not pass: host load 51.64 and 79.36 over 14 CPUs made it unmeasurable.
+
+Sparse fork snapshots passed `test-cow-fork`, `test-memory-mode`,
+`test-cross-fork-mapshared`, `test-mremap-fork-tracking` and
+`test-mremap-tail-emfile` through `tests/driver.sh`; the latter two require the
+manifest's constrained host fd limit. `test-madvise-fork` passed 15 checks when
+run directly, including nested DONTFORK and WIPEONFORK inheritance.
+A 64 GiB anonymous mapping with dirty endpoint pages forked in
+56.303/44.266/40.060 ms and preserved both endpoints and an untouched zero page.
+These focused checks do not establish a new full-matrix baseline.
+
+`test-vfork-sibling` holds a vfork child on a pipe while another parent thread
+forks. Three checks pass: the sibling fork succeeds, a signal stays pending
+until child release, and vfork returns the admitted child PID with its exit
+status still waitable. The caller unmounts until child exec/exit rather than
+blocking a CPU in the notification read.
+The continuation retains REISSUE across stop/continue, and wait deadlines match
+the task's park generation. A stopped-vfork smoke preserved the child's exit
+status after 15 STOP/CONT cycles. Concurrent fork and mapping-reset smokes
+completed without fork failures; high-VA replacement also passed under Rosetta.
+Quiesce has a 2-second bound for admitted host handlers to drain backing pauses;
+a failed freeze never authorizes a snapshot. Nested backing restoration keeps
+the outer memory pause until its matching resume.
+
+The PID allocator retains one close-on-exec sequence descriptor per host
+process, with a local mutex and the existing cross-process flock. Nested
+process/thread ID uniqueness and 18 other lifecycle cases passed. A 400-thread
+creation smoke measured 0.939905/0.907108/0.884239 seconds before descriptor
+reuse and 0.589498/0.591922/0.559472 seconds afterward.
+For 200,000 host-forwarded sched_getscheduler calls, the solo FAIR sample
+shortcut measured 0.394443/0.428115/0.399830 seconds before and
+0.359322/0.338923/0.323372 seconds after. Forced preemption, RR rotation,
+RR wake/quantum preservation, solo DEADLINE throttling and DEADLINE yield
+passed. RT/DEADLINE scenarios ran with --fakeroot.
+
+File-backed fork snapshots bypass page-disposition queries because every byte
+is copied. A 128 MiB private file mapping smoke preserved dirty endpoints,
+an untouched zero page and child-write isolation. The first before/after pair
+was 0.160417/0.076859 seconds; a warmed pair was 0.075647/0.058361 seconds.
+test-mmap-private passed 53 checks; test-cow-fork passed five checks;
+test-madvise-fork passed 15 checks, including nested inheritance.
+The native aarch64 matrix completed with 328 PASS, 0 FAIL and 10 SKIP after
+the PID allocator, solo FAIR sampling and file snapshot changes.
+make check reached the hot-syscall guardrail but exited nonzero: its second
+static stat-path measurement was 119.2 times getpid against a 105-times limit.
+The guest debugger integration passed 19 LLDB scenarios and 18 host checks,
+including compute-thread freeze, parked-thread snapshots and detach recovery.
+Real ART supplied all nine task register sets, resumed after repeated stops,
+and exited zero after both detach and abrupt debugger disconnect.
+
+A record-lock smoke held a conflicting lock for 20 ms. F_SETLKW returned after
+201.119 ms with the descriptorless 200 ms recheck, and after 24.935 ms with
+the 1 ms retry. Descriptor-backed fallback waits retain the 200 ms interval.
+
+
 
 ## OCI Images
 

@@ -487,9 +487,6 @@ void thread_deactivate(thread_entry_t *t)
     signal_wait_cancel(t);
     signal_release_claims(t);
     futex_pi_task_release(t);
-    uint64_t runtime_user_ns, runtime_sys_ns;
-    sched_thread_cputime_split_ns(t, &runtime_user_ns, &runtime_sys_ns);
-
     pthread_mutex_lock(&thread_lock);
 
     /* If this is a VM-clone child, mark it as exited and wake the tracer/parent
@@ -501,6 +498,13 @@ void thread_deactivate(thread_entry_t *t)
         pthread_mutex_unlock(&thread_lock);
         return;
     }
+
+    /* Sampled under the table lock: moving the value into the departed totals
+     * and removing the task from the active list is then one step, so an
+     * aggregate cannot attribute less to it than it already reported.
+     */
+    uint64_t runtime_user_ns, runtime_sys_ns;
+    sched_thread_cputime_split_ns(t, &runtime_user_ns, &runtime_sys_ns);
     if (!t->is_vm_clone) {
         departed_user_ns += runtime_user_ns;
         departed_sys_ns += runtime_sys_ns;

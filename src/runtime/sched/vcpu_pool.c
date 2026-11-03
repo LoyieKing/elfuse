@@ -449,7 +449,7 @@ static uint64_t slice_mono_ns(void)
     return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
 }
 
-/* Owner CPU-time sampling */
+/* CPU-time sampling */
 
 static void slot_cpu_port_init(struct vcpu_slot *slot)
 {
@@ -459,85 +459,194 @@ static void slot_cpu_port_init(struct vcpu_slot *slot)
                               memory_order_release);
 }
 
-static uint64_t slot_cpu_ns(struct vcpu_slot *slot)
+/* Thread CPU time from the one source a foreign observer can also read.
+ * CLOCK_THREAD_CPUTIME_ID is a fresh reading of the calling thread only; the
+ * basic-info totals are the per-thread counter the kernel refreshes on
+ * scheduling events, and a remote reader can obtain them through the cached
+ * port. Using the public clock for the owner would put the baseline and a
+ * remote reading in different freshness domains, where the remote value can sit
+ * a scheduling quantum below the baseline and lose that slice. Both sides
+ * therefore read this source, so a baseline and any later reading of it are
+ * directly comparable. The cost is one thread_info call per sample.
+ *
+ * The bool is the availability signal: a caller must not read a failed sample
+ * as zero time, which would look like a clock that went backwards.
+ */
+static bool slot_cpu_ns(struct vcpu_slot *slot, uint64_t *ns)
 {
-    /* The public owner clock avoids a Mach message on every phase boundary.
-     * Remote readers still need the cached port; both clocks sum user/system
-     * CPU time, excluding time descheduled or blocked on the host.
-     */
-    if (slot == owner_slot)
-        return clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
     mach_port_t port =
         atomic_load_explicit(&slot->cpu_port, memory_order_acquire);
     if (port == MACH_PORT_NULL)
-        return 0;
+        return false;
     thread_basic_info_data_t info;
     mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
     kern_return_t kr =
         thread_info(port, THREAD_BASIC_INFO, (thread_info_t) &info, &count);
     if (kr != KERN_SUCCESS)
-        return 0;
-    return (uint64_t) info.user_time.seconds * 1000000000ULL +
-           (uint64_t) info.user_time.microseconds * 1000ULL +
-           (uint64_t) info.system_time.seconds * 1000000000ULL +
-           (uint64_t) info.system_time.microseconds * 1000ULL;
+        return false;
+    *ns = (uint64_t) info.user_time.seconds * 1000000000ULL +
+          (uint64_t) info.user_time.microseconds * 1000ULL +
+          (uint64_t) info.system_time.seconds * 1000000000ULL +
+          (uint64_t) info.system_time.microseconds * 1000ULL;
+    return true;
 }
 
-/* Mach permits CPU-time sampling of another worker without HVF register access.
+/* The top bits of a sample generation carry the slot identity, so samples from
+ * different slots never compare equal even when their counters happen to. The
+ * low bits are the slot's transition count, which no run reaches the top of.
  */
-static uint64_t pool_live_phase_ns(const struct thread_entry *t, bool guest)
+#define POOL_SLOT_GEN_SHIFT 48
+
+/* Unsettled CPU time for @t: the batch the owner folded in, plus the phase
+ * still in progress, both measured with the one clock every observer shares
+ * (slot_cpu_ns). The in-progress term is what keeps a guest that never leaves
+ * EL0 visible: without it the value would only move at phase boundaries, which
+ * for a compute-bound task is one slice apart.
+ */
+static sched_live_sample_t pool_live_sample(const struct thread_entry *t)
 {
-    int cpu = sched_thread_cpu(t);
-    if (!t || !slots || cpu < 0 || cpu >= slot_count)
-        return 0;
-    struct vcpu_slot *slot = &slots[cpu];
+    sched_live_sample_t out = {
+        .exec_ns = 0,
+        .service_ns = 0,
+        .generation = 0,
+        .valid = true,
+    };
+
+    if (!t || !slots)
+        return out;
+    struct vcpu_slot *slot;
+
+    /* Called at every scheduler safe point, so the owner resolves its own slot
+     * rather than taking the scheduler lock for the lookup.
+     */
+    if (owner_slot &&
+        atomic_load_explicit(&owner_slot->current, memory_order_acquire) == t)
+        slot = owner_slot;
+    else {
+        int cpu = sched_thread_cpu(t);
+        if (cpu < 0 || cpu >= slot_count)
+            return out;
+        slot = &slots[cpu];
+    }
+    if (atomic_load_explicit(&slot->current, memory_order_acquire) != t) {
+        /* Not mounted: its batch is settled before the mount is cleared, so
+         * there is nothing to add and no transition to report.
+         */
+        return out;
+    }
+
+    /* The owner sees its own fields in program order, so it can never find them
+     * half-updated; only a foreign observer has to treat an open window as an
+     * unusable sample. A caller that already holds the window therefore never
+     * waits on itself.
+     */
+    bool self = slot == owner_slot;
     uint64_t seq =
         atomic_load_explicit(&slot->accounting_seq, memory_order_acquire);
-    if ((seq & 1) ||
-        atomic_load_explicit(&slot->current, memory_order_acquire) != t ||
-        atomic_load_explicit(&slot->accounting_guest, memory_order_acquire) !=
-            guest)
-        return 0;
+    bool guest =
+        atomic_load_explicit(&slot->accounting_guest, memory_order_acquire);
     uint64_t base =
         atomic_load_explicit(&slot->cpu_account_base_ns, memory_order_acquire);
-    uint64_t now = slot_cpu_ns(slot);
-    if (atomic_load_explicit(&slot->accounting_seq, memory_order_acquire) !=
-            seq ||
-        atomic_load_explicit(&slot->current, memory_order_acquire) != t)
-        return 0;
-    return now > base ? now - base : 0;
+    uint64_t exec =
+        atomic_load_explicit(&slot->pending_exec_ns, memory_order_acquire);
+    uint64_t service =
+        atomic_load_explicit(&slot->pending_service_ns, memory_order_acquire);
+    uint64_t now = 0;
+    bool sampled = slot_cpu_ns(slot, &now);
+    if (!self &&
+        ((seq & 1) || !sampled ||
+         atomic_load_explicit(&slot->accounting_seq, memory_order_acquire) !=
+             seq ||
+         atomic_load_explicit(&slot->current, memory_order_acquire) != t)) {
+        out.exec_ns = 0;
+        out.service_ns = 0;
+        out.valid = false;
+        return out;
+    }
+
+    /* The owner cannot ask again for its own clock without waiting on itself,
+     * so a failed reading leaves the phase out instead of failing the sample.
+     */
+    if (sampled && now > base) {
+        if (guest)
+            exec += now - base;
+        else
+            service += now - base;
+    }
+    out.exec_ns = exec;
+    out.service_ns = service;
+    out.generation =
+        ((uint64_t) (slot->index + 1) << POOL_SLOT_GEN_SHIFT) | seq;
+    return out;
 }
 
-static uint64_t pool_live_exec_ns(const struct thread_entry *t)
+/* A batch retires at this much owner CPU time, or when the mount ends: a tenth
+ * of the fair period. A live sample adds the phase in progress, so a safe point
+ * judges the budget on every nanosecond executed so far, and settled-state
+ * re-admission lags by at most one batch. Everything is charged before the task
+ * can be rescheduled or migrate.
+ */
+#define POOL_ACCOUNT_BATCH_NS 1000000ULL
+
+/* SIGXCPU owed by a DEADLINE overrun that the settle charge reported. Set only
+ * while this thread holds a settle window open: queuing it there takes sig_lock
+ * and thread_lock, and a CPU-clock reader that holds either lock may be waiting
+ * for that same window to close.
+ */
+static _Thread_local struct thread_entry *deferred_dl_overrun;
+
+static void deliver_dl_overrun(struct thread_entry *t)
 {
-    return pool_live_phase_ns(t, true);
+    if (t)
+        (void) signal_queue_thread(thread_tid(t), LINUX_SIGXCPU);
 }
 
-static uint64_t pool_live_service_ns(const struct thread_entry *t)
+/* Hand the unsettled batch to the scheduler. The window stays open across the
+ * charge: a live sampler then reports no coherent sample for this slot rather
+ * than one side of the move, and any sample that outlives the window carries
+ * the new generation. Nothing that blocks on a lock a sampler can hold runs
+ * inside it, so a sampler that waits for the window always sees it close.
+ */
+static void slot_settle_accounting(struct vcpu_slot *slot,
+                                   struct thread_entry *t)
 {
-    return pool_live_phase_ns(t, false);
+    if (!slot || !t)
+        return;
+    atomic_fetch_add_explicit(&slot->accounting_seq, 1, memory_order_acq_rel);
+    uint64_t exec = atomic_exchange_explicit(&slot->pending_exec_ns, 0,
+                                             memory_order_relaxed);
+    uint64_t service = atomic_exchange_explicit(&slot->pending_service_ns, 0,
+                                                memory_order_relaxed);
+    if (exec || service)
+        sched_account_interval_ns(t, exec, service);
+    atomic_fetch_add_explicit(&slot->accounting_seq, 1, memory_order_release);
+
+    struct thread_entry *overrun = deferred_dl_overrun;
+    deferred_dl_overrun = NULL;
+    deliver_dl_overrun(overrun);
 }
 
 void vcpu_pool_account_phase(bool entering_guest)
 {
     if (!owner_slot || !current_thread)
         return;
+    struct vcpu_slot *slot = owner_slot;
     {
         /* Seq-cst makes the requester see this entry or this owner see its
          * pause. No guest entry crosses the detach/remap window.
          */
-        atomic_store_explicit(&owner_slot->memory_guest, entering_guest,
+        atomic_store_explicit(&slot->memory_guest, entering_guest,
                               memory_order_seq_cst);
         if (atomic_load_explicit(&memory_paused, memory_order_seq_cst)) {
             pthread_mutex_lock(&memory_lock);
             if (entering_guest) {
-                atomic_store_explicit(&owner_slot->memory_guest, false,
+                atomic_store_explicit(&slot->memory_guest, false,
                                       memory_order_seq_cst);
                 pthread_cond_broadcast(&memory_cond);
                 while (
                     atomic_load_explicit(&memory_paused, memory_order_seq_cst))
                     pthread_cond_wait(&memory_cond, &memory_lock);
-                atomic_store_explicit(&owner_slot->memory_guest, true,
+                atomic_store_explicit(&slot->memory_guest, true,
                                       memory_order_seq_cst);
             } else {
                 pthread_cond_broadcast(&memory_cond);
@@ -545,33 +654,55 @@ void vcpu_pool_account_phase(bool entering_guest)
             pthread_mutex_unlock(&memory_lock);
         }
     }
-    atomic_fetch_add_explicit(&owner_slot->accounting_seq, 1,
-                              memory_order_acq_rel);
-    uint64_t now = slot_cpu_ns(owner_slot);
-    uint64_t base = atomic_load_explicit(&owner_slot->cpu_account_base_ns,
-                                         memory_order_acquire);
-    if (now > base) {
-        if (atomic_load_explicit(&owner_slot->accounting_guest,
-                                 memory_order_relaxed))
-            sched_account_cpu_ns(current_thread, now - base);
-        else
-            sched_account_service_ns(current_thread, now - base);
-    }
-    atomic_store_explicit(&owner_slot->cpu_account_base_ns, now,
-                          memory_order_release);
-    atomic_store_explicit(&owner_slot->accounting_guest, entering_guest,
-                          memory_order_release);
-    atomic_fetch_add_explicit(&owner_slot->accounting_seq, 1,
+    if (entering_guest)
+        (void) slot_barrier_before_guest(slot);
+    atomic_fetch_add_explicit(&slot->accounting_seq, 1, memory_order_acq_rel);
+    uint64_t now = 0;
+    bool sampled = slot_cpu_ns(slot, &now);
+    uint64_t base =
+        atomic_load_explicit(&slot->cpu_account_base_ns, memory_order_acquire);
+
+    /* A failed sample must not move the baseline: the next interval would then
+     * be charged the thread's whole CPU time at once.
+     */
+    if (sampled) {
+        bool guest =
+            atomic_load_explicit(&slot->accounting_guest, memory_order_relaxed);
+        _Atomic uint64_t *pending =
+            guest ? &slot->pending_exec_ns : &slot->pending_service_ns;
+        if (now > base)
+            atomic_fetch_add_explicit(pending, now - base,
+                                      memory_order_relaxed);
+        atomic_store_explicit(&slot->cpu_account_base_ns, now,
                               memory_order_release);
+    }
+    atomic_store_explicit(&slot->accounting_guest, entering_guest,
+                          memory_order_release);
+    uint64_t batch =
+        atomic_load_explicit(&slot->pending_exec_ns, memory_order_relaxed) +
+        atomic_load_explicit(&slot->pending_service_ns, memory_order_relaxed);
+    atomic_fetch_add_explicit(&slot->accounting_seq, 1, memory_order_release);
+    if (batch >= POOL_ACCOUNT_BATCH_NS)
+        slot_settle_accounting(slot, current_thread);
 }
 
 /* SCHED_DEADLINE overrun: Linux delivers SIGXCPU to the task. Called by the
- * scheduler without its lock held; thread-directed queueing is lifetime-safe.
+ * scheduler without its lock held; thread-directed queueing is lifetime-safe. A
+ * charge made inside a settle window only records the request: the window is
+ * what a CPU-clock reader waits on, and queueing here would wait on locks that
+ * reader may hold.
  */
 static void pool_dl_overrun(struct thread_entry *t)
 {
-    if (t)
-        (void) signal_queue_thread(thread_tid(t), LINUX_SIGXCPU);
+    if (!t)
+        return;
+    if (owner_slot && (atomic_load_explicit(&owner_slot->accounting_seq,
+                                            memory_order_acquire) &
+                       1)) {
+        deferred_dl_overrun = t;
+        return;
+    }
+    deliver_dl_overrun(t);
 }
 
 static const sched_host_ops_t pool_host_ops = {
@@ -580,8 +711,7 @@ static const sched_host_ops_t pool_host_ops = {
     .kick_all = vcpu_pool_kick_all_mounted,
     .wake_timer = vcpu_pool_wake_timer,
     .dl_overrun = pool_dl_overrun,
-    .live_exec_ns = pool_live_exec_ns,
-    .live_service_ns = pool_live_service_ns,
+    .live_sample = pool_live_sample,
 };
 
 /* Kick / handle publication */
@@ -1012,7 +1142,6 @@ static proc_leave_t run_one_task(struct vcpu_slot *slot,
     hv_vcpu_t vcpu = slot->vcpu;
     owner_slot = slot;
 
-    atomic_store_explicit(&slot->current, t, memory_order_release);
     current_thread = t;
     atomic_store_explicit(&slot->in_exec, true, memory_order_release);
 
@@ -1022,7 +1151,6 @@ static proc_leave_t run_one_task(struct vcpu_slot *slot,
         atomic_store_explicit(&slot->in_exec, false, memory_order_release);
         barrier_signal();
         owner_slot = NULL;
-        atomic_store_explicit(&slot->current, NULL, memory_order_release);
         current_thread = NULL;
         return PROC_LEAVE_EXIT;
     }
@@ -1039,11 +1167,27 @@ static proc_leave_t run_one_task(struct vcpu_slot *slot,
      * resume work reads the register set.
      */
     thread_ptrace_apply_resume(t, vcpu);
+    /* Publish the mount's accounting state before the task becomes visible to a
+     * sampler: a sample taken against a half-published mount would fold the
+     * owner's host time between mounts into the task. The whole publication is
+     * one generation, with @current stored inside it.
+     */
+    uint64_t cpu_start = 0;
+    bool sampled = slot_cpu_ns(slot, &cpu_start);
+    atomic_fetch_add_explicit(&slot->accounting_seq, 1, memory_order_acq_rel);
+    atomic_store_explicit(&slot->pending_exec_ns, 0, memory_order_relaxed);
+    atomic_store_explicit(&slot->pending_service_ns, 0, memory_order_relaxed);
 
-    uint64_t cpu_start = slot_cpu_ns(slot);
-    atomic_store_explicit(&slot->cpu_account_base_ns, cpu_start,
-                          memory_order_release);
-    atomic_store_explicit(&slot->accounting_guest, false, memory_order_release);
+    /* A failed sample leaves the last good baseline in place, so the first
+     * interval covers the gap instead of the thread's whole CPU time.
+     */
+    if (sampled)
+        atomic_store_explicit(&slot->cpu_account_base_ns, cpu_start,
+                              memory_order_relaxed);
+    atomic_store_explicit(&slot->accounting_guest, false, memory_order_relaxed);
+    atomic_store_explicit(&slot->current, t, memory_order_release);
+    atomic_fetch_add_explicit(&slot->accounting_seq, 1, memory_order_release);
+
     proc_leave_t leave;
 
     /* A completed park (including a wake that raced the handler's return), a
@@ -1111,6 +1255,8 @@ static proc_leave_t run_one_task(struct vcpu_slot *slot,
         guest_ctx_save(vcpu, &t->guest_ctx);
 
     vcpu_pool_account_phase(false);
+    /* Runtime is settled before the task can migrate or be republished. */
+    slot_settle_accounting(slot, t);
 
     /* A plain barrier that arrived while mounted still owes this owner a fence.
      * SYNC_CORE does not ack here: the lag stays and the next mount runs the
@@ -1289,11 +1435,16 @@ static void slot_destroy_vcpu_owner(struct vcpu_slot *slot)
     pthread_mutex_unlock(&slot->handle_lock);
     if (had)
         hv_vcpu_destroy(vcpu);
+
+    /* Stop being a sampling target before the port goes away: a reader that
+     * still resolves this slot falls into the not-mounted answer instead of
+     * retrying against a clock that is never going to read again.
+     */
+    atomic_store_explicit(&slot->current, NULL, memory_order_release);
     mach_port_t port = atomic_exchange_explicit(&slot->cpu_port, MACH_PORT_NULL,
                                                 memory_order_acq_rel);
     if (port != MACH_PORT_NULL)
         mach_port_deallocate(mach_task_self(), port);
-    atomic_store_explicit(&slot->current, NULL, memory_order_release);
 }
 
 static void *pool_worker_main(void *arg)

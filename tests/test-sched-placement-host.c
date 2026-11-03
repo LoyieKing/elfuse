@@ -66,6 +66,20 @@ void thread_process_cputime_split_ns(uint64_t *user, uint64_t *system)
 
 static thread_entry_t tasks[8];
 static int passes, fails;
+static unsigned live_calls, timer_wakes;
+static uint64_t live_exec_ns;
+
+static sched_live_sample_t live_sample(const thread_entry_t *t)
+{
+    (void) t;
+    live_calls++;
+    return (sched_live_sample_t) {.exec_ns = live_exec_ns, .valid = true};
+}
+
+static void wake_timer(void)
+{
+    timer_wakes++;
+}
 
 static void reset(void)
 {
@@ -205,6 +219,36 @@ int main(void)
                 "migration reset lag or consumed fraction");
 
     reset();
+    pinned(0, 0);
+    queue(0, 0, 1000000);
+    thread_entry_t *accounted = sched_worker_pick(0);
+    current_thread = accounted;
+    sched_account_cpu_ns(accounted, 100);
+    sched_account_service_ns(accounted, 200);
+    TEST("quiet accounting retains user and service runtime");
+    EXPECT_TRUE(accounted->sched.runtime_user_ns == 100 &&
+                    accounted->sched.runtime_sys_ns == 200 &&
+                    accounted->sched.runtime_ns == 300 &&
+                    !sched_take_resched(accounted),
+                "empty host actions lost charges or requested a switch");
+    pinned(1, 0);
+    queue(1, 0, 1000000);
+    (void) sched_take_resched(accounted);
+    uint64_t remaining =
+        accounted->sched.fair_slice_ns - accounted->sched.fair_used_ns;
+    uint64_t slope = sched_cpus[0].slope_q10;
+    uint64_t charge = sched_fair_real_ns(remaining, (uint32_t) slope) + 1;
+    sched_account_service_ns(accounted, charge);
+    TEST("service budget expiry reschedules runnable sibling");
+    EXPECT_TRUE(sched_take_resched(accounted) &&
+                    accounted->sched.runtime_sys_ns == 200 + charge,
+                "accounting discarded the nonempty kick or service charge");
+    TEST("budget expiry advances to the waiting task");
+    sched_put_current(accounted, SCHED_PUT_PREEMPTED);
+    EXPECT_TRUE(sched_worker_pick(0) == &tasks[1],
+                "budget expiry failed to advance to the waiting task");
+
+    reset();
     queue(0, 0, 1000000);
     thread_entry_t *running = sched_worker_pick(0);
     sched_account_cpu_ns(running, 8000000);
@@ -219,6 +263,83 @@ int main(void)
     TEST("runtime estimate decays by one quarter");
     EXPECT_EQ(tasks[0].sched.expected_runtime_ns, 7000000,
               "runtime estimate used a different decay");
+
+    reset();
+    sched_host_ops_t timer_ops = {
+        .live_sample = live_sample,
+        .wake_timer = wake_timer,
+    };
+    sched_set_host_ops(&timer_ops);
+    pinned(0, 0);
+    queue(0, 0, 1000000);
+    running = sched_worker_pick(0);
+    running->sched.fair_used_ns = running->sched.fair_slice_ns - 1;
+    uint64_t runtime_before = running->sched.runtime_ns;
+    live_calls = 0;
+    TEST("solo FAIR near expiry has no scheduler budget timer");
+    EXPECT_TRUE(sched_next_timer_ns() == 0 &&
+                    sched_run_timers(sched_now_ns()) == 0 && live_calls == 0,
+                "solo FAIR budget caused sampling or a timer wake");
+    sched_account_cpu_ns(running, 1);
+    TEST("solo FAIR exhausted budget leaves the task mounted");
+    EXPECT_TRUE(sched_next_timer_ns() == 0 && !sched_take_resched(running) &&
+                    live_calls == 0 &&
+                    running->sched.runtime_ns == runtime_before + 1 &&
+                    running->sched.fair_used_ns >= running->sched.fair_slice_ns,
+                "solo FAIR exhaustion lost accounting or reset the budget");
+    timer_wakes = 0;
+    pinned(1, 0);
+    queue(1, 0, 1000000);
+    TEST("FAIR enqueue restores timer pressure");
+    EXPECT_TRUE(timer_wakes != 0,
+                "a new contender did not notify the timer backend");
+    uint64_t before_timer = sched_now_ns();
+    uint64_t next_timer = sched_next_timer_ns();
+    TEST("FAIR contender makes an exhausted budget immediately due");
+    EXPECT_TRUE(next_timer >= before_timer &&
+                    next_timer <= sched_now_ns() + 1 && live_calls == 1 &&
+                    sched_run_timers(sched_now_ns()) == 1 &&
+                    sched_take_resched(running),
+                "contention lost the live sample or expired-budget kick");
+    sched_put_current(running, SCHED_PUT_PREEMPTED);
+    TEST("FAIR timer expiry advances the waiting task");
+    EXPECT_TRUE(sched_worker_pick(0) == &tasks[1],
+                "expired FAIR activation ran ahead of its contender");
+
+    reset();
+    sched_task_attrs_t rr = {.policy = SCHED_POLICY_RR, .rt_priority = 50};
+    bool rr_ok = sched_task_set_attr(&tasks[0], &rr) == 0;
+    pinned(0, 0);
+    queue(0, 0, 1000000);
+    running = sched_worker_pick(0);
+    live_calls = 0;
+    TEST("solo RR retains live budget sampling and timer");
+    EXPECT_TRUE(rr_ok && sched_next_timer_ns() != 0 && live_calls == 1,
+                "FAIR timer suppression changed RR enforcement");
+    sched_account_cpu_ns(running, SCHED_RR_QUANTUM_NS / 4);
+    uint64_t rr_left = running->sched.rr_remaining_ns;
+    (void) sched_next_timer_ns();
+    TEST("timer sampling preserves the unused RR quantum");
+    EXPECT_TRUE(rr_left == SCHED_RR_QUANTUM_NS * 3 / 4 &&
+                    running->sched.rr_remaining_ns == rr_left,
+                "timer sampling renewed or consumed the RR quantum");
+
+    reset();
+    dl_ok = sched_task_set_attr(&tasks[0], &dl) == 0;
+    pinned(0, 0);
+    queue(0, 0, 1000000);
+    running = sched_worker_pick(0);
+    live_calls = 0;
+    TEST("solo DEADLINE retains live budget sampling and timer");
+    EXPECT_TRUE(dl_ok && sched_next_timer_ns() != 0 && live_calls == 1,
+                "FAIR timer suppression changed DEADLINE enforcement");
+    live_exec_ns = running->sched.dl_runtime_left_ns;
+    TEST("solo DEADLINE still preempts at its runtime budget");
+    EXPECT_TRUE(
+        sched_run_timers(sched_now_ns()) == 1 && sched_take_resched(running),
+        "solo DEADLINE overrun did not request preemption");
+    live_exec_ns = 0;
+    sched_set_host_ops(NULL);
     reset();
     TEST("retiring tasks removes all estimated demand");
     EXPECT_TRUE(!sched_cpus[0].total_expected_runtime_ns &&

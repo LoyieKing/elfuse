@@ -67,6 +67,20 @@ queue. Runtime is settled before migration. Thread/group CPU clocks, CPU
 timers and scheduling budgets consume the same accounting source; waiting
 and host descheduling do not count as guest execution.
 
+Accounting updates task totals and scheduling budgets under `sched_lock`.
+The backend accumulates guest execution and syscall service separately and
+charges them together at 1 ms or mount completion. Live samples include the
+current phase. CPU-clock readers bracket settled counters with two samples
+of the same backend generation so a settlement cannot lose or duplicate time.
+An empty host-action set returns without copying callbacks or reacquiring
+the lock; wake, kick, timer and priority actions retain normal dispatch.
+Solo FAIR safe points and scheduler timer passes skip live budget sampling
+when no other task is runnable on that CPU. A solo FAIR budget has no scheduler
+deadline; the backend slice metronome still checks CPU-clock timers. Enqueue
+notifies the timer backend to restore the contended budget deadline. Expired
+budget remains expired, and CPU clocks, interval accounting and RT/DEADLINE
+budget sampling remain active.
+
 Wait completion publishes its result before making a task runnable. Task
 generation and wait sequence identify asynchronous work. Readiness, timeout,
 signal and teardown compete for one completion. Stopped or exiting tasks do

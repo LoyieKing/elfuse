@@ -50,10 +50,11 @@ build/elfuse. Do not overlap timing-sensitive test runs.
 `make check` also runs `test-sched-placement-host` against the scheduler core
 without HVF timing. It covers busy-CPU load selection, the 25 us early-out,
 deadline-demand tie breaking, affinity-filtered stealing, demand transfer,
-virtual timeline migration, peak/quarter-decay estimation and Linux RT/DL
-queue exclusion. `test-sched-policy-rt` waits for the FIFO runner's post-yield
-observation before the controller asserts ordering; peer waits have no timer
-that could change the FIFO queue order.
+virtual timeline migration, peak/quarter-decay estimation, Linux RT/DL queue
+exclusion, solo FAIR timer suppression and budget expiry after contention.
+RR and DEADLINE retain live budget sampling. `test-sched-policy-rt` waits for
+the FIFO runner's post-yield observation before the controller asserts
+ordering; peer waits have no timer that could change the FIFO queue order.
 
 ## Linux reference
 

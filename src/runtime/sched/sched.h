@@ -276,6 +276,16 @@ typedef struct sched_task_state {
     uint8_t affinity[SCHED_CPUSET_BYTES];
 } sched_task_state_t;
 
+/* One unsettled CPU-time sample from the execution backend. The validity and
+ * generation contract is stated on live_sample below.
+ */
+typedef struct sched_live_sample {
+    uint64_t exec_ns;    /* guest execution not yet reported */
+    uint64_t service_ns; /* host syscall service not yet reported */
+    uint64_t generation; /* interval this sample belongs to */
+    bool valid;          /* false: no coherent sample, pair unknown */
+} sched_live_sample_t;
+
 /* Host services the execution backend registers. NULL entries are permitted for
  * host unit tests; the core then simply does not wake or kick.
  */
@@ -289,19 +299,29 @@ typedef struct sched_host_ops {
      */
     void (*dl_overrun)(struct thread_entry *t);
 
-    /* Live guest-execution nanoseconds not yet settled through
-     * sched_account_cpu_ns() for a RUNNING task. Called without the scheduler
-     * lock held (the callback may take it for its slot lookup); must be safe
-     * under sig_lock -> thread_lock iteration.
+    /* One coherent sample of the CPU time this task has executed but not yet
+     * reported through sched_account_cpu_ns()/sched_account_service_ns(): guest
+     * execution and host syscall service, including the phase still in
+     * progress, from one reading. Every observer of the task must get the same
+     * answer, so the backend derives it from a single clock both sides can read
+     * rather than from one only the owner can: two such clocks disagree, and
+     * the value would move backwards.
+     *
+     * @valid is false when no coherent sample exists, which the backend reports
+     * only while it is between two updates of its own bookkeeping. Callers then
+     * treat the pair as unknown for that attempt, never as zero.
+     *
+     * @generation identifies the interval a valid sample belongs to: it changes
+     * whenever the backend moves time between the sample and its reported
+     * counters. Two valid samples whose generations are equal therefore bracket
+     * a settled snapshot that neither of them overlaps, which is how a caller
+     * adds a sample to the counters without counting an interval twice or
+     * losing one.
+     *
+     * Called without the scheduler lock held (the callback may take it for its
+     * slot lookup); must be safe under sig_lock -> thread_lock iteration.
      */
-    uint64_t (*live_exec_ns)(const struct thread_entry *t);
-
-    /* Live host syscall-service nanoseconds not yet settled through
-     * sched_account_service_ns() for a RUNNING task. Same call contract as
-     * live_exec_ns(). Both samples feed budget-expiry decisions, because
-     * service time is charged to the same runtime budgets.
-     */
-    uint64_t (*live_service_ns)(const struct thread_entry *t);
+    sched_live_sample_t (*live_sample)(const struct thread_entry *t);
 } sched_host_ops_t;
 
 void sched_set_host_ops(const sched_host_ops_t *ops);
@@ -423,6 +443,15 @@ void sched_account_cpu_ns(struct thread_entry *t, uint64_t ns);
  */
 void sched_account_service_ns(struct thread_entry *t, uint64_t ns);
 
+/* Report one interval of guest execution and host syscall service for @t as a
+ * single charge, so both counters and the budgets they feed advance together
+ * and a sampler sees one transition instead of two. Either part may be zero.
+ * Called before sched_put_current().
+ */
+void sched_account_interval_ns(struct thread_entry *t,
+                               uint64_t exec_ns,
+                               uint64_t service_ns);
+
 /* Reschedule requests */
 
 /* Request scheduling after the calling task's own return path completes. Never
@@ -446,8 +475,8 @@ uint64_t sched_cpu_weight_sum(int cpu);
 uint64_t sched_timeslice_ns(const struct thread_entry *t);
 
 /* Earliest absolute CLOCK_MONOTONIC time at which the scheduler needs a timer
- * event: fair slice expiry, RR quantum expiry, deadline replenishment or RT
- * bandwidth replenishment. 0 when no timer is needed.
+ * event: contended fair slice expiry, RR quantum expiry, deadline replenishment
+ * or RT bandwidth replenishment. 0 when no timer is needed.
  */
 uint64_t sched_next_timer_ns(void);
 
@@ -634,11 +663,13 @@ void sched_wake_parked_for_pending_signal(void);
 
 /* CPU clocks */
 
-/* Task CPU time in nanoseconds: settled runtime plus the unsettled live guest
- * and service deltas reported by the host's live_exec_ns / live_service_ns
- * callbacks. Wall time while the task is not executing is never substituted.
- * Safe from any thread; does not call back into the thread table and does not
- * call the live callbacks under the scheduler lock.
+/* Task CPU time in nanoseconds: settled runtime plus the unsettled guest and
+ * service deltas from the host's live_sample callback. A sample is added only
+ * when two readings of the same generation bracket the settled snapshot, so an
+ * interval that a settlement carried into the counters is never added twice and
+ * never dropped. Wall time while the task is not executing is never
+ * substituted. Safe from any thread; does not call back into the thread table
+ * and does not call the live callback under the scheduler lock.
  */
 uint64_t sched_thread_cputime_ns(const struct thread_entry *t);
 

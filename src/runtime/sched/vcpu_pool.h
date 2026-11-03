@@ -140,6 +140,12 @@ void vcpu_pool_refresh_mmu_template(uint64_t ttbr0,
 bool vcpu_pool_current_vcpu(hv_vcpu_t *out);
 bool vcpu_pool_current_vexit(hv_vcpu_exit_t **out);
 int vcpu_pool_current_cpu(void);
+
+/* Owner-side guest-entry and guest-exit boundary: publishes the memory-barrier
+ * state and accumulates the CPU time of the phase that just ended. The time
+ * reaches the scheduler in batches, and a live sample includes the batch not
+ * yet reported.
+ */
 void vcpu_pool_account_phase(bool entering_guest);
 
 /* Current logical CPU of @t if it is RUNNING on this pool, else its scheduler

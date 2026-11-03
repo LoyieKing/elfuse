@@ -173,8 +173,11 @@
  *                                    usbdev_loop_lock (usbdev.c)
  *                                    usbdev_fixture_lock (usbdev-fixture.c)
  *   wake_lock (syscall/wakeup-pipe.c)
+ *   pid_sequence_lock (syscall/proc.c)
  *   sched_lock (runtime/sched/sched.c)   pool_lock (runtime/sched/vcpu_pool.c)
  *   handle_lock (runtime/sched/vcpu_pool.c): per-slot HVF handle lifetime
+ *
+ * pid_sequence_lock serializes local users of the family PID counter.
  *
  * log_mutex is the one leaf every other entry may hold: a lock anywhere in
  * either list can log while held. It sits below the whole order rather than

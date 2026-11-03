@@ -677,23 +677,43 @@ bool proc_thread_resolve(int64_t tid,
     return found;
 }
 
+/* flock serializes family members; the mutex serializes users of this process's
+ * shared open description, for which repeated flock calls do not exclude peers.
+ */
+static pthread_mutex_t pid_sequence_lock = PTHREAD_MUTEX_INITIALIZER;
+static int pid_sequence_fd = -1;
+static bool pid_sequence_owner_reset;
+
+static void pid_sequence_close(void)
+{
+    if (pid_sequence_fd >= 0)
+        close(pid_sequence_fd);
+}
+
 int64_t proc_alloc_pid(void)
 {
-    static _Atomic bool owner_sequence_reset;
-    char path[PATH_MAX];
-    if (!process_pid_sequence_path(path, sizeof(path)))
-        return -LINUX_EAGAIN;
-
-    if (absock_namespace_is_owner() &&
-        !atomic_exchange_explicit(&owner_sequence_reset, true,
-                                  memory_order_relaxed))
-        unlink(path);
-
-    int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (fd < 0)
-        return -LINUX_EAGAIN;
+    pthread_mutex_lock(&pid_sequence_lock);
+    if (pid_sequence_fd < 0) {
+        char path[PATH_MAX];
+        if (!process_pid_sequence_path(path, sizeof(path))) {
+            pthread_mutex_unlock(&pid_sequence_lock);
+            return -LINUX_EAGAIN;
+        }
+        if (absock_namespace_is_owner() && !pid_sequence_owner_reset) {
+            unlink(path);
+            pid_sequence_owner_reset = true;
+        }
+        pid_sequence_fd =
+            open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (pid_sequence_fd < 0) {
+            pthread_mutex_unlock(&pid_sequence_lock);
+            return -LINUX_EAGAIN;
+        }
+        atexit(pid_sequence_close);
+    }
+    int fd = pid_sequence_fd;
     if (flock_retry(fd, LOCK_EX) != 0) {
-        close(fd);
+        pthread_mutex_unlock(&pid_sequence_lock);
         return -LINUX_EAGAIN;
     }
 
@@ -731,13 +751,13 @@ int64_t proc_alloc_pid(void)
             goto out;
         done += (size_t) n;
     }
-    if (ftruncate(fd, (off_t) sizeof(next)) != 0)
+    if (st.st_size == 0 && ftruncate(fd, (off_t) sizeof(next)) != 0)
         goto out;
     result = pid;
 
 out:
     flock_retry(fd, LOCK_UN);
-    close(fd);
+    pthread_mutex_unlock(&pid_sequence_lock);
     return result;
 }
 
