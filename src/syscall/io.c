@@ -291,6 +291,8 @@ int64_t io_retry_backoff(unsigned *backoff_us)
  */
 #define IO_WAIT_BATCH 64
 #define IO_WAIT_RECHECK_NS (200ULL * 1000 * 1000)
+/* Record locks, semaphores and FIFO opens have no readiness notification. */
+#define IO_WAIT_RETRY_NS (1000ULL * 1000)
 #define IO_WAIT_USER_IDENT 1
 
 typedef struct io_wait_reg {
@@ -680,7 +682,8 @@ static bool io_wait_register(thread_entry_t *t,
         }
     }
     if (!fully_watched || watched == 0)
-        reg->recheck_ns = io_mono_ns() + IO_WAIT_RECHECK_NS;
+        reg->recheck_ns =
+            io_mono_ns() + (nsrc == 0 ? IO_WAIT_RETRY_NS : IO_WAIT_RECHECK_NS);
     reg->next = io_wait_head;
     io_wait_head = reg;
     pthread_mutex_unlock(&io_wait_lock);
@@ -862,7 +865,8 @@ int64_t io_park_unmount_multi(const io_wait_source_t *sources,
          * deadline is harmless (the scan ignores an inactive park) and the next
          * arm clears it.
          */
-        uint64_t wake_at = io_mono_ns() + IO_WAIT_RECHECK_NS;
+        uint64_t wake_at =
+            io_mono_ns() + (nsrc == 0 ? IO_WAIT_RETRY_NS : IO_WAIT_RECHECK_NS);
         if (guest_dl != 0 && guest_dl < wake_at)
             wake_at = guest_dl;
         sched_arm_wait_deadline(self, wake_at);

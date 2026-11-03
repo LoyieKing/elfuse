@@ -32,6 +32,12 @@ Guest test builds additionally require:
 - An AArch64 Linux cross-compiler for C test programs
 - An AArch64 bare-metal toolchain for the assembly smoke test
 
+`make elfuse-gtk` and `make test-gtk-native-host` additionally require GTK
+4.24 or newer and `pkg-config` (`brew install gtk4 pkg-config`). These targets
+do not add GTK to `build/elfuse` or to the default test gate. GUI guests need
+their own Linux GTK libraries and fonts in the sysroot; see
+[Native macOS GTK Windows](usage.md#native-macos-gtk-windows).
+
 The toolchain defaults are defined in `mk/toolchain.mk`.
 These variables are intended to be overridden when needed:
 
@@ -1064,6 +1070,11 @@ and exited zero after both detach and abrupt debugger disconnect.
 A record-lock smoke held a conflicting lock for 20 ms. F_SETLKW returned after
 201.119 ms with the descriptorless 200 ms recheck, and after 24.935 ms with
 the 1 ms retry. Descriptor-backed fallback waits retain the 200 ms interval.
+The repeated lock smoke measured 21.586 ms; flock, fd pin and msync each passed
+nine checks. Solo FAIR timer suppression passed 26 scheduler host checks and
+guest preemption, wake balance, CPU clocks, RR rotation and retained quantum,
+and DEADLINE throttle/yield scenarios. RT/DEADLINE ran with --fakeroot.
+make check-format passed with COMMENTFLOW=/private/tmp/commentflow.
 
 
 

@@ -14,11 +14,13 @@
  */
 
 #include <errno.h>
+#include <stdbool.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "test-harness.h"
@@ -145,6 +147,51 @@ int main(void)
             kill(child, SIGKILL);
             waitpid(child, NULL, 0);
         }
+    }
+
+    TEST("F_SETLKW waits for release and acquires");
+    int ready_pipe[2], go_pipe[2];
+    if (pipe(ready_pipe) != 0 || pipe(go_pipe) != 0) {
+        FAIL("pipe failed");
+    } else {
+        pid_t child = fork();
+        if (child == 0) {
+            close(ready_pipe[0]);
+            close(go_pipe[1]);
+            char go;
+            if (set_lock(fd, F_WRLCK, CHILD_LOCK_BYTE, 1) != 0 ||
+                write(ready_pipe[1], "x", 1) != 1 ||
+                read(go_pipe[0], &go, 1) != 1)
+                _exit(1);
+            usleep(20000);
+            if (set_lock(fd, F_UNLCK, CHILD_LOCK_BYTE, 1) != 0)
+                _exit(2);
+            _exit(0);
+        }
+        close(ready_pipe[1]);
+        close(go_pipe[0]);
+        char ready;
+        bool ok = child > 0 && read(ready_pipe[0], &ready, 1) == 1;
+        struct timespec before, after;
+        struct flock requested = {.l_type = F_WRLCK,
+                                  .l_whence = SEEK_SET,
+                                  .l_start = CHILD_LOCK_BYTE,
+                                  .l_len = 1};
+        if (ok) {
+            clock_gettime(CLOCK_MONOTONIC, &before);
+            ok = write(go_pipe[1], "x", 1) == 1 &&
+                 fcntl(fd, F_SETLKW, &requested) == 0;
+            clock_gettime(CLOCK_MONOTONIC, &after);
+            double elapsed = (after.tv_sec - before.tv_sec) +
+                             (after.tv_nsec - before.tv_nsec) / 1e9;
+            ok = ok && elapsed >= 0.015;
+        }
+        int status = -1;
+        if (child > 0)
+            waitpid(child, &status, 0);
+        EXPECT_TRUE(ok && status == 0, "wait did not preserve lock ordering");
+        close(ready_pipe[0]);
+        close(go_pipe[1]);
     }
 
     close(fd);
