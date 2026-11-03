@@ -15,7 +15,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 
 #include "test-harness.h"
@@ -192,6 +194,85 @@ static void test_shared_hint_coherence(void)
     close(fd);
 }
 
+static void test_shared_overlay_preserves_neighbor(bool fixed)
+{
+    const size_t page = 4096;
+    const size_t span = 4 * page;
+    const size_t length = 3 * page;
+    unsigned char *base = reserve_free_low_hint(2 * span);
+    char path[] = "/tmp/elfuse-overlay-neighbor-XXXXXX";
+    int fd = mkstemp(path);
+    unsigned char *neighbor = MAP_FAILED;
+    void *mapped = MAP_FAILED;
+    TEST(fixed ? "fixed short shared overlay setup"
+               : "short shared overlay hint setup");
+    if (base == MAP_FAILED || fd < 0) {
+        FAIL("reserve or mkstemp failed");
+        goto out;
+    }
+    unlink(path);
+    if (ftruncate(fd, (off_t) span) != 0) {
+        FAIL("ftruncate failed");
+        goto out;
+    }
+    neighbor = mmap(base + length, page, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (neighbor == MAP_FAILED) {
+        FAIL("neighbor mmap failed");
+        goto out;
+    }
+    memset(neighbor, 0xa5, page);
+    if (munmap(base, length) != 0) {
+        FAIL("opening preceding gap failed");
+        goto out;
+    }
+    mapped = mmap(base, length, PROT_READ | PROT_WRITE,
+                  MAP_SHARED | (fixed ? MAP_FIXED : 0), fd, 0);
+    bool rejected = fixed && mapped == MAP_FAILED && errno == ENOMEM;
+    if (mapped == MAP_FAILED && !rejected) {
+        FAIL("shared mmap failed");
+        goto out;
+    }
+    PASS();
+    struct utsname uts;
+    if (!fixed && uname(&uts) == 0 && !strcmp(uts.nodename, "elfuse")) {
+        TEST(
+            "short shared overlay skips a gap with an occupied host-page tail");
+        EXPECT_TRUE(mapped != base, "overlay allocation reused a short gap");
+    }
+    TEST(fixed ? "fixed shared overlay preserves live neighbor"
+               : "shared overlay preserves live neighbor");
+    bool intact = true;
+    for (size_t i = 0; i < page; i++)
+        intact &= neighbor[i] == 0xa5;
+    EXPECT_TRUE(intact, "overlay replaced neighboring guest-page bytes");
+    if (mapped != MAP_FAILED) {
+        volatile unsigned char *bytes = mapped;
+        bytes[0] = 0x6b;
+        unsigned char stored = 0;
+        TEST("short shared overlay keeps live file backing");
+        EXPECT_TRUE(pread(fd, &stored, 1, 0) == 1 && stored == 0x6b,
+                    "shared mapping became a private snapshot");
+        munmap(mapped, length);
+    }
+    mapped = MAP_FAILED;
+    TEST(fixed ? "fixed shared overlay teardown preserves neighbor"
+               : "shared overlay teardown preserves neighbor");
+    intact = true;
+    for (size_t i = 0; i < page; i++)
+        intact &= neighbor[i] == 0xa5;
+    EXPECT_TRUE(intact, "overlay teardown zeroed neighboring guest-page bytes");
+out:
+    if (mapped != MAP_FAILED)
+        munmap(mapped, length);
+    if (base != MAP_FAILED)
+        munmap(base, 2 * span);
+    if (fd >= 0) {
+        close(fd);
+        unlink(path);
+    }
+}
+
 static void test_varying_size_churn(void)
 {
     TEST("varying-size mmap churn retains bounded live coverage");
@@ -243,6 +324,8 @@ int main(void)
     test_shared_file_hint_falls_back_from_2m_alignment();
     test_guest_page_hint();
     test_shared_hint_coherence();
+    test_shared_overlay_preserves_neighbor(false);
+    test_shared_overlay_preserves_neighbor(true);
     test_varying_size_churn();
     SUMMARY("test-mmap-hint");
     return fails ? 1 : 0;

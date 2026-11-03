@@ -3383,6 +3383,26 @@ int64_t sys_mmap(guest_t *g,
             }
         }
 
+        /* A host-page overlay cannot replace bytes outside MAP_FIXED's range.
+         * Refuse an occupied tail instead of silently making it private.
+         */
+        if (!is_anon && !is_prot_none && (flags & LINUX_MAP_SHARED) &&
+            overlay_fd_writable(host_backing_fd) &&
+            result_off % host_page_size_cached() == 0 &&
+            (uint64_t) offset % host_page_size_cached() == 0) {
+            uint64_t host_length;
+            if (!align_up_ok(length, host_page_size_cached(), &host_length) ||
+                !window_fits(result_off, host_length, g->guest_size) ||
+                guest_range_hits_infra(g, result_off,
+                                       result_off + host_length) ||
+                (host_length > length &&
+                 region_range_overlaps(g, result_off + length,
+                                       result_off + host_length))) {
+                mmap_fresh_dispose(&fresh);
+                return -LINUX_ENOMEM;
+            }
+        }
+
         if (is_anon) {
             int i = guest_region_first_end_above(g, result_off);
             if (i < g->nregions) {
@@ -3665,6 +3685,15 @@ int64_t sys_mmap(guest_t *g,
         }
 
         uint64_t align = host_page_size_cached();
+        uint64_t allocation_length = length;
+        /* Gap admission includes every byte the host overlay replaces. */
+        if (!is_anon && !is_prot_none && (flags & LINUX_MAP_SHARED) &&
+            overlay_fd_writable(host_backing_fd) &&
+            (uint64_t) offset % align == 0 &&
+            !align_up_ok(length, align, &allocation_length)) {
+            mmap_fresh_dispose(&fresh);
+            return -LINUX_ENOMEM;
+        }
 
         /* Private mappings can retain a guest-page hint. Shared aliases need
          * host-page placement to keep live file backing instead of snapshots.
@@ -3674,9 +3703,9 @@ int64_t sys_mmap(guest_t *g,
             uint64_t hint = ALIGN_DOWN(addr - g->ipa_base, GUEST_PAGE_SIZE);
             if (hint >= GUEST_PAGE_SIZE &&
                 (!(flags & LINUX_MAP_SHARED) || hint % align == 0) &&
-                window_fits(hint, length, g->mmap_limit) &&
-                !guest_range_hits_infra(g, hint, hint + length) &&
-                !region_range_overlaps(g, hint, hint + length)) {
+                window_fits(hint, allocation_length, g->mmap_limit) &&
+                !guest_range_hits_infra(g, hint, hint + allocation_length) &&
+                !region_range_overlaps(g, hint, hint + allocation_length)) {
                 uint64_t host_start = ALIGN_DOWN(hint, align);
                 uint64_t host_end = ALIGN_UP(hint + length, align);
                 bool live_overlay = false;
@@ -3695,7 +3724,7 @@ int64_t sys_mmap(guest_t *g,
              * permission.
              */
             if (result_off == UINT64_MAX)
-                result_off = find_free_gap(g, length, MMAP_RX_BASE,
+                result_off = find_free_gap(g, allocation_length, MMAP_RX_BASE,
                                            g->mmap_limit, align);
             if (result_off == UINT64_MAX) {
                 log_debug(
@@ -3722,7 +3751,7 @@ int64_t sys_mmap(guest_t *g,
             if (result_off == UINT64_MAX && addr != 0) {
                 uint64_t hint_off = addr - g->ipa_base;
                 if (hint_off >= ELF_DEFAULT_BASE && hint_off <= g->mmap_limit &&
-                    length <= g->mmap_limit - hint_off) {
+                    allocation_length <= g->mmap_limit - hint_off) {
                     /* Real Linux treats non-fixed mmap(addr!=0) as a strong
                      * hint, including low canonical addresses such as the
                      * traditional x86-64 ET_EXEC base at 0x400000. box64 uses
@@ -3738,13 +3767,14 @@ int64_t sys_mmap(guest_t *g,
                     uint64_t hint_max =
                         (hint_off < MMAP_BASE) ? MMAP_BASE : g->mmap_limit;
                     if (result_off == UINT64_MAX)
-                        result_off = find_free_gap_inner(g, length, hint_off,
-                                                         hint_max, align, NULL);
+                        result_off =
+                            find_free_gap_inner(g, allocation_length, hint_off,
+                                                hint_max, align, NULL);
                 }
             }
             if (result_off == UINT64_MAX)
-                result_off =
-                    find_free_gap(g, length, MMAP_BASE, g->mmap_limit, align);
+                result_off = find_free_gap(g, allocation_length, MMAP_BASE,
+                                           g->mmap_limit, align);
             if (result_off == UINT64_MAX) {
                 log_debug(
                     "mmap: RW address space exhausted "
@@ -3907,17 +3937,8 @@ int64_t sys_mmap(guest_t *g,
     if (!is_anon && fd >= 0 && !is_prot_none) {
         size_t hps = host_page_size_cached();
 
-        /* mmap rounds length up to the host page size internally; only addr and
-         * offset alignment matter for MAP_FIXED on macOS Apple Silicon (16 KiB
-         * host pages). The "extra" trailing bytes inside the host page are
-         * never reachable by the guest because the gap-finder advances the hint
-         * to the next host-page boundary after each allocation. MAP_SHARED |
-         * PROT_WRITE against a backing fd opened without write access must fail
-         * EACCES, matching Linux. The alignment-mismatch and read-only-fd cases
-         * below both fall through to the pread snapshot path, which always
-         * succeeds -- without this check a writable shared mapping request on a
-         * read-only fd would be silently downgraded to a private snapshot
-         * instead of being rejected.
+        /* Writable shared mappings need a writable backing fd even when host
+         * alignment prevents a live overlay; see mmap(2), EACCES.
          */
         if ((flags & LINUX_MAP_SHARED) && (prot & LINUX_PROT_WRITE) &&
             !overlay_fd_writable(host_backing_fd)) {

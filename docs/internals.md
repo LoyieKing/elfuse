@@ -262,6 +262,13 @@ overlay teardown precedes any private slab reset. Fork clones inherit the
 policy and reset their own backing. Exec resets tracked `PROT_NONE` ranges too,
 since permission revocation does not imply that the pages were never written.
 
+Writable file-backed `MAP_SHARED` overlays occupy whole host pages. Non-fixed
+placement checks that rounded extent, including a strong address hint, before
+choosing a gap. A fixed mapping whose rounded tail intersects another guest
+mapping fails with `ENOMEM` before replacing bytes or page tables; it does not
+fall back to a private snapshot. A successful overlay keeps live file and alias
+coherence without replacing neighboring guest pages.
+
 The mmap RW region starts at 8 GiB to match real Linux kernel address-space
 layout, where `mmap` allocations sit well above text/data/brk.
 
