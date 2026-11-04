@@ -9,6 +9,7 @@ test-futex-waitv-buckets
 test-futex-pi
 test-futex-wake-op
 test-futex-wake-nowaiter
+test-futex-shared-alias
 test-robust-futex
 test-socket-blockwrite-signal
 test-sigpipe

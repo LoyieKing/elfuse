@@ -12,13 +12,11 @@
  * a call with a valid but already-expired timeout still gets EAGAIN rather than
  * ETIMEDOUT when the word moved.
  *
- * That order is the whole content of this file, because it is the part an
- * implementation gets wrong by serving the easy answer first. elfuse answers
- * the moved-word case at EL1 without reaching the host, so its fast path has to
- * read and check the timespec before it may answer, and hand over anything it
- * cannot check. The seconds it accepts are deliberately a narrower range than
- * the host's, so a value between the two has to come back the same either way:
- * the tv_sec = 2^32 case below is that boundary.
+ * The moved-word case can return at EL1 without reaching the host, so its fast
+ * path must validate the timespec first and hand over anything it cannot check.
+ * The tv_sec = 2^32 case covers the boundary between the narrower EL1 range and
+ * the host range. Matching-word waits also check that future WAIT_BITSET and
+ * WAIT_REQUEUE_PI deadlines use monotonic time unless CLOCK_REALTIME is set.
  *
  * Every assertion is plain Linux futex ABI, so the reference kernel adjudicates
  * this file unchanged.
@@ -42,6 +40,26 @@ static long wait_to(int *word, int val, int op, const struct timespec *to)
 {
     return raw_syscall6(__NR_futex, (long) word, op, val, (long) to, 0,
                         FUTEX_BITSET_MATCH_ANY);
+}
+
+static void check_future_deadline(int op, clockid_t clock)
+{
+    int word = 0, pi_word = 0;
+    struct timespec deadline, before, after;
+    clock_gettime(clock, &deadline);
+    deadline.tv_nsec += 50000000;
+    if (deadline.tv_nsec >= 1000000000) {
+        deadline.tv_nsec -= 1000000000;
+        deadline.tv_sec++;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &before);
+    long rc = raw_syscall6(__NR_futex, (long) &word, op, 0, (long) &deadline,
+                           (long) &pi_word, FUTEX_BITSET_MATCH_ANY);
+    clock_gettime(CLOCK_MONOTONIC, &after);
+    long elapsed = (after.tv_sec - before.tv_sec) * 1000000000L +
+                   after.tv_nsec - before.tv_nsec;
+    EXPECT_TRUE(rc == -ETIMEDOUT && elapsed >= 40000000,
+                "future deadline expired before its clock reached it");
 }
 
 int main(void)
@@ -121,6 +139,18 @@ int main(void)
     TEST("unaligned address with a timeout");
     EXPECT_RAW_ERRNO(wait_to((int *) ((char *) &word + 1), 0, WAIT_OP, &zero),
                      -EINVAL, "expected EINVAL");
+
+    TEST("bitset default deadline uses monotonic time");
+    check_future_deadline(BITSET_OP, CLOCK_MONOTONIC);
+    TEST("bitset realtime deadline honors clock flag");
+    check_future_deadline(BITSET_OP | FUTEX_CLOCK_REALTIME, CLOCK_REALTIME);
+    TEST("requeue PI default deadline uses monotonic time");
+    check_future_deadline(FUTEX_WAIT_REQUEUE_PI | FUTEX_PRIVATE_FLAG,
+                          CLOCK_MONOTONIC);
+    TEST("requeue PI realtime deadline honors clock flag");
+    check_future_deadline(
+        FUTEX_WAIT_REQUEUE_PI | FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME,
+        CLOCK_REALTIME);
 
     SUMMARY("test-futex-timed");
     return fails ? 1 : 0;

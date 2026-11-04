@@ -736,10 +736,25 @@ exception from changing the resumed task's dispatch or signal information.
   in `src/syscall/syscall.c`, and `robust_list_walk()` releases owned
   futexes on thread exit, marking them `FUTEX_OWNER_DIED`.
 
-Wait queues live in a hash table keyed by guest virtual address, with a
-per-bucket mutex. Each waiter has its own condition variable for precise
-wakeup. Thread exit calls `futex_wake_one()` on `clear_child_tid`, which is
-how `pthread_join()` waits via the TID address.
+`FUTEX_WAIT` takes a relative timeout. `FUTEX_WAIT_BITSET` and
+`FUTEX_WAIT_REQUEUE_PI` take absolute monotonic deadlines unless
+`FUTEX_CLOCK_REALTIME` is set; `FUTEX_LOCK_PI` uses absolute realtime.
+The host wait machinery uses realtime deadlines, so monotonic deadlines
+are converted at entry. `test-futex-timed` checks future deadlines with
+both clock selections as well as timeout validation and error precedence.
+
+Wait queues live in a hash table keyed by a futex key captured when the
+operation starts. A private key is this process plus the raw guest address.
+A shared key is the backing object's device and inode plus the file offset
+of the word, so two MAP_SHARED mappings of one object and offset name one
+queue. The key is snapshotted under mmap_lock and then compared as stored:
+a later munmap of the waiter's mapping does not retarget a sleeper, and a
+waker does not re-read that sleeper's region. Each bucket has its own mutex
+and each waiter its own condition variable. The EL1 wake fast path answers
+only a private wake whose raw-address bucket is empty; a shared wake always
+reaches the host, because the shim cannot see the backing identity. Thread
+exit calls futex_wake_one() on clear_child_tid, which is how pthread_join()
+waits via the TID address.
 
 Atomicity: the bucket mutex is held across the futex word read and the
 waiter enqueue, so the compare-and-wait is a single critical section.

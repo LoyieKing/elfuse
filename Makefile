@@ -736,6 +736,12 @@ $(BUILD_DIR)/test-futex-wake-nowaiter: tests/test-futex-wake-nowaiter.c \
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
+# test-futex-shared-alias waits on one MAP_SHARED mapping and wakes another.
+$(BUILD_DIR)/test-futex-shared-alias: tests/test-futex-shared-alias.c \
+    | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
 # test-shim-futex-fast spawns a waker thread for the matching-word case, which
 # is the one branch of the futex fast path that must decline and block.
 $(BUILD_DIR)/test-shim-futex-fast: tests/test-shim-futex-fast.c | $(BUILD_DIR)

@@ -181,6 +181,9 @@ test-futex-wake-nowaiter
 [section] FUTEX_REQUEUE accounting
 test-futex-requeue-account
 
+[section] Shared MAP_SHARED futex aliases
+test-futex-shared-alias
+
 [section] Robust futex tests
 test-robust-futex
 

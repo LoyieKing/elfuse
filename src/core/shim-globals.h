@@ -179,9 +179,12 @@
 
 /* Per-bucket futex waiter counts, one uint32 per hash bucket of the table in
  * runtime/futex.c. The shim's wake fast path reads one of these to answer a
- * FUTEX_WAKE that has nobody to wake: a zero count for the bucket a uaddr
- * hashes to proves no waiter is parked on that address, and the syscall's whole
- * result is then 0.
+ * private FUTEX_WAKE that has nobody to wake: a zero count for the bucket a raw
+ * uaddr hashes to proves no private waiter is parked on that address, and the
+ * syscall's whole result is then 0. A shared wake does not consult the table.
+ * Its waiter is queued under the backing object and file offset, which this
+ * raw-address hash cannot name, so the shim hands every shared wake to the
+ * host.
  *
  * A count rather than the one-bit-per-slot the urandom bitmap uses, because
  * waiters nest: two threads on one bucket must not let the first to leave clear

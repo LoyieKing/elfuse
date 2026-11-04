@@ -5,18 +5,19 @@
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Hash table of wait queues keyed by guest virtual address. Each bucket has its
- * own mutex for fine-grained locking. Waiters are singly-linked lists with
- * per-waiter condition variables for precise wakeup.
+ * Hash table of wait queues keyed by a futex_key_t captured when the operation
+ * starts. A private key is this process plus the raw guest address. A shared
+ * key is the backing object and the file offset of the word, so two MAP_SHARED
+ * mappings of one object and offset name one queue. Each bucket has its own
+ * mutex. Waiters are singly-linked lists with per-waiter condition variables.
  *
- * Atomicity: The critical FUTEX_WAIT race (guest writes futex word after the
- * current read but before the waiter sleeps) is prevented by holding the bucket
- * lock across the word-read + enqueue + cond_wait sequence. FUTEX_WAKE also
- * acquires the same bucket lock, so a wake cannot slip between the read and the
- * wait.
+ * Atomicity: the critical FUTEX_WAIT race (guest writes the futex word after
+ * the current read but before the waiter sleeps) is prevented by holding the
+ * bucket lock across the word-read, enqueue, and cond_wait. FUTEX_WAKE takes
+ * the same bucket lock, so a wake cannot slip between the read and the wait.
  *
- * Timeout: FUTEX_WAIT with a non-NULL timeout uses pthread_cond_timedwait with
- * an absolute deadline. FUTEX_WAIT_BITSET always uses absolute time.
+ * Timeout: FUTEX_WAIT with a non-NULL timeout uses an absolute deadline.
+ * FUTEX_WAIT_BITSET always uses absolute time.
  */
 
 #include <errno.h>
@@ -28,6 +29,7 @@
 #include <string.h>
 #include <time.h>
 #include <limits.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 
 #include "utils.h"
@@ -39,6 +41,7 @@
 #include "runtime/sched/sched.h"
 #include "runtime/sched/exec.h"
 
+#include "syscall/internal.h"
 #include "syscall/linux-wire.h"
 #include "syscall/proc.h"
 #include "syscall/signal.h"
@@ -72,9 +75,9 @@ static _Atomic int futex_interrupt_requested = 0;
 #define FUTEX_WAIT_REQUEUE_PI 11
 #define FUTEX_CMP_REQUEUE_PI 12
 
-/* Strips the FUTEX_PRIVATE_FLAG (0x80) and FUTEX_CLOCK_REALTIME bits so the
- * dispatch switch sees only the base operation. Emulation doesn't differentiate
- * private vs shared futexes (single-process guest).
+/* Strips FUTEX_PRIVATE_FLAG (0x80) and FUTEX_CLOCK_REALTIME so the dispatch
+ * switch sees only the base operation. The private bit is not part of the
+ * command: it selects the key, below.
  */
 #define FUTEX_CMD_MASK 0x7F
 
@@ -87,6 +90,7 @@ static _Atomic int futex_interrupt_requested = 0;
 /* Unlock + clear list_op_pending in one futex op (newer Linux uapi). */
 #define FUTEX_ROBUST_UNLOCK 512
 #define FUTEX_ROBUST_LIST32 1024
+#define FUTEX_PRIVATE_FLAG 0x80
 
 /* core/shim.S futex_wait_fast decodes the same three values as immediates,
  * because assembly cannot see these defines. That leaves the shim serving a
@@ -173,8 +177,16 @@ _Static_assert(FUTEX_HASH_MULT == 0x9E3779B97F4A7C15ULL,
 struct futex_pi_lock;
 struct futex_waitv_group;
 
+typedef struct futex_key {
+    bool shared;     /* MAP_SHARED word; private otherwise */
+    uint64_t uaddr;  /* Guest VA. Private identity, and the word's location. */
+    uint64_t dev;    /* Host st_dev of the backing object. Shared only. */
+    uint64_t ino;    /* Host st_ino of the backing object. Shared only. */
+    uint64_t offset; /* Byte offset of the word in that object. Shared only. */
+} futex_key_t;
+
 typedef struct futex_waiter {
-    uint64_t uaddr;            /* Guest VA being waited on */
+    futex_key_t key;           /* Identity captured at enqueue */
     uint32_t bitset;           /* For WAIT_BITSET matching */
     pthread_cond_t cond;       /* Signalled by WAKE to unblock this waiter */
     _Atomic int woken;         /* Set to 1 by WAKE before signalling */
@@ -335,11 +347,108 @@ static futex_bucket_t buckets[FUTEX_BUCKETS];
  * futexes 256 bytes apart landed in one bucket of 64; eight a page apart landed
  * in two buckets, and stayed in two however wide the table grew, so widening
  * relocated the collapse rather than fixing it and the hash had to change with
- * it.
+ * it. Private bucket. The shim recomputes this from the raw address, so a
+ * private wake with an empty bucket can be answered there. A shared key mixes
+ * the backing identity in as well, which the shim cannot see; those wakes take
+ * the host path.
  */
-static inline unsigned futex_hash(uint64_t uaddr)
+static inline unsigned futex_hash_private(uint64_t uaddr)
 {
     return futex_bucket_index(uaddr, FUTEX_BUCKETS);
+}
+
+static inline unsigned futex_hash_key(const futex_key_t *key)
+{
+    if (!key->shared)
+        return futex_hash_private(key->uaddr);
+    uint64_t mixed = key->offset ^ (key->dev * FUTEX_HASH_MULT) ^
+                     (key->ino * (FUTEX_HASH_MULT << 1));
+    return futex_bucket_index(mixed, FUTEX_BUCKETS);
+}
+
+static bool futex_key_equal(const futex_key_t *a, const futex_key_t *b)
+{
+    if (a->shared != b->shared)
+        return false;
+    if (!a->shared)
+        return a->uaddr == b->uaddr;
+    return a->dev == b->dev && a->ino == b->ino && a->offset == b->offset;
+}
+
+/* Snapshot the identity of the word at @uaddr. A private op keeps the raw
+ * address and does not look the mapping up: an unmapped private wake is 0,
+ * which is what the shim already answers, so this returns true for it. A shared
+ * word records the backing object and the file offset of that word. The
+ * snapshot is taken under mmap_lock and then used as-is: a later munmap of the
+ * waiter's mapping does not retarget it, and a waker does not re-read the
+ * waiter's region.
+ *
+ * Returns false when a shared address is not mapped. The caller answers EFAULT.
+ * fstat failure on a file-backed shared mapping is also a fault: inventing a
+ * private key there would split two aliases of one object.
+ */
+static bool futex_key_get(guest_t *g,
+                          uint64_t uaddr,
+                          bool shared,
+                          futex_key_t *out)
+{
+    out->shared = false;
+    out->uaddr = uaddr;
+    out->dev = 0;
+    out->ino = 0;
+    out->offset = 0;
+
+    /* A private key is the raw address. An unmapped private wake is 0, the same
+     * answer the shim gives, so this path must not translate the address or
+     * turn that wake into EFAULT.
+     */
+    if (!shared || !g)
+        return true;
+
+    mmap_lock_acquire();
+    const guest_region_t *r = guest_region_find(g, uaddr);
+    bool readable = guest_ptr(g, uaddr) != NULL;
+    if (!r || !r->shared || !readable) {
+        mmap_lock_release();
+        return readable;
+    }
+
+    uint64_t delta = uaddr - r->start;
+    if (r->backing_fd >= 0) {
+        struct stat st;
+        if (fstat(r->backing_fd, &st) < 0) {
+            mmap_lock_release();
+            return false;
+        }
+        out->shared = true;
+        out->dev = (uint64_t) st.st_dev;
+        out->ino = (uint64_t) st.st_ino;
+        out->offset = r->offset + delta;
+    } else {
+        /* MAP_SHARED|MAP_ANONYMOUS has no file. vma_id names the lineage a
+         * split keeps, and offset is advanced by the same split, so the word's
+         * place in that lineage is offset plus the delta inside this piece.
+         */
+        out->shared = true;
+        out->dev = 0;
+        out->ino = r->vma_id;
+        out->offset = r->offset + delta;
+    }
+    mmap_lock_release();
+    return true;
+}
+
+/* Install @src as @dst's identity and point the word at @uaddr. A requeue moves
+ * the captured backing with the waiter and retargets the guest address, so a
+ * later private wake matches the destination address rather than the one the
+ * waiter parked on.
+ */
+static void futex_key_retarget(futex_key_t *dst,
+                               const futex_key_t *src,
+                               uint64_t uaddr)
+{
+    *dst = *src;
+    dst->uaddr = uaddr;
 }
 
 /* Linux requires a futex word to be naturally aligned, and every op checks this
@@ -422,11 +531,14 @@ static futex_bucket_t *futex_waiter_follow(futex_bucket_t *b,
     }
 }
 
-/* Whether any waiter on @uaddr is queued in @b. Caller must hold b->lock. */
-static bool bucket_has_uaddr_locked(const futex_bucket_t *b, uint64_t uaddr)
+/* Whether any waiter captured as @key is queued in @b. Caller holds b->lock.
+ * The comparison is the snapshot, not a fresh lookup of the waiter's mapping.
+ */
+static bool bucket_has_key_locked(const futex_bucket_t *b,
+                                  const futex_key_t *key)
 {
     for (const futex_waiter_t *w = b->head; w; w = w->next) {
-        if (w->uaddr == uaddr)
+        if (futex_key_equal(&w->key, key))
             return true;
     }
     return false;
@@ -552,6 +664,7 @@ typedef struct {
     guest_t *park_guest;
     bool pi_lock_pi;
     bool requeue_pi;
+    bool shared; /* key.shared, snapshotted with uaddr */
 } futex_async_wake_t;
 
 static _Thread_local futex_async_wake_t *futex_async_wake_q;
@@ -578,7 +691,8 @@ static void futex_async_wake_queue(futex_waiter_t *w)
     e->owner = owner;
     e->async = w->waitv_group ? futex_waitv_tag(w->waitv_group) : (void *) w;
     e->park_seq = sched_park_seq(owner);
-    e->uaddr = w->uaddr;
+    e->uaddr = w->key.uaddr;
+    e->shared = w->key.shared;
     e->requeue_pi_uaddr = w->requeue_pi_uaddr;
     e->waiter_tid = w->waiter_tid;
     e->park_guest = owner->park_guest;
@@ -660,14 +774,14 @@ static void futex_wake_waiter_locked(futex_waiter_t **pp)
         futex_async_wake_queue(w);
 }
 
-/* Wake the first waiter queued on @uaddr, whichever op parked it. The bucket
+/* Wake the first waiter queued under @key, whichever op parked it. The bucket
  * lock must be held. FUTEX_WAKE refuses a PI waiter, so the two callers that
  * have to reach one, FUTEX_UNLOCK_PI and the robust walk, come here instead.
  */
-static void futex_wake_first_locked(futex_bucket_t *b, uint64_t uaddr)
+static void futex_wake_first_locked(futex_bucket_t *b, const futex_key_t *key)
 {
     for (futex_waiter_t **pp = &b->head; *pp; pp = &(*pp)->next) {
-        if ((*pp)->uaddr == uaddr) {
+        if (futex_key_equal(&(*pp)->key, key)) {
             futex_wake_waiter_locked(pp);
             return;
         }
@@ -838,7 +952,7 @@ static void futex_clear_waiters_bit(uint32_t *word)
  * owner->futex_pi.locks so an exiting owner finds every lock it must hand off.
  */
 typedef struct futex_pi_lock {
-    uint64_t uaddr;
+    futex_key_t key;
     thread_entry_t *owner;
     futex_waiter_t *waiters;
     struct futex_pi_lock *next;
@@ -970,10 +1084,10 @@ static bool futex_pi_cycle_locked(futex_pi_lock_t *st, thread_entry_t *self)
 }
 
 static futex_pi_lock_t *futex_pi_find_locked(thread_entry_t *owner,
-                                             uint64_t uaddr)
+                                             const futex_key_t *key)
 {
     for (futex_pi_lock_t *st = owner->futex_pi.locks; st; st = st->next) {
-        if (st->uaddr == uaddr)
+        if (futex_key_equal(&st->key, key))
             return st;
     }
     return NULL;
@@ -995,7 +1109,7 @@ static void futex_pi_owner_list_remove_locked(thread_entry_t *owner,
  * the owner field; free or handoff releases it.
  */
 static futex_pi_lock_t *futex_pi_create_locked(thread_entry_t *owner,
-                                               uint64_t uaddr)
+                                               const futex_key_t *key)
 {
     futex_pi_lock_t *st = calloc(1, sizeof(*st));
     if (!st)
@@ -1005,7 +1119,7 @@ static futex_pi_lock_t *futex_pi_create_locked(thread_entry_t *owner,
         free(st);
         return NULL;
     }
-    st->uaddr = uaddr;
+    st->key = *key;
     st->next = owner->futex_pi.locks;
     owner->futex_pi.locks = st;
     return st;
@@ -1211,11 +1325,11 @@ static int futex_pi_link_locked(futex_pi_lock_t *st,
 }
 
 static futex_pi_lock_t *futex_pi_owner_state_locked(thread_entry_t *owner,
-                                                    uint64_t uaddr)
+                                                    const futex_key_t *key)
 {
-    futex_pi_lock_t *st = futex_pi_find_locked(owner, uaddr);
+    futex_pi_lock_t *st = futex_pi_find_locked(owner, key);
     if (!st)
-        st = futex_pi_create_locked(owner, uaddr);
+        st = futex_pi_create_locked(owner, key);
     return st;
 }
 
@@ -1224,11 +1338,11 @@ static futex_pi_lock_t *futex_pi_owner_state_locked(thread_entry_t *owner,
  * names the old owner; the task that takes the word over must adopt it so the
  * remaining waiters donate to the real owner.
  */
-static futex_pi_lock_t *futex_pi_state_for_uaddr_locked(futex_bucket_t *b,
-                                                        uint64_t uaddr)
+static futex_pi_lock_t *futex_pi_state_for_key_locked(futex_bucket_t *b,
+                                                      const futex_key_t *key)
 {
     for (futex_waiter_t *w = b->head; w; w = w->next) {
-        if (w->uaddr == uaddr && w->pi_state)
+        if (futex_key_equal(&w->key, key) && w->pi_state)
             return w->pi_state;
     }
     return NULL;
@@ -1319,9 +1433,9 @@ void futex_pi_owner_exit(guest_t *g, thread_entry_t *t)
     pthread_mutex_lock(&futex_pi_mutex);
     while (t->futex_pi.locks) {
         futex_pi_lock_t *st = t->futex_pi.locks;
-        uint64_t uaddr = st->uaddr;
+        uint64_t uaddr = st->key.uaddr;
         uint32_t *word = g ? (uint32_t *) guest_ptr_w(g, uaddr) : NULL;
-        futex_bucket_t *b = &buckets[futex_hash(uaddr)];
+        futex_bucket_t *b = &buckets[futex_hash_key(&st->key)];
 
         pthread_mutex_lock(&b->lock);
         futex_waiter_t *top = futex_pi_top_locked(st);
@@ -1473,15 +1587,14 @@ static int linux_timespec_is_valid(const linux_timespec_t *lts)
                                  FUTEX_TIMESPEC_SEC_MAX);
 }
 
-/* Convert a Linux guest timespec to an absolute struct timespec deadline. For
- * FUTEX_WAIT (relative timeout), adds the duration to the current time. For
- * FUTEX_WAIT_BITSET (absolute timeout), uses the value directly.
- * Returns 0 on success, -1 if the guest pointer is invalid, -2 if the guest
- * timespec is malformed.
+/* Convert guest deadlines to the realtime domain used by the wait machinery.
+ * WAIT_BITSET and WAIT_REQUEUE_PI default to monotonic; LOCK_PI uses realtime.
+ * Returns -1 for an invalid pointer and -2 for a malformed timespec.
  */
 static int futex_make_deadline(guest_t *g,
                                uint64_t timeout_gva,
                                int is_absolute,
+                               clockid_t clock,
                                struct timespec *out)
 {
     linux_timespec_t lts;
@@ -1493,6 +1606,19 @@ static int futex_make_deadline(guest_t *g,
     if (is_absolute) {
         out->tv_sec = (time_t) lts.tv_sec;
         out->tv_nsec = (long) lts.tv_nsec;
+        if (clock == CLOCK_MONOTONIC) {
+            struct timespec mono, real;
+            clock_gettime(CLOCK_MONOTONIC, &mono);
+            clock_gettime(CLOCK_REALTIME, &real);
+            if (out->tv_sec < mono.tv_sec ||
+                (out->tv_sec == mono.tv_sec && out->tv_nsec <= mono.tv_nsec)) {
+                *out = (struct timespec) {0, 0};
+            } else {
+                out->tv_sec += real.tv_sec - mono.tv_sec;
+                out->tv_nsec += real.tv_nsec - mono.tv_nsec;
+                timespec_normalize(out);
+            }
+        }
     } else {
         /* Relative: add to current CLOCK_REALTIME (pthread_cond_timedwait uses
          * CLOCK_REALTIME by default on macOS)
@@ -1569,25 +1695,28 @@ static uint64_t futex_remaining_ns(const struct timespec *deadline,
 /* FUTEX_WAIT / FUTEX_WAIT_BITSET: atomically check word == val, then sleep. */
 static int64_t futex_wait_inner(unsigned *pub_bucket_out,
                                 guest_t *g,
-                                uint64_t uaddr,
+                                const futex_key_t *key,
                                 uint32_t expected,
                                 uint64_t timeout_gva,
                                 uint32_t bitset,
-                                int is_absolute)
+                                int is_absolute,
+                                clockid_t clock)
 {
+    uint64_t uaddr = key->uaddr;
     if (bitset == 0)
         return -LINUX_EINVAL;
     if (!futex_uaddr_is_aligned(uaddr))
         return -LINUX_EINVAL;
 
-    unsigned idx = futex_hash(uaddr);
+    unsigned idx = futex_hash_key(key);
     futex_bucket_t *b = &buckets[idx];
 
     /* Build deadline before locking (avoid holding lock during syscall) */
     bool has_timeout = (timeout_gva != 0);
     struct timespec deadline;
     if (has_timeout) {
-        int rc = futex_make_deadline(g, timeout_gva, is_absolute, &deadline);
+        int rc =
+            futex_make_deadline(g, timeout_gva, is_absolute, clock, &deadline);
         if (rc == -1)
             return -LINUX_EFAULT;
         if (rc == -2)
@@ -1640,7 +1769,7 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
             pthread_mutex_unlock(&b->lock);
             return -LINUX_ENOMEM;
         }
-        waiter->uaddr = uaddr;
+        waiter->key = *key;
         waiter->bitset = bitset;
         atomic_store_explicit(&waiter->woken, 0, memory_order_relaxed);
         waiter->next = b->head;
@@ -1769,18 +1898,19 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
  * anything.
  */
 static int64_t futex_wait(guest_t *g,
-                          uint64_t uaddr,
+                          const futex_key_t *key,
                           uint32_t expected,
                           uint64_t timeout_gva,
                           uint32_t bitset,
-                          int is_absolute)
+                          int is_absolute,
+                          clockid_t clock)
 {
-    unsigned idx = futex_hash(uaddr);
+    unsigned idx = futex_hash_key(key);
     unsigned pub = idx;
 
     shim_globals_futex_waiters_add(g, idx, +1);
-    int64_t rc = futex_wait_inner(&pub, g, uaddr, expected, timeout_gva, bitset,
-                                  is_absolute);
+    int64_t rc = futex_wait_inner(&pub, g, key, expected, timeout_gva, bitset,
+                                  is_absolute, clock);
     if (rc == SYSCALL_PARKED)
         return SYSCALL_PARKED; /* charge dropped when the park completes */
     shim_globals_futex_waiters_add(g, pub, -1);
@@ -1788,7 +1918,7 @@ static int64_t futex_wait(guest_t *g,
 }
 
 /* Whether a plain wake would meet a PI waiter among the first budget entries it
- * would touch at uaddr. A PI waiter stays tied to its entry bucket while it
+ * would touch at @key. A PI waiter stays tied to its entry bucket while it
  * retries and is not woken by a plain wake, so Linux answers EINVAL from inside
  * futex_wake() and futex_wake_op(); this decides before anything is woken, the
  * way futex_requeue decides, so a refused call leaves the chain as it found it.
@@ -1797,12 +1927,12 @@ static int64_t futex_wait(guest_t *g,
  * cannot refuse the call: its loops stop once nr_wake entries are woken.
  */
 static bool futex_pi_waiter_within(const futex_bucket_t *b,
-                                   uint64_t uaddr,
+                                   const futex_key_t *key,
                                    uint32_t bitset,
                                    uint32_t budget)
 {
     for (const futex_waiter_t *w = b->head; w && budget != 0; w = w->next) {
-        if (w->uaddr != uaddr || (w->bitset & bitset) == 0)
+        if (!futex_key_equal(&w->key, key) || (w->bitset & bitset) == 0)
             continue;
 
         /* A LOCK_PI waiter or a WAIT_REQUEUE_PI waiter cannot be reached by a
@@ -1815,8 +1945,9 @@ static bool futex_pi_waiter_within(const futex_bucket_t *b,
     return false;
 }
 
-static int64_t futex_wake(const guest_t *g,
+static int64_t futex_wake(guest_t *g,
                           uint64_t uaddr,
+                          bool shared,
                           uint32_t val,
                           uint32_t bitset)
 {
@@ -1825,12 +1956,18 @@ static int64_t futex_wake(const guest_t *g,
     if (!futex_uaddr_is_aligned(uaddr))
         return -LINUX_EINVAL;
 
-    unsigned idx = futex_hash(uaddr);
+    /* After EINVAL. A private miss stays 0, matching the shim. A shared miss is
+     * EFAULT: the backing identity cannot be named.
+     */
+    futex_key_t key;
+    if (!futex_key_get(g, uaddr, shared, &key))
+        return -LINUX_EFAULT;
+
+    unsigned idx = futex_hash_key(&key);
     futex_bucket_t *b = &buckets[idx];
     int woken = 0;
 
     pthread_mutex_lock(&b->lock);
-
 #ifdef ELFUSE_CONTRACT_ASSERT
     /* The published count may never understate what is parked on this bucket.
      * An understatement is what the shim's wake fast path reads as "nobody
@@ -1873,7 +2010,7 @@ static int64_t futex_wake(const guest_t *g,
     }
 #endif
 
-    if (futex_pi_waiter_within(b, uaddr, bitset, val)) {
+    if (futex_pi_waiter_within(b, &key, bitset, val)) {
         pthread_mutex_unlock(&b->lock);
         return -LINUX_EINVAL;
     }
@@ -1881,7 +2018,7 @@ static int64_t futex_wake(const guest_t *g,
     futex_waiter_t **pp = &b->head;
     while (*pp && (uint32_t) woken < val) {
         futex_waiter_t *w = *pp;
-        if (w->uaddr == uaddr && (w->bitset & bitset) != 0) {
+        if (futex_key_equal(&w->key, &key) && (w->bitset & bitset) != 0) {
             futex_wake_waiter_locked(pp);
             woken++;
         } else {
@@ -1909,13 +2046,16 @@ static int64_t futex_wake(const guest_t *g,
  * when source and destination hash to different buckets.
  */
 static int64_t futex_requeue(guest_t *g,
-                             uint64_t uaddr,
+                             const futex_key_t *src,
                              uint32_t wake_count,
                              uint32_t requeue_count,
-                             uint64_t uaddr2,
+                             const futex_key_t *dst,
                              int do_cmp,
                              uint32_t expected)
 {
+    uint64_t uaddr = src->uaddr;
+    uint64_t uaddr2 = dst->uaddr;
+
     /* Linux refuses these before taking either key; proved/futexreq.h carries
      * why the sign is only visible as the top bit here.
      */
@@ -1925,12 +2065,10 @@ static int64_t futex_requeue(guest_t *g,
     if (!futex_uaddr_is_aligned(uaddr) || !futex_uaddr_is_aligned(uaddr2))
         return -LINUX_EINVAL;
 
-    unsigned idx_src = futex_hash(uaddr);
-    unsigned idx_dst = futex_hash(uaddr2);
+    unsigned idx_src = futex_hash_key(src);
+    unsigned idx_dst = futex_hash_key(dst);
     futex_bucket_t *b_src = &buckets[idx_src];
     futex_bucket_t *b_dst = &buckets[idx_dst];
-
-    /* Lock both buckets in consistent order (lower index first) */
     if (idx_src == idx_dst) {
         pthread_mutex_lock(&b_src->lock);
     } else if (idx_src < idx_dst) {
@@ -1961,7 +2099,7 @@ static int64_t futex_requeue(guest_t *g,
      */
     uint64_t checked = futex_requeue_budget(wake_count, requeue_count);
     for (futex_waiter_t *w = b_src->head; w && checked != 0; w = w->next) {
-        if (w->uaddr != uaddr)
+        if (!futex_key_equal(&w->key, src))
             continue;
 
         /* The same PI rejection as futex_wake: a WAIT_REQUEUE_PI waiter is not
@@ -1982,7 +2120,7 @@ static int64_t futex_requeue(guest_t *g,
     futex_waiter_t **pp = &b_src->head;
     while (*pp) {
         futex_waiter_t *w = *pp;
-        if (w->uaddr != uaddr) {
+        if (!futex_key_equal(&w->key, src)) {
             pp = &w->next;
             continue;
         }
@@ -1999,7 +2137,7 @@ static int64_t futex_requeue(guest_t *g,
                  * moving the entry. Unlinking and relinking here would put w
                  * right back at *pp, so pp would never advance past it.
                  */
-                w->uaddr = uaddr2;
+                futex_key_retarget(&w->key, dst, uaddr2);
                 pp = &w->next;
             } else {
                 /* Requeue: remove from source, add to destination */
@@ -2016,7 +2154,7 @@ static int64_t futex_requeue(guest_t *g,
                     shim_globals_futex_waiters_add(g, w->pub_bucket, -1);
                     w->pub_bucket = idx_dst;
                 }
-                w->uaddr = uaddr2;
+                futex_key_retarget(&w->key, dst, uaddr2);
                 w->next = b_dst->head;
                 b_dst->head = w;
 
@@ -2061,12 +2199,14 @@ static int64_t futex_requeue(guest_t *g,
  *   bits  0-11: cmp arg
  */
 static int64_t futex_wake_op(guest_t *g,
-                             uint64_t uaddr,
+                             const futex_key_t *key1,
                              uint32_t val,
-                             uint64_t uaddr2,
+                             const futex_key_t *key2,
                              uint32_t val2,
                              uint32_t val3)
 {
+    uint64_t uaddr = key1->uaddr;
+    uint64_t uaddr2 = key2->uaddr;
     if (!futex_uaddr_is_aligned(uaddr) || !futex_uaddr_is_aligned(uaddr2))
         return -LINUX_EINVAL;
 
@@ -2108,8 +2248,8 @@ static int64_t futex_wake_op(guest_t *g,
     if (!futex_wake_op_supported(wake_op))
         return -LINUX_ENOSYS;
 
-    unsigned idx1 = futex_hash(uaddr);
-    unsigned idx2 = futex_hash(uaddr2);
+    unsigned idx1 = futex_hash_key(key1);
+    unsigned idx2 = futex_hash_key(key2);
     futex_bucket_t *b1 = &buckets[idx1];
     futex_bucket_t *b2 = &buckets[idx2];
 
@@ -2175,9 +2315,9 @@ static int64_t futex_wake_op(guest_t *g,
      * modify above stays: Linux applies it before its own walks reach the
      * waiter that answers EINVAL.
      */
-    if (futex_pi_waiter_within(b1, uaddr, FUTEX_BITSET_MATCH_ANY, val) ||
+    if (futex_pi_waiter_within(b1, key1, FUTEX_BITSET_MATCH_ANY, val) ||
         (cond_met &&
-         futex_pi_waiter_within(b2, uaddr2, FUTEX_BITSET_MATCH_ANY, val2))) {
+         futex_pi_waiter_within(b2, key2, FUTEX_BITSET_MATCH_ANY, val2))) {
         if (idx1 != idx2)
             pthread_mutex_unlock(&b2->lock);
         pthread_mutex_unlock(&b1->lock);
@@ -2189,7 +2329,7 @@ static int64_t futex_wake_op(guest_t *g,
     futex_waiter_t **pp1 = &b1->head;
     while (*pp1 && (uint32_t) woken1 < val) {
         futex_waiter_t *w = *pp1;
-        if (w->uaddr == uaddr) {
+        if (futex_key_equal(&w->key, key1)) {
             futex_wake_waiter_locked(pp1);
             woken1++;
         } else {
@@ -2203,7 +2343,7 @@ static int64_t futex_wake_op(guest_t *g,
         futex_waiter_t **pp2 = &b2->head;
         while (*pp2 && (uint32_t) woken2 < val2) {
             futex_waiter_t *w2 = *pp2;
-            if (w2->uaddr == uaddr2) {
+            if (futex_key_equal(&w2->key, key2)) {
                 futex_wake_waiter_locked(pp2);
                 woken2++;
             } else {
@@ -2255,9 +2395,10 @@ static int64_t futex_wake_op(guest_t *g,
  * the owner is itself blocked on, with a cycle check before enqueue.
  */
 static int64_t futex_lock_pi_inner(guest_t *g,
-                                   uint64_t uaddr,
+                                   const futex_key_t *key,
                                    uint64_t timeout_gva)
 {
+    uint64_t uaddr = key->uaddr;
     if (!futex_uaddr_is_aligned(uaddr))
         return -LINUX_EINVAL;
 
@@ -2274,15 +2415,15 @@ static int64_t futex_lock_pi_inner(guest_t *g,
     bool has_timeout = timeout_gva != 0;
     struct timespec deadline;
     if (has_timeout) {
-        int rc =
-            futex_make_deadline(g, timeout_gva, /*is_absolute=*/1, &deadline);
+        int rc = futex_make_deadline(g, timeout_gva, /*is_absolute=*/1,
+                                     CLOCK_REALTIME, &deadline);
         if (rc == -1)
             return -LINUX_EFAULT;
         if (rc == -2)
             return -LINUX_EINVAL;
     }
 
-    unsigned idx = futex_hash(uaddr);
+    unsigned idx = futex_hash_key(key);
     futex_bucket_t *b = &buckets[idx];
 
     for (;;) {
@@ -2316,7 +2457,7 @@ static int64_t futex_lock_pi_inner(guest_t *g,
              * adopt any waiters' lock record.
              */
             uint32_t want = tid | (cur & FUTEX_PI_OWNER_DIED);
-            if (bucket_has_uaddr_locked(b, uaddr))
+            if (bucket_has_key_locked(b, key))
                 want = futex_pi_set_waiters(want);
             bool taken;
             if (!futex_word_cas(word, &cur, want, &taken)) {
@@ -2325,7 +2466,7 @@ static int64_t futex_lock_pi_inner(guest_t *g,
                 return -LINUX_EFAULT;
             }
             if (taken) {
-                futex_pi_lock_t *st = futex_pi_state_for_uaddr_locked(b, uaddr);
+                futex_pi_lock_t *st = futex_pi_state_for_key_locked(b, key);
                 if (st)
                     (void) futex_pi_adopt_lock_locked(st, self);
                 pthread_mutex_unlock(&b->lock);
@@ -2374,7 +2515,7 @@ static int64_t futex_lock_pi_inner(guest_t *g,
             }
         }
 
-        futex_pi_lock_t *st = futex_pi_owner_state_locked(owner, uaddr);
+        futex_pi_lock_t *st = futex_pi_owner_state_locked(owner, key);
         thread_release(owner);
         if (!st) {
             pthread_mutex_unlock(&b->lock);
@@ -2395,7 +2536,7 @@ static int64_t futex_lock_pi_inner(guest_t *g,
             pthread_mutex_unlock(&futex_pi_mutex);
             return -LINUX_ENOMEM;
         }
-        waiter->uaddr = uaddr;
+        waiter->key = *key;
         waiter->bitset = FUTEX_BITSET_MATCH_ANY;
         atomic_store_explicit(&waiter->woken, 0, memory_order_relaxed);
         waiter->next = b->head;
@@ -2464,7 +2605,7 @@ static int64_t futex_lock_pi_inner(guest_t *g,
 
         bool kicked = fail == 0 && futex_kick_consume();
         if (fail != 0) {
-            if (fail == -LINUX_ETIMEDOUT && !bucket_has_uaddr_locked(b, uaddr))
+            if (fail == -LINUX_ETIMEDOUT && !bucket_has_key_locked(b, key))
                 futex_clear_waiters_bit(word);
             bool ours = futex_async_claim_pre_unmount_locked(self, waiter);
             bucket_unlink_locked(b, waiter);
@@ -2493,12 +2634,14 @@ static int64_t futex_lock_pi_inner(guest_t *g,
     }
 }
 
-static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr, uint64_t timeout_gva)
+static int64_t futex_lock_pi(guest_t *g,
+                             const futex_key_t *key,
+                             uint64_t timeout_gva)
 {
-    unsigned idx = futex_hash(uaddr);
+    unsigned idx = futex_hash_key(key);
 
     shim_globals_futex_waiters_add(g, idx, +1);
-    int64_t rc = futex_lock_pi_inner(g, uaddr, timeout_gva);
+    int64_t rc = futex_lock_pi_inner(g, key, timeout_gva);
     if (rc == SYSCALL_PARKED)
         return SYSCALL_PARKED; /* charge dropped when the park completes */
     shim_globals_futex_waiters_add(g, idx, -1);
@@ -2510,8 +2653,9 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr, uint64_t timeout_gva)
  * LOCK_PI, adopting any queued waiters. A live owner yields EAGAIN and a dead
  * owner without a robust mark yields ESRCH.
  */
-static int64_t futex_trylock_pi(guest_t *g, uint64_t uaddr)
+static int64_t futex_trylock_pi(guest_t *g, const futex_key_t *key)
 {
+    uint64_t uaddr = key->uaddr;
     if (!futex_uaddr_is_aligned(uaddr))
         return -LINUX_EINVAL;
 
@@ -2533,7 +2677,7 @@ static int64_t futex_trylock_pi(guest_t *g, uint64_t uaddr)
             return 0;
 
         pthread_mutex_lock(&futex_pi_mutex);
-        futex_bucket_t *b = &buckets[futex_hash(uaddr)];
+        futex_bucket_t *b = &buckets[futex_hash_key(key)];
         pthread_mutex_lock(&b->lock);
 
         uint32_t cur;
@@ -2544,7 +2688,7 @@ static int64_t futex_trylock_pi(guest_t *g, uint64_t uaddr)
         }
         if (futex_pi_unowned(cur)) {
             uint32_t want = tid | (cur & FUTEX_PI_OWNER_DIED);
-            if (bucket_has_uaddr_locked(b, uaddr))
+            if (bucket_has_key_locked(b, key))
                 want = futex_pi_set_waiters(want);
             bool taken;
             if (!futex_word_cas(word, &cur, want, &taken)) {
@@ -2553,7 +2697,7 @@ static int64_t futex_trylock_pi(guest_t *g, uint64_t uaddr)
                 return -LINUX_EFAULT;
             }
             if (taken) {
-                futex_pi_lock_t *st = futex_pi_state_for_uaddr_locked(b, uaddr);
+                futex_pi_lock_t *st = futex_pi_state_for_key_locked(b, key);
                 if (st)
                     (void) futex_pi_adopt_lock_locked(st, self);
                 pthread_mutex_unlock(&b->lock);
@@ -2586,18 +2730,19 @@ static int64_t futex_trylock_pi(guest_t *g, uint64_t uaddr)
  * one blocked waiter so it can retry acquisition, and release the word to
  * FUTEX_WAITERS while another stays queued, to 0 otherwise.
  */
-static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr)
+static int64_t futex_unlock_pi(guest_t *g, const futex_key_t *key)
 {
+    uint64_t uaddr = key->uaddr;
     thread_entry_t *self = current_thread;
     if (!self)
         return -LINUX_EPERM;
     uint32_t tid = (uint32_t) thread_tid(self);
 
     /* Linux futex_unlock_pi() reads the word and rejects a non-owner with
-     * -EPERM *before* it validates alignment (get_user + owner check run ahead
-     * of get_futex_key, whose -EINVAL is never reached), so releasing a lock
-     * you do not own returns -EPERM even for an unaligned uaddr. Match that
-     * ordering. The word may be unaligned here, so read it with
+     * -EPERM before it validates alignment (get_user plus the owner check run
+     * ahead of get_futex_key, whose -EINVAL is never reached), so releasing a
+     * lock you do not own returns -EPERM even for an unaligned uaddr. Match
+     * that ordering. The word may be unaligned here, so read it with
      * guest_read_small (boundary-safe, and avoids the aligned-atomic-load fault
      * an unaligned atomic load would take on the arm64 host).
      */
@@ -2618,12 +2763,12 @@ static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr)
     if (!word)
         return -LINUX_EFAULT;
 
-    futex_bucket_t *b = &buckets[futex_hash(uaddr)];
+    futex_bucket_t *b = &buckets[futex_hash_key(key)];
     pthread_mutex_lock(&futex_pi_mutex);
     pthread_mutex_lock(&b->lock);
 
     uint32_t released;
-    futex_pi_lock_t *st = futex_pi_find_locked(self, uaddr);
+    futex_pi_lock_t *st = futex_pi_find_locked(self, key);
     if (st && st->waiters) {
         /* Hand the lock to the highest effective key, FIFO among equals. The
          * async completion for that waiter sees its TID in the word and returns
@@ -2644,7 +2789,7 @@ static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr)
         /* A plain futex waiter on the same word is not a PI owner handoff; keep
          * WAITERS so its own FUTEX_WAKE can still reach it.
          */
-        released = bucket_has_uaddr_locked(b, uaddr) ? FUTEX_PI_WAITERS : 0;
+        released = bucket_has_key_locked(b, key) ? FUTEX_PI_WAITERS : 0;
     }
 
     if (!futex_pi_word_store_locked(word, released)) {
@@ -2816,7 +2961,7 @@ static int64_t futex_requeue_pi_signal_result_locked(thread_entry_t *t,
     bool want_restart = false;
     if (exec_park_waiter_load(t) == w) {
         b = futex_waiter_follow(b, w);
-        if (w->uaddr == w->requeue_pi_uaddr) {
+        if (w->key.uaddr == w->requeue_pi_uaddr) {
             result = -LINUX_EAGAIN; /* EWOULDBLOCK */
         } else {
             want_restart = true;
@@ -2893,7 +3038,7 @@ void futex_park_on_deadline(thread_entry_t *t)
                                 : (futex_waiter_t *) async;
         if (w && w->waiter_tid != 0 && !w->requeue_pi && t->park_guest) {
             guest_t *g = t->park_guest;
-            uint32_t *word = (uint32_t *) guest_ptr_w(g, w->uaddr);
+            uint32_t *word = (uint32_t *) guest_ptr_w(g, w->key.uaddr);
             uint32_t check = 0;
             if (word && futex_word_load(word, &check)) {
                 bool retry = false;
@@ -2985,11 +3130,14 @@ void futex_park_on_interrupt(thread_entry_t *t)
  * uaddr2 (word holds its TID).
  */
 static int64_t futex_wait_requeue_pi(guest_t *g,
-                                     uint64_t uaddr,
+                                     const futex_key_t *key,
                                      uint32_t expected,
-                                     uint64_t uaddr2,
-                                     uint64_t timeout_gva)
+                                     const futex_key_t *key2,
+                                     uint64_t timeout_gva,
+                                     clockid_t clock)
 {
+    uint64_t uaddr = key->uaddr;
+    uint64_t uaddr2 = key2->uaddr;
     if (!futex_uaddr_is_aligned(uaddr) || !futex_uaddr_is_aligned(uaddr2))
         return -LINUX_EINVAL;
     if (uaddr == uaddr2)
@@ -2998,16 +3146,14 @@ static int64_t futex_wait_requeue_pi(guest_t *g,
     uint32_t tid = current_thread ? (uint32_t) thread_tid(current_thread)
                                   : (uint32_t) proc_get_pid();
 
-    unsigned idx = futex_hash(uaddr);
+    unsigned idx = futex_hash_key(key);
     futex_bucket_t *b = &buckets[idx];
 
     bool has_timeout = (timeout_gva != 0);
     struct timespec deadline;
     if (has_timeout) {
-        /* WAIT_REQUEUE_PI timeouts are absolute CLOCK_REALTIME, like LOCK_PI.
-         */
-        int rc =
-            futex_make_deadline(g, timeout_gva, /*is_absolute=*/1, &deadline);
+        int rc = futex_make_deadline(g, timeout_gva, /*is_absolute=*/1, clock,
+                                     &deadline);
         if (rc == -1)
             return -LINUX_EFAULT;
         if (rc == -2)
@@ -3040,7 +3186,7 @@ static int64_t futex_wait_requeue_pi(guest_t *g,
             pthread_mutex_unlock(&b->lock);
             return -LINUX_ENOMEM;
         }
-        waiter->uaddr = uaddr;
+        waiter->key = *key;
         waiter->bitset = FUTEX_BITSET_MATCH_ANY;
         atomic_store_explicit(&waiter->woken, 0, memory_order_relaxed);
         waiter->next = b->head;
@@ -3132,12 +3278,14 @@ static int64_t futex_wait_requeue_pi(guest_t *g,
  * uaddr yield -EINVAL (ks-futex_requeue_pi_mismatched_ops).
  */
 static int64_t futex_cmp_requeue_pi(guest_t *g,
-                                    uint64_t uaddr,
+                                    const futex_key_t *src,
                                     uint32_t wake_count,
                                     uint32_t requeue_count,
-                                    uint64_t uaddr2,
+                                    const futex_key_t *dst,
                                     uint32_t expected)
 {
+    uint64_t uaddr = src->uaddr;
+    uint64_t uaddr2 = dst->uaddr;
     if (wake_count != 1)
         return -LINUX_EINVAL;
     if (!futex_uaddr_is_aligned(uaddr) || !futex_uaddr_is_aligned(uaddr2))
@@ -3147,8 +3295,8 @@ static int64_t futex_cmp_requeue_pi(guest_t *g,
     if (!futex_requeue_counts_valid(wake_count, requeue_count))
         return -LINUX_EINVAL;
 
-    unsigned idx_src = futex_hash(uaddr);
-    unsigned idx_dst = futex_hash(uaddr2);
+    unsigned idx_src = futex_hash_key(src);
+    unsigned idx_dst = futex_hash_key(dst);
     futex_bucket_t *b_src = &buckets[idx_src];
     futex_bucket_t *b_dst = &buckets[idx_dst];
 
@@ -3180,7 +3328,7 @@ static int64_t futex_cmp_requeue_pi(guest_t *g,
      * targeting uaddr2 is EINVAL.
      */
     for (futex_waiter_t *w = b_src->head; w; w = w->next) {
-        if (w->uaddr != uaddr)
+        if (!futex_key_equal(&w->key, src))
             continue;
         if (!w->requeue_pi || w->requeue_pi_uaddr != uaddr2) {
             rc = -LINUX_EINVAL;
@@ -3195,7 +3343,7 @@ static int64_t futex_cmp_requeue_pi(guest_t *g,
     }
 
     for (first_pp = &b_src->head; *first_pp; first_pp = &(*first_pp)->next) {
-        if ((*first_pp)->uaddr == uaddr) {
+        if (futex_key_equal(&(*first_pp)->key, src)) {
             first = *first_pp;
             break;
         }
@@ -3245,7 +3393,7 @@ static int64_t futex_cmp_requeue_pi(guest_t *g,
             rc = -LINUX_ESRCH;
             goto out;
         }
-        st = futex_pi_owner_state_locked(owner, uaddr2);
+        st = futex_pi_owner_state_locked(owner, dst);
         thread_release(owner);
         if (!st) {
             rc = -LINUX_ENOMEM;
@@ -3257,7 +3405,7 @@ static int64_t futex_cmp_requeue_pi(guest_t *g,
      * owner or link it as a PI waiter behind the live owner.
      */
     if (idx_src == idx_dst) {
-        first->uaddr = uaddr2;
+        futex_key_retarget(&first->key, dst, uaddr2);
         first->pub_follows = false;
     } else {
         *first_pp = first->next;
@@ -3266,7 +3414,7 @@ static int64_t futex_cmp_requeue_pi(guest_t *g,
             shim_globals_futex_waiters_add(g, first->pub_bucket, -1);
             first->pub_bucket = idx_dst;
         }
-        first->uaddr = uaddr2;
+        futex_key_retarget(&first->key, dst, uaddr2);
         first->pub_follows = false;
         first->next = b_dst->head;
         b_dst->head = first;
@@ -3294,7 +3442,7 @@ static int64_t futex_cmp_requeue_pi(guest_t *g,
         futex_waiter_t **pp = &b_src->head;
         futex_waiter_t *w = NULL;
         while (*pp) {
-            if ((*pp)->uaddr == uaddr) {
+            if (futex_key_equal(&(*pp)->key, src)) {
                 w = *pp;
                 break;
             }
@@ -3308,7 +3456,7 @@ static int64_t futex_cmp_requeue_pi(guest_t *g,
         }
 
         if (idx_src == idx_dst) {
-            w->uaddr = uaddr2;
+            futex_key_retarget(&w->key, dst, uaddr2);
             w->pub_follows = false;
         } else {
             *pp = w->next;
@@ -3317,7 +3465,7 @@ static int64_t futex_cmp_requeue_pi(guest_t *g,
                 shim_globals_futex_waiters_add(g, w->pub_bucket, -1);
                 w->pub_bucket = idx_dst;
             }
-            w->uaddr = uaddr2;
+            futex_key_retarget(&w->key, dst, uaddr2);
             w->pub_follows = false;
             w->next = b_dst->head;
             b_dst->head = w;
@@ -3325,7 +3473,7 @@ static int64_t futex_cmp_requeue_pi(guest_t *g,
         }
 
         if (!st) {
-            st = futex_pi_owner_state_locked(new_owner, uaddr2);
+            st = futex_pi_owner_state_locked(new_owner, dst);
             if (!st) {
                 rc = -LINUX_ENOMEM;
                 goto out;
@@ -3350,7 +3498,7 @@ static int64_t futex_cmp_requeue_pi(guest_t *g,
         if (futex_word_load(pi_word, &now) &&
             futex_pi_owner_tid(now) == first->waiter_tid) {
             uint32_t want = first->waiter_tid | (now & FUTEX_PI_OWNER_DIED);
-            if (bucket_has_uaddr_locked(b_dst, uaddr2))
+            if (bucket_has_key_locked(b_dst, dst))
                 want = futex_pi_set_waiters(want);
             (void) futex_pi_word_store_locked(pi_word, want);
         }
@@ -3384,13 +3532,14 @@ out:
  * 32 bits of the pending pointer (compat layout).
  */
 static int64_t futex_robust_unlock(guest_t *g,
-                                   uint64_t uaddr,
+                                   const futex_key_t *key,
                                    int cmd,
                                    uint32_t val,
                                    uint64_t pending_gva,
                                    uint32_t val3,
                                    bool list32)
 {
+    uint64_t uaddr = key->uaddr;
     if (!futex_uaddr_is_aligned(uaddr))
         return -LINUX_EINVAL;
 
@@ -3408,7 +3557,7 @@ static int64_t futex_robust_unlock(guest_t *g,
     /* Clear the word under the bucket lock so a concurrent waiter enqueue
      * cannot miss the wake after observing a non-zero owner.
      */
-    futex_bucket_t *b = &buckets[futex_hash(uaddr)];
+    futex_bucket_t *b = &buckets[futex_hash_key(key)];
     pthread_mutex_lock(&b->lock);
     for (;;) {
         if (!futex_word_load(word, &cur)) {
@@ -3441,7 +3590,7 @@ static int64_t futex_robust_unlock(guest_t *g,
         for (int i = 0; i < nr; i++) {
             futex_waiter_t *w = NULL;
             for (futex_waiter_t *it = b->head; it; it = it->next) {
-                if (it->uaddr != uaddr)
+                if (!futex_key_equal(&it->key, key))
                     continue;
                 if (cmd == FUTEX_WAKE_BITSET && (it->bitset & bitset) == 0)
                     continue;
@@ -3486,6 +3635,7 @@ int64_t sys_futex(guest_t *g,
                   uint32_t val3)
 {
     int cmd = op & FUTEX_CMD_MASK;
+    bool shared = (op & FUTEX_PRIVATE_FLAG) == 0;
 
     /* Match Linux do_futex(): FLAGS_CLOCKRT is only valid for WAIT_BITSET and
      * WAIT_REQUEUE_PI (LOCK_PI2 not implemented). Plain LOCK_PI must not park
@@ -3495,11 +3645,54 @@ int64_t sys_futex(guest_t *g,
         cmd != FUTEX_WAIT_REQUEUE_PI)
         return -LINUX_ENOSYS;
 
+    /* Alignment and the other EINVAL gates outrank the key. Linux rejects an
+     * unaligned word in futex_wake before get_futex_key, so an unmapped
+     * unaligned shared address is EINVAL, not EFAULT. An aligned shared address
+     * that is not a readable mapping is still EFAULT, below.
+     */
+    if ((cmd == FUTEX_WAKE_BITSET || cmd == FUTEX_WAIT_BITSET) && val3 == 0)
+        return -LINUX_EINVAL;
+    if (cmd == FUTEX_CMP_REQUEUE_PI && val != 1)
+        return -LINUX_EINVAL;
+    if ((cmd == FUTEX_REQUEUE || cmd == FUTEX_CMP_REQUEUE ||
+         cmd == FUTEX_CMP_REQUEUE_PI) &&
+        !futex_requeue_counts_valid(val, (uint32_t) timeout_gva))
+        return -LINUX_EINVAL;
+    if (cmd != FUTEX_UNLOCK_PI && cmd != FUTEX_WAKE &&
+        cmd != FUTEX_WAKE_BITSET && !futex_uaddr_is_aligned(uaddr))
+        return -LINUX_EINVAL;
+    if ((cmd == FUTEX_REQUEUE || cmd == FUTEX_CMP_REQUEUE ||
+         cmd == FUTEX_WAKE_OP || cmd == FUTEX_WAIT_REQUEUE_PI ||
+         cmd == FUTEX_CMP_REQUEUE_PI) &&
+        !futex_uaddr_is_aligned(uaddr2))
+        return -LINUX_EINVAL;
+    if ((cmd == FUTEX_WAIT_REQUEUE_PI || cmd == FUTEX_CMP_REQUEUE_PI) &&
+        uaddr == uaddr2)
+        return -LINUX_EINVAL;
+
+    /* Capture before the command runs. A shared key is the backing object and
+     * offset as they are now; the waiter keeps that snapshot, and a wake
+     * compares against it rather than re-reading the sleeping mapping. Private
+     * ops skip the region walk. WAKE and WAKE_BITSET defer the lookup: an
+     * unmapped private wake is 0, and an unmapped shared wake is EFAULT only
+     * once alignment has passed.
+     */
+    bool wake_cmd = (cmd == FUTEX_WAKE || cmd == FUTEX_WAKE_BITSET) &&
+                    (op & FUTEX_ROBUST_UNLOCK) == 0;
+    futex_key_t key, key2;
+    if (!wake_cmd && !futex_key_get(g, uaddr, shared, &key))
+        return -LINUX_EFAULT;
+    bool needs_second = cmd == FUTEX_REQUEUE || cmd == FUTEX_CMP_REQUEUE ||
+                        cmd == FUTEX_WAKE_OP || cmd == FUTEX_WAIT_REQUEUE_PI ||
+                        cmd == FUTEX_CMP_REQUEUE_PI;
+    if (needs_second && !futex_key_get(g, uaddr2, shared, &key2))
+        return -LINUX_EFAULT;
+
     if (op & FUTEX_ROBUST_UNLOCK) {
         if (cmd != FUTEX_WAKE && cmd != FUTEX_WAKE_BITSET &&
             cmd != FUTEX_UNLOCK_PI)
             return -LINUX_ENOSYS;
-        return futex_robust_unlock(g, uaddr, cmd, val, uaddr2, val3,
+        return futex_robust_unlock(g, &key, cmd, val, uaddr2, val3,
                                    (op & FUTEX_ROBUST_LIST32) != 0);
     }
 
@@ -3512,50 +3705,52 @@ int64_t sys_futex(guest_t *g,
          * that way reports EINTR for a wake that counted the waiter, or 0 for a
          * signal it could not claim. waiter.woken is what tells them apart.
          */
-        return futex_wait(g, uaddr, val, timeout_gva, FUTEX_BITSET_MATCH_ANY,
-                          /*is_absolute=*/0);
+        return futex_wait(g, &key, val, timeout_gva, FUTEX_BITSET_MATCH_ANY,
+                          /*is_absolute=*/0, CLOCK_MONOTONIC);
 
     case FUTEX_WAKE:
-        return futex_wake(g, uaddr, val, FUTEX_BITSET_MATCH_ANY);
+        return futex_wake(g, uaddr, shared, val, FUTEX_BITSET_MATCH_ANY);
 
     case FUTEX_REQUEUE:
         /* For REQUEUE, the timeout arg is repurposed as val2 (requeue count) */
-        return futex_requeue(g, uaddr, val, (uint32_t) timeout_gva, uaddr2,
+        return futex_requeue(g, &key, val, (uint32_t) timeout_gva, &key2,
                              /*do_cmp=*/0, 0);
 
     case FUTEX_CMP_REQUEUE:
         /* Same repurposing of timeout -> val2, plus compare against val3 */
-        return futex_requeue(g, uaddr, val, (uint32_t) timeout_gva, uaddr2,
+        return futex_requeue(g, &key, val, (uint32_t) timeout_gva, &key2,
                              /*do_cmp=*/1, val3);
 
     case FUTEX_WAKE_OP:
         /* timeout arg repurposed as val2 (wake count for uaddr2) */
-        return futex_wake_op(g, uaddr, val, uaddr2, (uint32_t) timeout_gva,
-                             val3);
+        return futex_wake_op(g, &key, val, &key2, (uint32_t) timeout_gva, val3);
 
     case FUTEX_WAIT_BITSET:
-        return futex_wait(g, uaddr, val, timeout_gva, val3, /*is_absolute=*/1);
+        return futex_wait(
+            g, &key, val, timeout_gva, val3, /*is_absolute=*/1,
+            (op & FUTEX_CLOCK_REALTIME) ? CLOCK_REALTIME : CLOCK_MONOTONIC);
 
     case FUTEX_WAKE_BITSET:
-        return futex_wake(g, uaddr, val, val3);
+        return futex_wake(g, uaddr, shared, val, val3);
 
     case FUTEX_LOCK_PI:
-        return futex_lock_pi(g, uaddr, timeout_gva);
+        return futex_lock_pi(g, &key, timeout_gva);
 
     case FUTEX_UNLOCK_PI:
-        return futex_unlock_pi(g, uaddr);
+        return futex_unlock_pi(g, &key);
 
     case FUTEX_TRYLOCK_PI:
-        return futex_trylock_pi(g, uaddr);
+        return futex_trylock_pi(g, &key);
 
     case FUTEX_WAIT_REQUEUE_PI:
-        /* val3 unused; uaddr2 is the PI futex; timeout is absolute REALTIME. */
-        return futex_wait_requeue_pi(g, uaddr, val, uaddr2, timeout_gva);
+        return futex_wait_requeue_pi(
+            g, &key, val, &key2, timeout_gva,
+            (op & FUTEX_CLOCK_REALTIME) ? CLOCK_REALTIME : CLOCK_MONOTONIC);
 
     case FUTEX_CMP_REQUEUE_PI:
         /* timeout arg -> val2 (requeue count); val3 -> expected compare. */
-        return futex_cmp_requeue_pi(g, uaddr, val, (uint32_t) timeout_gva,
-                                    uaddr2, val3);
+        return futex_cmp_requeue_pi(g, &key, val, (uint32_t) timeout_gva, &key2,
+                                    val3);
 
     default:
         /* Unimplemented futex operation.
@@ -3567,7 +3762,8 @@ int64_t sys_futex(guest_t *g,
 
 int futex_wake_one(guest_t *g, uint64_t uaddr)
 {
-    return (int) futex_wake(g, uaddr, 1, FUTEX_BITSET_MATCH_ANY);
+    /* clear_child_tid is a private word. Skip the shared-region walk. */
+    return (int) futex_wake(g, uaddr, false, 1, FUTEX_BITSET_MATCH_ANY);
 }
 
 /* futex_waitv (SYS 449): batch futex wait on multiple addresses.
@@ -3761,7 +3957,7 @@ static bool futex_waitv_cancel_locked(thread_entry_t *t,
  * nr_futexes is bounded by FUTEX_WAITV_MAX before the call, which is what keeps
  * nbuckets below the array length at every insert.
  */
-static int waitv_collect_buckets(const linux_futex_waitv_t *elts,
+static int waitv_collect_buckets(const futex_key_t *keys,
                                  uint32_t nr_futexes,
                                  unsigned bucket_ids[FUTEX_WAITV_MAX])
 {
@@ -3769,7 +3965,7 @@ static int waitv_collect_buckets(const linux_futex_waitv_t *elts,
 
     for (uint32_t i = 0; i < nr_futexes; i++)
         nbuckets = futex_bucket_insert(bucket_ids, nbuckets, FUTEX_WAITV_MAX,
-                                       futex_hash(elts[i].uaddr));
+                                       futex_hash_key(&keys[i]));
 
     return (int) nbuckets;
 }
@@ -3837,6 +4033,13 @@ int64_t sys_futex_waitv(guest_t *g,
             return -LINUX_EINVAL;
     }
 
+    futex_key_t keys[FUTEX_WAITV_MAX];
+    for (uint32_t i = 0; i < nr_futexes; i++) {
+        bool shared = (elts[i].flags & FUTEX2_PRIVATE) == 0;
+        if (!futex_key_get(g, elts[i].uaddr, shared, &keys[i]))
+            return -LINUX_EFAULT;
+    }
+
     thread_entry_t *self = current_thread;
     if (!self)
         return -LINUX_ESRCH;
@@ -3855,15 +4058,17 @@ int64_t sys_futex_waitv(guest_t *g,
     grp->waiters = waiters;
 
     unsigned bucket_ids[FUTEX_WAITV_MAX];
-    int nbuckets = waitv_collect_buckets(elts, nr_futexes, bucket_ids);
+    int nbuckets = waitv_collect_buckets(keys, nr_futexes, bucket_ids);
     unsigned entry_bucket[FUTEX_WAITV_MAX];
     int enqueued = 0;
 
     /* Publish one charge per element before the word checks; the shim's wake
-     * fast path reads these counts without a bucket lock.
+     * fast path reads these counts without a bucket lock. A shared element
+     * charges the backing-identity bucket, which the shim cannot hash, so a
+     * shared wake of that word takes the host path.
      */
     for (uint32_t i = 0; i < nr_futexes; i++) {
-        entry_bucket[i] = futex_hash(elts[i].uaddr);
+        entry_bucket[i] = futex_hash_key(&keys[i]);
         shim_globals_futex_waiters_add(g, entry_bucket[i], +1);
     }
 
@@ -3883,7 +4088,7 @@ int64_t sys_futex_waitv(guest_t *g,
         }
 
         futex_waiter_t *w = &waiters[i];
-        w->uaddr = uaddr;
+        w->key = keys[i];
         w->bitset = FUTEX_BITSET_MATCH_ANY;
         atomic_store_explicit(&w->woken, 0, memory_order_relaxed);
         w->next = b->head;
@@ -4005,12 +4210,13 @@ unlock_early:
  * itself in that case: futex_pi_owner_exit runs next and has to move the lock
  * record to the highest-priority waiter before the word is published.
  */
-static bool futex_pi_state_has_waiters(thread_entry_t *t, uint64_t uaddr)
+static bool futex_pi_state_has_waiters(thread_entry_t *t,
+                                       const futex_key_t *key)
 {
     bool found = false;
     pthread_mutex_lock(&futex_pi_mutex);
     for (futex_pi_lock_t *st = t->futex_pi.locks; st; st = st->next) {
-        if (st->uaddr == uaddr && st->waiters) {
+        if (futex_key_equal(&st->key, key) && st->waiters) {
             found = true;
             break;
         }
@@ -4019,18 +4225,41 @@ static bool futex_pi_state_has_waiters(thread_entry_t *t, uint64_t uaddr)
     return found;
 }
 
-/* Wake one waiter on a word the robust walk just marked FUTEX_OWNER_DIED. PI
- * waiters are left to futex_pi_owner_exit.
+/* Wake one non-PI waiter on a word the robust walk just marked
+ * FUTEX_OWNER_DIED. The list carries no private bit, so @key is the shared
+ * identity when the word is MAP_SHARED. A waiter that passed FUTEX_PRIVATE_FLAG
+ * is queued under the raw address instead, and that is a different key. Wake
+ * the shared queue first. If it holds nobody, wake the raw-address queue. A PI
+ * record under either key stays for futex_pi_owner_exit, which hands the lock
+ * off itself.
  */
-static void futex_wake_owner_died(guest_t *g, thread_entry_t *t, uint64_t uaddr)
+static bool futex_wake_key_if_queued(const futex_key_t *key)
 {
-    if (futex_pi_state_has_waiters(t, uaddr))
-        return;
-    futex_bucket_t *b = &buckets[futex_hash(uaddr)];
+    futex_bucket_t *b = &buckets[futex_hash_key(key)];
     pthread_mutex_lock(&b->lock);
-    futex_wake_first_locked(b, uaddr);
+    bool queued = bucket_has_key_locked(b, key);
+    if (queued)
+        futex_wake_first_locked(b, key);
     pthread_mutex_unlock(&b->lock);
-    futex_async_wake_flush();
+    return queued;
+}
+
+static void futex_wake_owner_died(guest_t *g,
+                                  thread_entry_t *t,
+                                  const futex_key_t *key)
+{
+    futex_key_t raw;
+    if (!futex_key_get(g, key->uaddr, false, &raw))
+        return;
+    if (futex_pi_state_has_waiters(t, key) ||
+        (key->shared && futex_pi_state_has_waiters(t, &raw)))
+        return;
+
+    bool woke = futex_wake_key_if_queued(key);
+    if (!woke && key->shared)
+        woke = futex_wake_key_if_queued(&raw);
+    if (woke)
+        futex_async_wake_flush();
 }
 
 void robust_list_walk(guest_t *g, thread_entry_t *t)
@@ -4101,8 +4330,15 @@ void robust_list_walk(guest_t *g, thread_entry_t *t)
                         "futex: robust list OWNER_DIED write to 0x%llx "
                         "failed; waiters on this lock may hang",
                         (unsigned long long) futex_gva);
-                else
-                    futex_wake_owner_died(g, t, futex_gva);
+                else {
+                    /* No private bit on the list. A MAP_SHARED word still takes
+                     * the shared key, and futex_wake_owner_died also looks at
+                     * the raw address for a private waiter.
+                     */
+                    futex_key_t key;
+                    if (futex_key_get(g, futex_gva, true, &key))
+                        futex_wake_owner_died(g, t, &key);
+                }
             }
         }
 
@@ -4143,8 +4379,11 @@ void robust_list_walk(guest_t *g, thread_entry_t *t)
                         "futex: robust list pending OWNER_DIED write to "
                         "0x%llx failed; waiters on this lock may hang",
                         (unsigned long long) futex_gva);
-                else
-                    futex_wake_owner_died(g, t, futex_gva);
+                else {
+                    futex_key_t key;
+                    if (futex_key_get(g, futex_gva, true, &key))
+                        futex_wake_owner_died(g, t, &key);
+                }
             }
         }
     }

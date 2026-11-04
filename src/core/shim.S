@@ -1039,15 +1039,21 @@ attn_bail:
  * mutex-and-condvar workload, where the wait fast path next door fires not once
  * because every wait there genuinely blocks.
  *
- * No address check beyond alignment. The host resolves nothing for a wake
- * either: futex_wake matches enqueued waiters by raw uaddr. So an unmapped or
- * tagged address answers 0 on both sides, and hashing the raw value here is
- * what keeps the two agreeing.
+ * No address check beyond alignment, and only for a private wake. A shared wake
+ * (FUTEX_PRIVATE_FLAG clear) can name a second MAP_SHARED mapping of the same
+ * backing object and offset, whose waiter is queued under that identity rather
+ * than under this raw address. Hashing the raw value would read an empty bucket
+ * and answer 0 for a waiter that is parked. The host resolves that identity, so
+ * a shared wake always takes the slow path. A private wake still hashes the raw
+ * address, which is what the host queues it under.
  */
 futex_wakebs_shape:
     ldr w16, [sp, #40]                /* val3 = bitset */
     cbz w16, futex_shape_bail         /* zero bitset is EINVAL on the host */
 futex_wake_shape:
+    ldr w15, [sp, #8]                 /* op */
+    tst w15, #0x80                    /* FUTEX_PRIVATE_FLAG */
+    b.eq futex_shape_bail             /* shared wake: host resolves the key */
     ldr x14, [sp, #0]                 /* uaddr */
     tst x14, #3
     b.ne futex_shape_bail             /* unaligned is EINVAL on the host */
