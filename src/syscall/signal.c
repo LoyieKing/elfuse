@@ -341,6 +341,7 @@ static guest_posix_timer_t posix_timers[POSIX_TIMER_MAX];
 static int posix_next_id;
 static int posix_timer_next_slot[LINUX_NSIG];
 static _Atomic bool posix_timers_need_poll;
+static _Atomic bool posix_timer_poll_active;
 
 static guest_posix_timer_t *posix_timer_find_locked(int id)
 {
@@ -2020,20 +2021,37 @@ static void timer_kick_scan_one(thread_entry_t *t, void *ctx)
         scan->slots[scan->n++] = slot;
 }
 
-/* Advance and enqueue expired POSIX timers. When raise is false, skip
- * attention_raise, for slice-timer park deadlines that would deadlock on
- * thread_interrupt_all (same contract as signal_check_timer_real_quiet). Claim
- * + remount deliver the pending signal to the parked sleeper.
+/* Syscall polls sample the caller's CPU timers; the slice worker samples every
+ * target, including a task executing without syscalls. Neither path may call
+ * attention_raise while completing a parked waiter.
  */
 static void posix_timer_check_ex(bool raise)
 {
     if (!atomic_load_explicit(&posix_timers_need_poll, memory_order_acquire))
         return;
+
+    /* Coalesce concurrent scans. Contending workers continue guest work; the
+     * active poll publishes notifications and kicks their targets.
+     */
+    bool idle = false;
+    if (!atomic_compare_exchange_strong_explicit(
+            &posix_timer_poll_active, &idle, true, memory_order_acquire,
+            memory_order_relaxed))
+        return;
     uint64_t waiting = 0, notify = 0;
+    bool queued = false;
     pthread_mutex_lock(&sig_lock);
     for (int i = 0; i < POSIX_TIMER_MAX; i++) {
         guest_posix_timer_t *timer = &posix_timers[i];
         if (!timer->used || !timer->signum)
+            continue;
+
+        /* A task's syscall cannot advance another task's CPU clock. The
+         * target's return path and the slice poll sample that clock instead.
+         */
+        if (raise && current_thread && timer->cpu_target_tid &&
+            timer->cpu_target_tid != thread_tid(current_thread) &&
+            timer->notification == POSIX_TIMER_NONE)
             continue;
         uint64_t count = posix_timer_advance_locked(timer);
         if (count) {
@@ -2046,9 +2064,10 @@ static void posix_timer_check_ex(bool raise)
                                   ? INT32_MAX
                                   : timer->overruns + (int) missed;
         }
-        if (timer->notification == POSIX_TIMER_QUEUED)
+        if (timer->notification == POSIX_TIMER_QUEUED) {
+            queued = true;
             posix_timer_update_pending_locked(timer);
-        else if (timer->notification == POSIX_TIMER_WAITING)
+        } else if (timer->notification == POSIX_TIMER_WAITING)
             waiting |= sig_bit(timer->signum);
     }
     for (uint64_t pending = waiting; pending; pending &= pending - 1) {
@@ -2057,10 +2076,13 @@ static void posix_timer_check_ex(bool raise)
             notify |= sig_bit(signum);
     }
     posix_timer_refresh_poll_hint_locked();
-    refresh_pending_hint_locked();
+    if (notify)
+        refresh_pending_hint_locked();
     pthread_mutex_unlock(&sig_lock);
     for (uint64_t pending = notify; pending; pending &= pending - 1)
         signalfd_notify(bit_ctz64(pending) + 1);
+    if (!notify && !queued)
+        goto complete;
 
     /* A QUEUED timer whose pending bit is still set never re-enters notify
      * (standard signals cannot double-queue), so the first queue's wake does
@@ -2144,7 +2166,7 @@ static void posix_timer_check_ex(bool raise)
     }
 
     if (!notify && !need_wake)
-        return;
+        goto complete;
 
     /* Never attention_raise from the posix-timer poll paths. With a sibling
      * parked in pthread_join, thread_interrupt_all deadlocks the arming/check
@@ -2156,6 +2178,9 @@ static void posix_timer_check_ex(bool raise)
     for (int k = 0; k < kick_n; k++)
         vcpu_pool_kick_cpu(kick_slots[k]);
     wakeup_pipe_signal();
+complete:
+    atomic_store_explicit(&posix_timer_poll_active, false,
+                          memory_order_release);
 }
 
 static void posix_timer_check(void)
@@ -2547,7 +2572,8 @@ uint64_t signal_next_wall_timer_deadline_ns(void)
 void signal_deliver_expired_wall_timers_quiet(void)
 {
     signal_check_timer_real_quiet();
-    sched_wake_parked_for_pending_signal();
+    if (atomic_load_explicit(&sig_pending_hint, memory_order_acquire))
+        sched_wake_parked_for_pending_signal();
 }
 
 /* timeval <-> nanoseconds for the CPU-time interval timers. */

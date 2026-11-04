@@ -959,6 +959,10 @@ Key points:
   `setitimer(ITIMER_REAL)` as a single timer, and `elfuse` already needs
   that timer for its execution watchdog.
 - `signal_check_timer()` is called from the vCPU loop after each syscall.
+- POSIX CPU-timer syscall polls sample the calling task's timers; the slice
+  worker samples every target, including tasks executing without syscalls.
+  Concurrent polls coalesce, and the active poll publishes notifications and
+  kicks their targets.
 - After `SYSCALL_EXEC_HAPPENED`, the vCPU loop verifies that `ELR_EL1` is
   non-zero -- a defensive check against HVF register-sync bugs.
 - Each `thread_entry_t` carries its own `blocked` mask. `rt_sigprocmask`
