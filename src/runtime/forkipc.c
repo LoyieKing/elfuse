@@ -1451,6 +1451,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
      * no guest code can close a slave in between.
      */
     proc_pty_fork_parent_note_inherited();
+    proc_scratch_note_fork();
 
     /* The process-state payload includes the SCM_RIGHTS handoff for region
      * backing fds. Keep siblings quiesced until that send completes so a

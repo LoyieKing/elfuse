@@ -45,6 +45,7 @@
 #include <dirent.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <sys/clonefile.h>
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/sysctl.h>
@@ -110,7 +111,7 @@ typedef struct {
     bool inherited_at_fork;
     bool dontfork;
     bool wipeonfork;
-    char name[64];
+    char *name; /* NULL when the VMA has no name; owned by the snapshot */
 } maps_entry_t;
 
 /* A growable VMA snapshot. The generated facade keeps element-size and
@@ -163,13 +164,30 @@ static int maps_entries_append_entry(maps_entries_t *entries,
         .inherited_at_fork = inherited_at_fork,
         .dontfork = dontfork,
         .wipeonfork = wipeonfork,
+        .name = NULL,
     };
-    if (name && name[0])
-        str_copy_trunc(value.name, name, sizeof(value.name));
-    else
-        value.name[0] = '\0';
+    if (name && name[0]) {
+        value.name = strdup(name);
+        if (!value.name)
+            return -1;
+    }
+    if (maps_entries_append_value(entries, value) < 0) {
+        free(value.name);
+        return -1;
+    }
+    return 0;
+}
 
-    return maps_entries_append_value(entries, value);
+static const char *maps_entry_name(const maps_entry_t *e)
+{
+    return e->name ? e->name : "";
+}
+
+static void maps_entries_release(maps_entries_t *entries)
+{
+    for (size_t i = 0; i < maps_entries_count(entries); i++)
+        free(maps_entries_at(entries, i)->name);
+    maps_entries_destroy(entries);
 }
 
 /* Synthetic /sys/devices/system/cpu directory backing store. Populated lazily
@@ -365,16 +383,27 @@ static void format_proc_net_addr(char out[33],
  *
  * The previous design shared one host directory across every open, which meant
  * a second open could unlink/recreate entries while the first opener was
- * mid-getdents on its dirfd. Each open now allocates its own mkdtemp dir, so
- * concurrent enumerations cannot mutate one another.
+ * mid-getdents on its dirfd. Each open now allocates its own dir, so concurrent
+ * enumerations cannot mutate one another.
  *
- * The tracker keeps the paths so an atexit hook can rmdir them at process exit.
- * The capacity is a soft cap: callers that exceed it leak the dir to /tmp
- * (cleared on host reboot or by tmp janitors).
+ * The tracker keys each dir by its inode. Closing the last guest descriptor of
+ * a listing removes its dir (proc_scratch_note_closed_dir), and an atexit hook
+ * removes whatever is left. A dir cannot go earlier: getdents on a removed
+ * directory returns nothing on macOS. A fork child reads the same directories
+ * through inherited descriptors, so a fork marks every tracked dir shared and a
+ * shared dir waits for the atexit hook. The capacity bounds dirs live at once;
+ * one past it is still served and leaks to /tmp (cleared on host reboot or by
+ * tmp janitors).
  */
 #define PROC_SCRATCH_DIRS_MAX 128
-static char proc_scratch_dirs[PROC_SCRATCH_DIRS_MAX][80];
-static int proc_scratch_dirs_count;
+typedef struct {
+    char path[80];
+    dev_t dev;
+    ino_t ino;
+    bool shared;
+} proc_scratch_dir_t;
+static proc_scratch_dir_t proc_scratch_dirs[PROC_SCRATCH_DIRS_MAX];
+static _Atomic int proc_scratch_dirs_count;
 static pthread_mutex_t proc_scratch_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t proc_scratch_atexit_once = PTHREAD_ONCE_INIT;
 
@@ -401,9 +430,11 @@ void proc_scratch_remove_one(const char *dir)
 static void proc_scratch_cleanup_atexit(void)
 {
     pthread_mutex_lock(&proc_scratch_lock);
-    for (int i = 0; i < proc_scratch_dirs_count; i++)
-        proc_scratch_remove_one(proc_scratch_dirs[i]);
-    proc_scratch_dirs_count = 0;
+    int count =
+        atomic_load_explicit(&proc_scratch_dirs_count, memory_order_relaxed);
+    for (int i = 0; i < count; i++)
+        proc_scratch_remove_one(proc_scratch_dirs[i].path);
+    atomic_store_explicit(&proc_scratch_dirs_count, 0, memory_order_relaxed);
     pthread_mutex_unlock(&proc_scratch_lock);
 }
 
@@ -412,45 +443,132 @@ static void proc_scratch_register_atexit(void)
     atexit(proc_scratch_cleanup_atexit);
 }
 
-/* Record a scratch directory for removal at exit, arming the atexit hook on
- * first use. The registry is private to this file; procemu-pty.c reaches it
- * through here rather than through the five statics behind it.
+/* Record a scratch directory for removal at its last close or at exit, arming
+ * the atexit hook on first use. The registry is private to this file;
+ * procemu-pty.c reaches it through here rather than through the statics
+ * behind it.
  */
 void proc_scratch_register(const char *dir)
 {
     pthread_once(&proc_scratch_atexit_once, proc_scratch_register_atexit);
 
+    struct stat st;
+    if (stat(dir, &st) < 0)
+        return;
     pthread_mutex_lock(&proc_scratch_lock);
-    if (proc_scratch_dirs_count < PROC_SCRATCH_DIRS_MAX) {
-        str_copy_trunc(proc_scratch_dirs[proc_scratch_dirs_count++], dir,
-                       sizeof(proc_scratch_dirs[0]));
+    int count =
+        atomic_load_explicit(&proc_scratch_dirs_count, memory_order_relaxed);
+    if (count < PROC_SCRATCH_DIRS_MAX) {
+        proc_scratch_dir_t *e = &proc_scratch_dirs[count];
+        str_copy_trunc(e->path, dir, sizeof(e->path));
+        e->dev = st.st_dev;
+        e->ino = st.st_ino;
+        e->shared = false;
+        atomic_store_explicit(&proc_scratch_dirs_count, count + 1,
+                              memory_order_release);
     }
     pthread_mutex_unlock(&proc_scratch_lock);
 }
 
-/* Open a per-call scratch directory populated with one empty file per live
- * guest fd.
- *
- * Returns a host dirfd on success, -1 on failure with errno set.
- *
- * The dirfd is the standard backing for getdents on this synthetic listing. Two
- * concurrent openers get two independent dirs, so neither mutates the other's
- * enumeration.
- */
-static int proc_open_fd_scratch(const char *prefix, int linux_flags)
+void proc_scratch_note_closed_dir(int host_fd)
 {
-    char dir[80];
-    int n = snprintf(dir, sizeof(dir), "/tmp/%s-XXXXXX", prefix);
-    if (n < 0 || (size_t) n >= sizeof(dir)) {
-        errno = ENAMETOOLONG;
-        return -1;
+    if (atomic_load_explicit(&proc_scratch_dirs_count, memory_order_acquire) ==
+        0)
+        return;
+    struct stat st;
+    if (fstat(host_fd, &st) < 0)
+        return;
+    char path[sizeof(proc_scratch_dirs[0].path)];
+    path[0] = '\0';
+    pthread_mutex_lock(&proc_scratch_lock);
+    int count =
+        atomic_load_explicit(&proc_scratch_dirs_count, memory_order_relaxed);
+    for (int i = 0; i < count; i++) {
+        if (proc_scratch_dirs[i].dev != st.st_dev ||
+            proc_scratch_dirs[i].ino != st.st_ino)
+            continue;
+        if (!proc_scratch_dirs[i].shared)
+            str_copy_trunc(path, proc_scratch_dirs[i].path, sizeof(path));
+        else
+            break;
+        proc_scratch_dirs[i] = proc_scratch_dirs[count - 1];
+        atomic_store_explicit(&proc_scratch_dirs_count, count - 1,
+                              memory_order_relaxed);
+        break;
     }
-    if (!mkdtemp(dir))
-        return -1;
+    pthread_mutex_unlock(&proc_scratch_lock);
+    if (path[0])
+        proc_scratch_remove_one(path);
+}
 
+void proc_scratch_note_fork(void)
+{
+    pthread_mutex_lock(&proc_scratch_lock);
+    int count =
+        atomic_load_explicit(&proc_scratch_dirs_count, memory_order_relaxed);
+    for (int i = 0; i < count; i++)
+        proc_scratch_dirs[i].shared = true;
+    pthread_mutex_unlock(&proc_scratch_lock);
+}
+
+/* Template behind the per-open fd listings: one empty file per live guest fd,
+ * kept in sync incrementally. A listing open clones it instead of creating one
+ * file per descriptor, which costs a host file creation each: an app holding a
+ * few hundred fds paid over 100 ms per open of /proc/self/fd, and runtimes poll
+ * that directory to count their descriptors.
+ */
+typedef struct {
+    const char *template;
+    char path[80];
+    uint8_t present[FD_TABLE_SIZE];
+    pthread_mutex_t lock;
+} proc_fd_listing_t;
+
+#define PROC_FD_LISTING(prefix) \
+    {.template = prefix,        \
+     .path = {0},               \
+     .present = {0},            \
+     .lock = PTHREAD_MUTEX_INITIALIZER}
+
+static proc_fd_listing_t proc_fd_listing =
+    PROC_FD_LISTING("/tmp/elfuse-fd-XXXXXX");
+static proc_fd_listing_t proc_fdinfo_listing =
+    PROC_FD_LISTING("/tmp/elfuse-fdinfo-XXXXXX");
+
+/* Bring @l's template to the live fd set. Caller holds l->lock. */
+static int proc_fd_listing_sync_locked(proc_fd_listing_t *l)
+{
+    if (!l->path[0]) {
+        if (proc_lazy_mkdtemp(l->path, sizeof(l->path), l->template) < 0)
+            return -1;
+        proc_scratch_register(l->path);
+    }
     for (int i = 0; i < FD_TABLE_SIZE; i++) {
-        fd_entry_t snap;
-        if (!fd_snapshot(i, &snap))
+        bool live = fd_get_type(i) != FD_CLOSED;
+        if (live == (l->present[i] != 0))
+            continue;
+        char entry[160];
+        int en = snprintf(entry, sizeof(entry), "%s/%d", l->path, i);
+        if (en <= 0 || (size_t) en >= sizeof(entry))
+            continue;
+        if (live) {
+            int tfd = open(entry, O_CREAT | O_WRONLY, 0444);
+            if (tfd < 0)
+                continue;
+            close(tfd);
+        } else if (unlink(entry) < 0 && errno != ENOENT) {
+            continue;
+        }
+        l->present[i] = live;
+    }
+    return 0;
+}
+
+/* Fill @dir, which mkdtemp created empty, with one file per live guest fd. */
+static void proc_fd_scratch_populate(const char *dir)
+{
+    for (int i = 0; i < FD_TABLE_SIZE; i++) {
+        if (fd_get_type(i) == FD_CLOSED)
             continue;
         char entry[160];
         int en = snprintf(entry, sizeof(entry), "%s/%d", dir, i);
@@ -459,6 +577,45 @@ static int proc_open_fd_scratch(const char *prefix, int linux_flags)
         int tfd = open(entry, O_CREAT | O_WRONLY, 0444);
         if (tfd >= 0)
             close(tfd);
+    }
+}
+
+/* Open a per-call scratch directory holding one empty file per live guest fd.
+ *
+ * Returns a host dirfd on success, -1 on failure with errno set.
+ *
+ * The dirfd is the standard backing for getdents on this synthetic listing. Two
+ * concurrent openers get two independent dirs, so neither mutates the other's
+ * enumeration. Each dir is an APFS clone of @l's template, taken under its lock
+ * so it is one consistent snapshot; a volume that cannot clone gets the files
+ * created directly.
+ */
+static int proc_open_fd_scratch(proc_fd_listing_t *l, int linux_flags)
+{
+    static _Atomic uint64_t clone_seq;
+    char dir[96];
+    bool cloned = false;
+
+    /* The clone sits beside its template, whose mkdtemp name is already private
+     * to this process; the sequence number keeps clones apart. clonefile does
+     * not replace an existing destination, so a leftover name fails over to the
+     * direct path instead of reusing someone else's directory.
+     */
+    pthread_mutex_lock(&l->lock);
+    if (proc_fd_listing_sync_locked(l) == 0) {
+        uint64_t seq =
+            atomic_fetch_add_explicit(&clone_seq, 1, memory_order_relaxed);
+        int n = snprintf(dir, sizeof(dir), "%s.%llu", l->path,
+                         (unsigned long long) seq);
+        cloned = n > 0 && (size_t) n < sizeof(dir) &&
+                 clonefile(l->path, dir, 0) == 0;
+    }
+    pthread_mutex_unlock(&l->lock);
+    if (!cloned) {
+        str_copy_trunc(dir, l->template, sizeof(dir));
+        if (!mkdtemp(dir))
+            return -1;
+        proc_fd_scratch_populate(dir);
     }
 
     proc_scratch_register(dir);
@@ -1625,6 +1782,20 @@ static int proc_region_resident_pages(const guest_t *g,
                                        end - start, pages_out);
 }
 
+/* The guest path of the linked file behind a region's backing descriptor, or
+ * an empty string when it has none to report.
+ */
+static void proc_region_backing_name(int host_fd, char *out, size_t outsz)
+{
+    out[0] = '\0';
+    struct stat st;
+    char host_path[MAXPATHLEN];
+    if (fstat(host_fd, &st) < 0 || st.st_nlink == 0 || !S_ISREG(st.st_mode) ||
+        fcntl(host_fd, F_GETPATH, host_path) < 0 ||
+        path_host_to_guest(host_path, out, outsz) < 0)
+        out[0] = '\0';
+}
+
 /* Build the VMA list shared by /proc/self/maps and /proc/self/smaps, merging
  * contiguous regions[] runs that came from one mmap.
  *
@@ -1661,11 +1832,31 @@ static int proc_build_maps_entries(const guest_t *g,
         nregions = 0;
     if (nregions > GUEST_MAX_REGIONS)
         nregions = GUEST_MAX_REGIONS;
+    /* A file mapping names its file, as Linux does. The region tracker keeps
+     * the host descriptor rather than a path, so the guest spelling is asked of
+     * it here, once per run of regions on one descriptor, instead of on every
+     * mmap. Unlinked backings (memfd, the fork-time anon-shared promotion, a
+     * file the guest removed) stay nameless: their Linux names come from
+     * kernel state the descriptor does not carry.
+     */
+    int named_fd = -1;
+    char named_path[LINUX_PATH_MAX];
+    named_path[0] = '\0';
     for (int i = 0; i < nregions; i++) {
         const guest_region_t *r = &g->regions[i];
         uint64_t start = r->start & ~0xFFFULL;
         uint64_t end = maps_align_up_page(r->end);
         uint64_t resident = 0;
+        const char *name = r->name;
+        if (!name[0] && r->backing_fd >= 0 &&
+            !(r->flags & LINUX_MAP_ANONYMOUS)) {
+            if (r->backing_fd != named_fd) {
+                named_fd = r->backing_fd;
+                proc_region_backing_name(named_fd, named_path,
+                                         sizeof(named_path));
+            }
+            name = named_path;
+        }
         if (with_residency) {
             int rc =
                 proc_region_resident_pages(g, r, r->start, r->end, &resident);
@@ -1681,14 +1872,15 @@ static int proc_build_maps_entries(const guest_t *g,
             last->flags == r->flags && last->offset == r->offset &&
             last->inherited_at_fork == r->inherited_at_fork &&
             last->dontfork == r->dontfork &&
-            last->wipeonfork == r->wipeonfork && !strcmp(last->name, r->name)) {
+            last->wipeonfork == r->wipeonfork &&
+            !strcmp(maps_entry_name(last), name)) {
             last->end = end;
             last->resident_pages += resident;
             continue;
         }
         if (maps_entries_append_entry(
                 &entries, start, end, r->prot, r->flags, r->offset, resident,
-                r->name, r->inherited_at_fork, r->dontfork, r->wipeonfork) < 0)
+                name, r->inherited_at_fork, r->dontfork, r->wipeonfork) < 0)
             goto out_unlock;
     }
 
@@ -1698,7 +1890,7 @@ out_unlock:
     saved_errno = errno;
     mmap_lock_release();
     if (result < 0) {
-        maps_entries_destroy(&entries);
+        maps_entries_release(&entries);
         errno = saved_errno;
         return -1;
     }
@@ -1729,7 +1921,7 @@ static int proc_format_maps_header(const maps_entry_t *e,
     if ((size_t) header_len >= headersz)
         header_len = (int) headersz - 1;
 
-    if (e->name[0]) {
+    if (e->name) {
         while (header_len < MAPS_NAME_COLUMN &&
                (size_t) header_len < headersz - 1)
             header[header_len++] = ' ';
@@ -1755,7 +1947,7 @@ static int proc_finish_maps_output(int result,
                                    string_builder_t *builder)
 {
     int saved_errno = errno;
-    maps_entries_destroy(entries);
+    maps_entries_release(entries);
     string_builder_destroy(builder);
     errno = saved_errno;
     return result;
@@ -1780,7 +1972,7 @@ static int proc_open_self_maps(const guest_t *g)
     /* Emit lines after merging so buffer accounting is centralized. */
     for (int i = 0; i < nentries; i++) {
         const maps_entry_t *e = maps_entries_at_const(&entries, (size_t) i);
-        char line[256];
+        char line[128 + LINUX_PATH_MAX];
         int line_len = proc_format_maps_header(e, line, sizeof(line));
         if (line_len < 0 ||
             string_builder_append_n(&builder, line, (size_t) line_len) < 0 ||
@@ -1827,7 +2019,7 @@ static int proc_open_self_smaps(const guest_t *g)
 
     for (int i = 0; i < nentries; i++) {
         const maps_entry_t *e = maps_entries_at_const(&entries, (size_t) i);
-        char header[256];
+        char header[128 + LINUX_PATH_MAX];
         int header_len = proc_format_maps_header(e, header, sizeof(header));
         if (header_len < 0)
             goto out;
@@ -2446,7 +2638,7 @@ static int intercept_open_dispatch(const guest_t *g,
      * mutate one another (see proc_open_fd_scratch).
      */
     if (!strcmp(path, "/proc/self/fd") || !strcmp(path, "/proc/self/fd/"))
-        return proc_open_fd_scratch("elfuse-fd", linux_flags);
+        return proc_open_fd_scratch(&proc_fd_listing, linux_flags);
 
     if (!strcmp(path, "/proc/net") || !strcmp(path, "/proc/net/")) {
         const char *dir = ensure_proc_tmpdir(g);
@@ -2984,7 +3176,7 @@ static int intercept_open_dispatch(const guest_t *g,
      */
     if (!strcmp(path, "/proc/self/fdinfo") ||
         !strcmp(path, "/proc/self/fdinfo/")) {
-        return proc_open_fd_scratch("elfuse-fdinfo", linux_flags);
+        return proc_open_fd_scratch(&proc_fdinfo_listing, linux_flags);
     }
 
     /* /proc/self/fd/N -> open the target of the fd (readlink-style) */

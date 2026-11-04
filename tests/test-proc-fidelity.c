@@ -24,6 +24,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/eventfd.h>
+#include <sys/mman.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -728,6 +729,137 @@ static void test_proc_fdinfo_dir_concurrent_safe(void)
     EXPECT_TRUE(n1 >= 3 && n2 >= 3, "concurrent enumeration broken");
 }
 
+/* True when the listing behind @d names descriptor @fd. */
+static bool fd_listing_has(DIR *d, int fd)
+{
+    char name[16];
+    snprintf(name, sizeof(name), "%d", fd);
+    rewinddir(d);
+    struct dirent *ent;
+    while ((ent = readdir(d)))
+        if (!strcmp(ent->d_name, name))
+            return true;
+    return false;
+}
+
+static void test_proc_fd_dir_tracks_churn(void)
+{
+    TEST("/proc/self/fd listing follows open and close churn");
+
+    /* Each open is a snapshot: a listing opened earlier keeps its entries
+     * while the descriptor set changes, and a later open reflects the closes
+     * and reopens made in between, across several rounds.
+     */
+    enum { N = 64 };
+    int fds[N];
+    for (int i = 0; i < N; i++)
+        fds[i] = open("/dev/null", O_RDONLY);
+    DIR *before = opendir("/proc/self/fd");
+    if (!before) {
+        FAIL("opendir before");
+        return;
+    }
+    bool ok = true;
+    for (int round = 0; round < 4 && ok; round++) {
+        for (int i = round % 2; i < N; i += 2) {
+            close(fds[i]);
+            fds[i] = -1;
+        }
+        DIR *now = opendir("/proc/self/fd");
+        if (!now) {
+            FAIL("opendir during churn");
+            closedir(before);
+            return;
+        }
+        for (int i = 0; i < N && ok; i++) {
+            if (fds[i] >= 0 && !fd_listing_has(now, fds[i]))
+                ok = false;
+        }
+        for (int i = round % 2; i < N && ok; i += 2) {
+            fds[i] = open("/dev/null", O_RDONLY);
+            if (fds[i] < 0)
+                ok = false;
+        }
+        closedir(now);
+        /* The reopens reuse the closed numbers, so a listing taken now must
+         * name every one of them again.
+         */
+        DIR *after = opendir("/proc/self/fd");
+        for (int i = 0; i < N && ok && after; i++)
+            if (!fd_listing_has(after, fds[i]))
+                ok = false;
+        if (after)
+            closedir(after);
+    }
+    for (int i = 0; i < N && ok; i++)
+        if (fds[i] >= 0 && !fd_listing_has(before, fds[i]))
+            ok = false;
+    closedir(before);
+
+    int probe = open("/dev/null", O_RDONLY);
+    close(probe);
+    DIR *closed = opendir("/proc/self/fd");
+    bool stale = closed && fd_listing_has(closed, probe);
+    if (closed)
+        closedir(closed);
+    for (int i = 0; i < N; i++)
+        if (fds[i] >= 0)
+            close(fds[i]);
+    EXPECT_TRUE(ok && closed && !stale,
+                "listing missed a live fd or kept a closed one");
+}
+
+/* The /proc/self/maps line covering @addr, or false when none does. */
+static bool maps_line_for(const void *addr, char *out, size_t outsz)
+{
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f)
+        return false;
+    bool found = false;
+    while (!found && fgets(out, (int) outsz, f)) {
+        unsigned long lo, hi;
+        if (sscanf(out, "%lx-%lx", &lo, &hi) == 2 &&
+            (unsigned long) addr >= lo && (unsigned long) addr < hi)
+            found = true;
+    }
+    fclose(f);
+    return found;
+}
+
+static void test_proc_maps_names_file_mappings(void)
+{
+    TEST("/proc/self/maps names file-backed mappings");
+
+    /* Native crash reporters and loaders map a PC back to its library by the
+     * pathname column; an unnamed file mapping hides every library.
+     */
+    char path[] = "/tmp/maps-name-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0 || ftruncate(fd, 8192) < 0) {
+        FAIL("mkstemp");
+        return;
+    }
+    void *p = mmap(NULL, 8192, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED) {
+        unlink(path);
+        FAIL("mmap");
+        return;
+    }
+    char line[1024];
+    bool named = maps_line_for(p, line, sizeof(line)) &&
+                 strstr(line, strrchr(path, '/'));
+
+    /* A removed file has no path to report, and must not borrow one. */
+    unlink(path);
+    char gone[1024];
+    bool removed_unnamed = maps_line_for(p, gone, sizeof(gone)) &&
+                           !strstr(gone, strrchr(path, '/'));
+    munmap(p, 8192);
+    EXPECT_TRUE(named && removed_unnamed,
+                "file mapping not named, or a removed one kept its name");
+}
+
 static void test_proc_fdinfo_dirfd_openat_uses_virtual_entries(void)
 {
     TEST("/proc/self/fdinfo dirfd openat resolves virtually");
@@ -965,6 +1097,8 @@ int main(void)
     test_proc_fdinfo_timerfd_periodic_value();
     test_proc_fdinfo_timerfd_ticks_drains_kqueue();
     test_proc_fdinfo_dir_concurrent_safe();
+    test_proc_fd_dir_tracks_churn();
+    test_proc_maps_names_file_mappings();
     test_proc_fdinfo_dirfd_openat_uses_virtual_entries();
     test_proc_net_tcp_sl_dense();
     test_proc_net_dirfd_openat_uses_virtual_entries();

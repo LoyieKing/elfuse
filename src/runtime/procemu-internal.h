@@ -25,7 +25,7 @@
  */
 int proc_open_dir_fd(const char *path, int linux_flags);
 
-/* Record a scratch directory for removal at exit. */
+/* Record a scratch directory for removal at its last close or at exit. */
 void proc_scratch_register(const char *dir);
 
 /* Remove one lazily-created scratch directory. The pty code uses it to drop its

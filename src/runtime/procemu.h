@@ -111,6 +111,18 @@ int proc_dev_shm_resolve(const char *guest_suffix,
                          char *host_path,
                          size_t host_path_sz);
 
+/* A directory stream's last reference is closing @host_fd. When it names a
+ * /proc listing scratch directory that no fork child shares, remove that
+ * directory now instead of at exit. No-op for every other descriptor.
+ */
+void proc_scratch_note_closed_dir(int host_fd);
+
+/* A fork is duplicating every guest descriptor into the child: the scratch
+ * directories tracked so far stay until exit, since the child may still list
+ * them through its inherited descriptors.
+ */
+void proc_scratch_note_fork(void);
+
 /* Drop the keepalive slave fd paired with a /dev/ptmx master host fd. Called
  * from fd_cleanup_entry when the guest closes the master so the host kernel
  * eventually tears the tty down. Idempotent and safe to call on any host fd

@@ -629,6 +629,7 @@ void dir_stream_release(void *ds_ptr)
     pthread_mutex_unlock(&fd_lock);
     if (last) {
         dir_backing_free(ds);
+        proc_scratch_note_closed_dir(dirfd(ds->dir));
         closedir(ds->dir);
         pthread_mutex_destroy(&ds->lock);
         free(ds);
@@ -3032,6 +3033,50 @@ int64_t sys_pipe2(guest_t *g, uint64_t fds_gva, int linux_flags)
     return 0;
 }
 
+/* lseek on a directory moves the getdents position, which lives in the pinned
+ * DIR* and its backing cursor rather than in the host descriptor: Darwin's
+ * readdir buffers ahead, so moving the host offset alone left a rewound guest
+ * reading the empty tail of the old buffer -- rewinddir() and every walk after
+ * the first came back empty. Linux accepts SEEK_SET to a d_off it handed out,
+ * or 0, and SEEK_CUR 0 to read the position; anything else is EINVAL.
+ *
+ * d_off on the primary side is the telldir cookie of the next entry, and the
+ * backing side counts its own entries from 1, so a SEEK_SET past the primary
+ * end is not representable; only the positions the walk itself reported are.
+ * A rewind also restarts the union, so the backing is drained afresh.
+ */
+static int64_t dir_stream_lseek(int fd, int64_t offset, int whence)
+{
+    char walk_path[FD_VIRTUAL_PATH_MAX];
+    dir_stream_t *ds = dir_stream_acquire(fd, walk_path, sizeof(walk_path));
+    if (!ds)
+        return INT64_MIN;
+    pthread_mutex_lock(&ds->lock);
+    int64_t ret;
+    if (whence == SEEK_CUR && offset == 0) {
+        ret = ds->backing_drained ? (int64_t) ds->backing_pos
+                                  : (int64_t) telldir(ds->dir);
+    } else if (whence == SEEK_SET && offset == 0) {
+        rewinddir(ds->dir);
+        dir_backing_free(ds);
+        ds->backing_drained = false;
+        ds->listing_errno = 0;
+        ret = 0;
+    } else if (whence == SEEK_SET && offset > 0 && !ds->backing_drained) {
+        seekdir(ds->dir, (long) offset);
+        ret = offset;
+    } else if (whence == SEEK_SET && offset > 0 &&
+               (uint64_t) offset <= ds->backing_count) {
+        ds->backing_pos = (size_t) offset;
+        ret = offset;
+    } else {
+        ret = -LINUX_EINVAL;
+    }
+    pthread_mutex_unlock(&ds->lock);
+    dir_stream_release(ds);
+    return ret;
+}
+
 int64_t sys_lseek(int fd, int64_t offset, int whence)
 {
     int64_t frc = fuse_lseek_fd(fd, offset, whence);
@@ -3040,7 +3085,9 @@ int64_t sys_lseek(int fd, int64_t offset, int whence)
     frc = usbdev_lseek_fd(fd, offset, whence);
     if (frc != INT64_MIN)
         return frc;
-
+    frc = dir_stream_lseek(fd, offset, whence);
+    if (frc != INT64_MIN)
+        return frc;
     host_fd_ref_t host_ref;
     int64_t err = host_fd_ref_open_io(fd, &host_ref);
     if (err < 0)
