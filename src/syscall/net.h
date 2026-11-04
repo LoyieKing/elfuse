@@ -19,6 +19,7 @@
 #include "syscall/internal.h"   /* fd_block_state_t */
 
 struct msghdr;
+struct sockaddr_storage;
 
 /* Linux address families. */
 #define LINUX_AF_UNSPEC 0
@@ -406,3 +407,19 @@ void absock_set_namespace_id(uint64_t namespace_id);
  * no family id mints one and returns true, the same as reading the id.
  */
 bool absock_namespace_is_owner(void);
+
+/* True when a host sockaddr's pathname is Android's dnsproxyd socket. */
+bool dns_bridge_is_proxyd(const struct sockaddr_storage *sa, int len);
+
+/* linux_sa is the guest sockaddr before sysroot translation. When it names
+ * /dev/socket/dnsproxyd, mac_sa is replaced with the host listener. Returns 1
+ * when replaced, 0 when linux_sa is some other address, -1 with errno set when
+ * the listener could not be started.
+ */
+int dns_bridge_retarget(const uint8_t *linux_sa,
+                        uint32_t addrlen,
+                        struct sockaddr_storage *mac_sa,
+                        int *mac_len);
+
+/* True when sa is the private path the bridge listener is bound to. */
+bool dns_bridge_is_listener(const struct sockaddr_storage *sa, int len);

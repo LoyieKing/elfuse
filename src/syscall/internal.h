@@ -162,6 +162,7 @@
  * it has no position in the order above and cannot be half of an inversion:
  *
  *   absock_lock (net-absock.c)       rlimit_lock (sys.c)
+ *   dns_bridge_lock (net-dns.c)      dns_resolv_lock (net-dns.c)
  *   log_mutex (debug/log.c)          rosettad_path_lock (rosetta.c)
  *   nl_lock (netlink.c)              session_lock (proc-identity.c)
  *   overlay_lock (chown-overlay.c)   shm_dir_lock (procemu.c)

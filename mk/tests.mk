@@ -351,6 +351,7 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract ch
 	$(call run-lane,test-sysroot-interp-fallback,PT_INTERP /lib fallback)
 	$(call run-lane,test-sysroot-interp-cased,PT_INTERP through an escaped path)
 	$(call run-lane,test-sysroot-absock-names,pathname sockets across the escape boundary)
+	$(call run-lane,test-dns-proxy,Bionic resolver protocol and descriptor inheritance)
 	$(call run-lane,test-absock-cleanup,absock namespace lifecycle)
 	$(call run-lane,test-registry-stale-pid,stale registry record on a reused host pid)
 	$(call run-lane,test-sysroot-root,sysroot mounted at /)
@@ -710,6 +711,11 @@ test-sysroot-symlink-target: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-symlink-tar
 		ls -Rb "$$tmpdir"; \
 		exit 1; \
 	fi
+
+.PHONY: test-dns-proxy
+test-dns-proxy: $(ELFUSE_BIN) $(BUILD_DIR)/test-dns-proxy
+	@$(SYSROOT_SCRATCH); \
+	$(ELFUSE_BIN) --sysroot "$$tmpdir" $(BUILD_DIR)/test-dns-proxy
 
 # A pathname socket's address is a filesystem path and resolves like one.
 # The recipe asserts the host-side half: the socket the guest leaves bound

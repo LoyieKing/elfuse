@@ -74,6 +74,7 @@ SRCS := \
     syscall/net-identity.c \
     syscall/net-absock.c \
     syscall/net-sockopt.c \
+    syscall/net-dns.c \
     syscall/netlink.c \
     syscall/usbdev.c \
     syscall/sysvipc.c \
@@ -120,7 +121,7 @@ DISPATCH_HEADER := $(BUILD_DIR)/dispatch.h
 DEPARTED_MANIFEST := tests/usbdev-ioctl-departed.tbl
 DEPARTED_GENERATOR := scripts/gen-usbdev-ioctl-departed.py
 DEPARTED_HEADER := $(BUILD_DIR)/usbdev-ioctl-departed-vectors.h
-HVF_LDFLAGS := -framework Hypervisor -framework IOKit -framework CoreFoundation -arch arm64
+HVF_LDFLAGS := -framework Hypervisor -framework IOKit -framework CoreFoundation -lresolv -arch arm64
 
 # Generated headers under build/ that must exist before compiling sources that
 # include them.

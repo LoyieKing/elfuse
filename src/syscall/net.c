@@ -835,10 +835,21 @@ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
         }
     } else {
         mac_len = net_sockaddr_to_mac(linux_sa, addrlen, false, &mac_sa);
-        if (mac_len < 0) {
-            host_fd_ref_close(&host_ref);
-            return mac_len;
-        }
+    }
+
+    /* The guest path, not the sysroot spelling. Translation rewrites
+     * /dev/socket/dnsproxyd before a check of mac_sa could see it, and a
+     * failed translation must not hide the name the guest actually connected
+     * to.
+     */
+    int dns_rc = dns_bridge_retarget(linux_sa, addrlen, &mac_sa, &mac_len);
+    if (dns_rc < 0) {
+        host_fd_ref_close(&host_ref);
+        return linux_errno();
+    }
+    if (dns_rc == 0 && mac_len < 0) {
+        host_fd_ref_close(&host_ref);
+        return mac_len;
     }
 
     /* glibc probes UDP connect(addr, port 0) during getaddrinfo() source
@@ -1061,6 +1072,21 @@ int64_t sys_getpeername(guest_t *g,
     if (getpeername(host_ref.fd, (struct sockaddr *) &mac_sa, &mac_len) < 0) {
         host_fd_ref_close(&host_ref);
         return linux_errno();
+    }
+
+
+    /* The bridge listener lives on a private host path. Report the pathname
+     * the guest connected to, not that path.
+     */
+    if (dns_bridge_is_listener(&mac_sa, (int) mac_len)) {
+        struct sockaddr_un *sun = (struct sockaddr_un *) &mac_sa;
+        static const char path[] = "/dev/socket/dnsproxyd";
+        memset(&mac_sa, 0, sizeof(mac_sa));
+        sun->sun_family = AF_UNIX;
+        memcpy(sun->sun_path, path, sizeof(path));
+        sun->sun_len = (uint8_t) (offsetof(struct sockaddr_un, sun_path) +
+                                  sizeof(path));
+        mac_len = sun->sun_len;
     }
 
     uint32_t guest_addrlen;
