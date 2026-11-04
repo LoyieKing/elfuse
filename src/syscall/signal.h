@@ -118,6 +118,7 @@ typedef struct {
 /* si_code values */
 #define LINUX_SI_USER 0
 #define LINUX_SI_TIMER (-2)
+#define LINUX_SI_TKILL (-6)
 
 /* si_code values for SIGTRAP */
 #define LINUX_TRAP_BRKPT 1 /* Process breakpoint (BRK instruction) */

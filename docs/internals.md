@@ -959,6 +959,9 @@ Key points:
 - Each `thread_entry_t` carries its own `blocked` mask. `rt_sigprocmask`
   operates on `current_thread->blocked`, and child threads inherit the
   parent's mask at clone time.
+- `tkill` and `tgkill` queue `SI_TKILL` with the guest sender PID and real UID.
+  glibc's cancellation handler checks this metadata before accepting its
+  thread-directed cancellation signal.
 - `rt_sigtimedwait` parks the task and releases its logical CPU while waiting.
   The wait set, siginfo destination and monotonic deadline remain task-owned
   across reissue. Signal enqueue and wait registration share `sig_lock`, so a

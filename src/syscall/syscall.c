@@ -1207,7 +1207,11 @@ static int64_t sc_tkill(guest_t *g,
         return -LINUX_EINVAL;
     if (sig == 0)
         return thread_tid_alive((int64_t) tid) ? 0 : -LINUX_ESRCH;
-    return signal_queue_thread((int64_t) tid, sig) ? 0 : -LINUX_ESRCH;
+    return signal_queue_thread_info((int64_t) tid, sig, LINUX_SI_TKILL,
+                                    (int32_t) proc_get_pid(), proc_get_uid(), 0,
+                                    0)
+               ? 0
+               : -LINUX_ESRCH;
 }
 
 static int64_t sc_tgkill(guest_t *g,
@@ -1246,7 +1250,11 @@ static int64_t sc_tgkill(guest_t *g,
     /* Thread-directed: only the target thread consumes it (Linux
      * task->pending). The enqueue resolves and validates the tid atomically.
      */
-    return signal_queue_thread((int64_t) tid, sig) ? 0 : -LINUX_ESRCH;
+    return signal_queue_thread_info((int64_t) tid, sig, LINUX_SI_TKILL,
+                                    (int32_t) proc_get_pid(), proc_get_uid(), 0,
+                                    0)
+               ? 0
+               : -LINUX_ESRCH;
 }
 
 /* Shared body for rt_tgsigqueueinfo (directed=true, thread-targeted) and

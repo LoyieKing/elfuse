@@ -21,9 +21,12 @@
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #ifndef SYS_tkill
@@ -244,6 +247,73 @@ static void test_tkill_self(void)
                 "tkill(self) did not deliver to the caller");
 }
 
+static volatile sig_atomic_t info_code, info_pid, info_uid;
+
+static void info_handler(int sig, siginfo_t *info, void *context)
+{
+    (void) sig;
+    (void) context;
+    info_code = info->si_code;
+    info_pid = info->si_pid;
+    info_uid = (sig_atomic_t) info->si_uid;
+}
+
+static void test_directed_metadata(void)
+{
+    TEST("tkill and tgkill preserve SI_TKILL and sender credentials");
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = info_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    EXPECT_EQ(sigaction(SIGUSR1, &sa, NULL), 0, "install siginfo handler");
+    for (int directed = 0; directed < 2; directed++) {
+        info_code = info_pid = info_uid = -1;
+        long rc = directed
+                      ? syscall(SYS_tgkill, getpid(), raw_gettid(), SIGUSR1)
+                      : syscall(SYS_tkill, raw_gettid(), SIGUSR1);
+        EXPECT_EQ(rc, 0, "send thread-directed signal");
+        EXPECT_EQ(info_code, SI_TKILL, "thread signal lost SI_TKILL");
+        EXPECT_EQ(info_pid, getpid(), "thread signal sender pid is wrong");
+        EXPECT_EQ(info_uid, getuid(), "thread signal sender uid is wrong");
+    }
+}
+
+static _Atomic bool cancel_ready;
+
+static void *cancel_sleeper(void *arg)
+{
+    (void) arg;
+    atomic_store_explicit(&cancel_ready, true, memory_order_release);
+    sleep(100);
+    return NULL;
+}
+
+static void test_cancel_sleep(void)
+{
+    TEST("pthread_cancel terminates a sleeping cancellation point");
+    pid_t child = fork();
+    if (child == 0) {
+        pthread_t worker;
+        void *result = NULL;
+        alarm(5);
+        atomic_store_explicit(&cancel_ready, false, memory_order_relaxed);
+        if (pthread_create(&worker, NULL, cancel_sleeper, NULL) != 0)
+            _exit(1);
+        while (!atomic_load_explicit(&cancel_ready, memory_order_acquire))
+            usleep(1000);
+        usleep(100000);
+        if (pthread_cancel(worker) != 0 || pthread_join(worker, &result) != 0 ||
+            result != PTHREAD_CANCELED)
+            _exit(1);
+        _exit(0);
+    }
+    int status = 0;
+    EXPECT_TRUE(child > 0 && waitpid(child, &status, 0) == child &&
+                    WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                "sleeping thread ignored cancellation or failed to exit");
+}
+
 int main(void)
 {
     printf("test-tgkill-directed: thread-directed signal routing\n");
@@ -251,6 +321,8 @@ int main(void)
     test_pthread_kill_targets_thread();
     test_directed_no_coalesce();
     test_tkill_self();
+    test_directed_metadata();
+    test_cancel_sleep();
 
     SUMMARY("test-tgkill-directed");
     return fails > 0 ? 1 : 0;
