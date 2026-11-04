@@ -1095,6 +1095,52 @@ chain completes 200 execs with eight live siblings per exec.
 
 
 
+## Runtime Profile Regression
+
+`make test-profile-host` checks disabled clock behavior, strict numeric
+configuration, IO re-dispatch across worker migration, parked result/errno
+completion, READY versus sleep residence, TID reuse, exec PC epoch identity,
+bounded storage overflow and snapshots containing an open syscall while the
+process is still alive. `make check` and `make check-sanitizer` include this
+host test. It does not require Hypervisor entitlements.
+
+For a guest smoke, use the same guest binary with profiling unset and with
+`ELFUSE_PROFILE=/private/tmp/profile-smoke` set; compare its exit status and
+stdout. A workload with a busy loop and a delayed pipe read/nanosleep should
+have guest CPU for the busy task, IO/sleep residence for the blocked task and
+one logical read with possibly multiple handler attempts. Capture a complete
+snapshot before terminating the guest, then parse it with
+`python3 scripts/elfuse-profile.py /private/tmp/profile-smoke.*.jsonl`.
+Run a fork/exec workload with a fresh prefix to check separate host-PID files
+and exec epoch markers. Invalid relative prefixes and unwritable output
+parents should disable profiling with a diagnostic and preserve guest output.
+Compare profiler-on/off wall and CPU time with fixed workload/CPU count;
+profiling records measured span clock overhead and changes scheduling timing.
+The [schema and sampling limits](usage.md#runtime-profile) define which
+comparisons are valid. EL1-only syscall paths are intentionally not counted
+as host-forwarded calls.
+
+On Apple M4 Pro, a real two-task guest workload completes in about two seconds
+with 11 periodic/final snapshots: the busy task has over 500 ms guest CPU, the
+pipe reader over one second IO residence, and nanosleep over one second sleep
+residence. The profiler host regression passes 12 checks. Scheduler scenarios
+process-cputime-thread-exit, signal-affinity-migrate and affinity-migrate pass
+with two CPUs; the host fork-quiesce regression passes four checks.
+
+Three alternating runs of 30,000 forwarded fstat calls on one CPU have median
+guest wall times 97.700 ms with Mach owner sampling and 65.561 ms with
+CLOCK_THREAD_CPUTIME_ID owner sampling. Three further alternating runs of the
+owner-sampled binary have medians 63.018 ms with profiling unset and 66.988 ms
+with profiling enabled. These are syscall microbenchmarks, not APK startup or
+frame-rate results. Foreign thread_info readings can lag owner readings;
+the shared high-water sample keeps the clock monotonic.
+Invalid relative and non-directory output prefixes both preserve the real
+fstat workload's successful result and report profiling disabled on stderr.
+The profiled real test-fork guest completes both normal and SIGUSR1 child
+exits. Its parent and two helper files each contain a final snapshot. The
+exporter starts after preemption signals are blocked; starting it earlier
+allows Darwin SIGUSR2 to terminate the host instead of reaching sigwait.
+
 ## OCI Images
 
 `python3 scripts/test-elfuse-oci.py` runs table cases over the parts of the OCI

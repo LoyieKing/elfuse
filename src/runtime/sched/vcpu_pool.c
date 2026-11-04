@@ -24,6 +24,7 @@
 
 #include "debug/gdbstub.h"
 #include "debug/gdbstub-reg.h"
+#include "debug/profile.h"
 #include "core/shim-globals.h"
 #include "hvutil.h"
 #include "syscall/linux-wire.h"
@@ -471,6 +472,7 @@ static void slot_cpu_port_init(struct vcpu_slot *slot)
 static bool slot_cpu_ns(struct vcpu_slot *slot, uint64_t *ns)
 {
     bool owner = slot == owner_slot;
+    uint64_t profile_start = profile_enabled() ? profile_now_ns() : 0;
     bool success;
     uint64_t sampled = 0;
     if (owner) {
@@ -493,6 +495,8 @@ static bool slot_cpu_ns(struct vcpu_slot *slot, uint64_t *ns)
                       (uint64_t) info.system_time.seconds * 1000000000ULL +
                       (uint64_t) info.system_time.microseconds * 1000ULL;
     }
+    if (profile_start)
+        profile_accounting(profile_start, success, slot->index, owner);
     if (!success)
         return false;
     uint64_t previous =
@@ -629,6 +633,8 @@ static void slot_settle_accounting(struct vcpu_slot *slot,
                                              memory_order_relaxed);
     uint64_t service = atomic_exchange_explicit(&slot->pending_service_ns, 0,
                                                 memory_order_relaxed);
+    if (profile_enabled())
+        profile_cpu(t, exec, service);
     if (exec || service)
         sched_account_interval_ns(t, exec, service);
     atomic_fetch_add_explicit(&slot->accounting_seq, 1, memory_order_release);
@@ -672,6 +678,8 @@ void vcpu_pool_account_phase(bool entering_guest)
     }
     if (entering_guest)
         (void) slot_barrier_before_guest(slot);
+    if (profile_enabled())
+        profile_phase(current_thread, entering_guest);
     atomic_fetch_add_explicit(&slot->accounting_seq, 1, memory_order_acq_rel);
     uint64_t now = 0;
     bool sampled = slot_cpu_ns(slot, &now);
@@ -1160,6 +1168,10 @@ static proc_leave_t run_one_task(struct vcpu_slot *slot,
     owner_slot = slot;
 
     current_thread = t;
+    if (profile_enabled()) {
+        profile_mount(t, slot->index);
+        profile_image(g->is_rosetta);
+    }
     atomic_store_explicit(&slot->in_exec, true, memory_order_release);
 
     if (!t->guest_ctx.valid) {

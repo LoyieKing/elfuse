@@ -176,6 +176,7 @@
  *   pid_sequence_lock (syscall/proc.c)
  *   sched_lock (runtime/sched/sched.c)   pool_lock (runtime/sched/vcpu_pool.c)
  *   handle_lock (runtime/sched/vcpu_pool.c): per-slot HVF handle lifetime
+ *   writer_lock (debug/profile.c), exporter sleep and exit coordination
  *
  * pid_sequence_lock serializes local users of the family PID counter.
  *

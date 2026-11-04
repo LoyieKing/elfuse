@@ -252,6 +252,7 @@ CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
         test-tlbi-encoder-host \
         test-vcpu-run-hooks-host test-identity-override-host \
         test-sched-fair-host test-sched-placement-host test-fork-quiesce-host \
+        test-profile-host \
         test-stdio-nonblock-host \
         test-rlimit-unchanged-host test-casefold-host \
         test-casefold-walk-host test-absock-names-host \
@@ -270,6 +271,7 @@ $(call run-host-unit,test-vcpu-run-hooks-host,vCPU run-loop hook API unit test)
 $(call run-host-unit,test-identity-override-host,identity override unit test)
 $(call run-host-unit,test-sched-fair-host,fair scheduler math unit test)
 $(call run-host-unit,test-sched-placement-host,scheduler CPU placement and stealing)
+$(call run-host-unit,test-profile-host,profile lifecycle and continuation accounting)
 $(call run-host-unit,test-fork-quiesce-host,fork and backing-pause ordering)
 $(call run-host-unit,test-casefold-host,filename codec unit test)
 $(call run-host-unit,test-casefold-walk-host,case-exact path resolution unit test)
@@ -2122,6 +2124,12 @@ test-elf-headers-host: $(BUILD_DIR)/test-elf-headers-host
 ## Run scheduler CPU policy, placement, and stealing tests on the host
 test-sched-placement-host: $(BUILD_DIR)/test-sched-placement-host
 	$(BUILD_DIR)/test-sched-placement-host
+
+.PHONY: test-profile-host
+## Run profile storage, continuation, and live snapshot tests on the host
+test-profile-host: $(BUILD_DIR)/test-profile-host
+	$(BUILD_DIR)/test-profile-host
+
 # Wakeup pipe concurrency unit test. Only a -fsanitize=thread build carries a
 # race detector, so check-sanitizer is where this lane has its full weight.
 ## Run the wakeup pipe concurrency unit test natively on the host

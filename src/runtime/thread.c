@@ -264,6 +264,8 @@ void thread_register_main(const guest_t *g,
     thread_entry_t *t = thread_slots[0];
     main_thread_entry = t;
     atomic_store_explicit(&t->guest_tid, tid, memory_order_relaxed);
+    if (profile_enabled())
+        profile_attach(t);
     guest_ctx_save(vcpu, &t->guest_ctx);
     (void) vexit;
     t->clear_child_tid = 0;
@@ -387,6 +389,8 @@ rescan:
         /* Not in one; syscall_dispatch fills this */
         atomic_store_explicit(&t->in_syscall, -1, memory_order_relaxed);
         atomic_store_explicit(&t->guest_tid, tid, memory_order_relaxed);
+        if (profile_enabled())
+            profile_attach(t);
         if (stack_start < stack_end) {
             t->stack_map_start = stack_start;
             t->stack_map_end = stack_end;

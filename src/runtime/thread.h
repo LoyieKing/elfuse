@@ -33,6 +33,7 @@
 #include "runtime/sched/guest_ctx.h"
 #include "runtime/futex.h"
 #include "runtime/sched/sched.h"
+#include "debug/profile.h"
 
 /* Concurrent kernel tasks are not hard-capped at a fixed 64.
  *
@@ -121,6 +122,8 @@ typedef struct thread_entry {
                                * known via guest_t.
                                */
     uint64_t generation;      /* Slot identity; protected by thread_lock. */
+    struct profile_task
+        *profile;        /* Process-lifetime storage, never recycled. */
     unsigned references; /* Held under thread_lock; prevents slot recycling. */
     bool exit_cleanup_claimed;
 

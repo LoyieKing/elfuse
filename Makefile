@@ -83,7 +83,8 @@ SRCS := \
     debug/gdbstub-reg.c \
     debug/gdbstub-rsp.c \
     debug/log.c \
-    debug/syscall-hist.c
+    debug/syscall-hist.c \
+    debug/profile.c
 
 # The USB fixture seam (src/syscall/usbdev-fixture.h). usbdev.c calls it with no
 # conditional compilation of its own, so exactly one translation unit has to
@@ -159,6 +160,7 @@ $(DISPATCH_HEADER): $(DISPATCH_MANIFEST) $(DISPATCH_GENERATOR) src/syscall/abi.h
 	rm -f "$$tmp"
 
 $(BUILD_DIR)/syscall/syscall.o: $(DISPATCH_HEADER)
+$(BUILD_DIR)/debug/profile.o: $(DISPATCH_HEADER)
 
 $(DEPARTED_HEADER): $(DEPARTED_MANIFEST) $(DEPARTED_GENERATOR) \
 		src/syscall/usbdev.c | $(BUILD_DIR)
@@ -248,9 +250,16 @@ $(BUILD_DIR)/test-sched-fair-host: $(BUILD_DIR)/test-sched-fair-host.o \
 
 # Scheduler placement and steal invariants without HVF timing.
 $(BUILD_DIR)/test-sched-placement-host: tests/test-sched-placement-host.c \
-		src/runtime/sched/sched.c $(BUILD_DIR)/runtime/sched/fair.o | $(BUILD_DIR)
+        src/runtime/sched/sched.c $(BUILD_DIR)/runtime/sched/fair.o \
+        $(BUILD_DIR)/debug/profile.o | $(BUILD_DIR)
 	@echo "  CC      $<"
-	$(Q)$(CC) $(CFLAGS) -Isrc -Itests -o $@ $< $(BUILD_DIR)/runtime/sched/fair.o
+	$(Q)$(CC) $(CFLAGS) -Isrc -Itests -o $@ $< \
+		$(BUILD_DIR)/runtime/sched/fair.o $(BUILD_DIR)/debug/profile.o
+
+$(BUILD_DIR)/test-profile-host: tests/test-profile-host.c \
+        src/debug/profile.c src/debug/profile.h $(DISPATCH_HEADER) | $(BUILD_DIR)
+	@echo "  CC      $<"
+	$(Q)$(CC) $(CFLAGS) -Isrc -Itests -I$(BUILD_DIR) -o $@ $<
 
 $(BUILD_DIR)/test-fork-quiesce-host: tests/test-fork-quiesce-host.c \
         src/runtime/sched/vcpu_pool.c src/runtime/forkipc.c tests/test-harness.h \

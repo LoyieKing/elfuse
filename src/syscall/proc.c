@@ -61,6 +61,7 @@
 
 #include "debug/crashreport.h"
 #include "debug/gdbstub.h"
+#include "debug/profile.h"
 
 /* Process state. */
 
@@ -5159,6 +5160,8 @@ static vcpu_action_t syscall_return_epilogue(guest_t *g,
 static void inject_park_result(thread_entry_t *t, hv_vcpu_t vcpu)
 {
     int64_t result = exec_park_result_load(t);
+    if (profile_enabled())
+        profile_syscall_resume(t);
     hv_vcpu_set_reg(vcpu, HV_REG_X0, (uint64_t) result);
     t->guest_ctx.gprs[0] = (uint64_t) result;
     hv_vcpu_set_reg(vcpu, HV_REG_X7, 0);
@@ -5260,6 +5263,8 @@ proc_leave_t proc_resume_task(hv_vcpu_t vcpu,
     bool requeue_pi_restart = exec_park_requeue_pi_take(t);
     if (exec_park_result_pending_load(t) && requeue_pi_restart &&
         exec_park_result_load(t) == -LINUX_EINTR) {
+        if (profile_enabled())
+            profile_syscall_resume(t);
         exec_park_result_pending_store(t, false);
         if (t->guest_ctx.elr_el1 >= 4) {
             t->guest_ctx.elr_el1 -= 4;
@@ -5303,6 +5308,8 @@ proc_leave_t proc_resume_task(hv_vcpu_t vcpu,
                             signal_pending_interruption(NULL) &&
                             t->guest_ctx.elr_el1 >= 4;
             if (restarts) {
+                if (profile_enabled())
+                    profile_syscall_resume(t);
                 uint64_t elr_after_svc = t->guest_ctx.elr_el1;
                 syscall_restart_arm(vcpu, elr_after_svc, t->guest_ctx.gprs[8],
                                     result);
@@ -5953,6 +5960,25 @@ static proc_leave_t run_loop_core(hv_vcpu_t vcpu,
         vcpu_pool_account_phase(true);
         HV_CHECK_CTX(hv_vcpu_run(vcpu), vcpu, g);
         vcpu_pool_account_phase(false);
+        if (profile_enabled() && profile_sample_due(current_thread)) {
+            uint64_t pc = 0, lr = 0, cpsr = 0;
+            hv_return_t pc_rc = hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc);
+            hv_return_t lr_rc = hv_vcpu_get_reg(vcpu, HV_REG_X30, &lr);
+            hv_return_t ps_rc = hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &cpsr);
+            bool el0 = pc_rc == HV_SUCCESS && lr_rc == HV_SUCCESS &&
+                       ps_rc == HV_SUCCESS && (cpsr & 15) == 0;
+            if (!el0 && vexit->reason == HV_EXIT_REASON_EXCEPTION &&
+                ((vexit->exception.syndrome >> 26) & 0x3F) == 0x16 &&
+                (vexit->exception.syndrome & 0xFFFF) == 5) {
+                /* HVC #5 exposes restored EL0 GPRs; the return PC is ELR_EL1.
+                 */
+                pc_rc = hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &pc);
+                ps_rc = hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, &cpsr);
+                el0 = pc_rc == HV_SUCCESS && lr_rc == HV_SUCCESS &&
+                      ps_rc == HV_SUCCESS && (cpsr & 15) == 0;
+            }
+            profile_sample(current_thread, pc, lr, el0, g->is_rosetta);
+        }
         thread_fork_barrier_check();
 
         if (is_main)

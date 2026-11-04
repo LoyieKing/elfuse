@@ -80,6 +80,7 @@
 #include "core/shim-globals.h"
 
 #include "debug/syscall-hist.h"
+#include "debug/profile.h"
 
 /* Generated from src/syscall/dispatch.tbl into $(BUILD_DIR). */
 #include "dispatch.h"
@@ -2752,6 +2753,8 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
      * disabled so the bottom-of-dispatch record path is a single branch.
      */
     uint64_t hist_start_ns = syscall_hist_now_ns();
+    if (profile_enabled())
+        profile_syscall_begin(current_thread, nr);
 
     if (!verbose) {
         if (nr == SYS_getpid || nr == SYS_getppid || nr == SYS_gettid ||
@@ -2938,6 +2941,12 @@ slow_path:
             should_exit = true;
             result = 0; /* Not written back, but keep clean */
         } else if (result == SYSCALL_EXEC_HAPPENED) {
+            if (profile_enabled()) {
+                profile_syscall_end(current_thread, 0, false);
+                if (nr == SYS_execve || nr == SYS_execveat)
+                    profile_exec(current_thread);
+                profile_image(g->is_rosetta);
+            }
             if (hist_start_ns) {
                 /* Guard the subtraction: syscall_hist_now_ns returns 0 if
                  * clock_gettime fails. An unsigned 0 minus a non-zero start
@@ -2952,6 +2961,8 @@ slow_path:
             thread_note_syscall(-1);
             return SYSCALL_EXEC_HAPPENED;
         } else if (result == SYSCALL_PARKED) {
+            if (profile_enabled())
+                profile_syscall_end(current_thread, 0, true);
             /* Async park: do not write X0; HVC #5 unmounts the worker. */
             if (hist_start_ns) {
                 uint64_t hist_end_ns = syscall_hist_now_ns();
@@ -2975,6 +2986,8 @@ slow_path:
 
 
 fast_done:
+    if (profile_enabled())
+        profile_syscall_end(current_thread, result, false);
     thread_note_syscall(-1);
 
     if (!should_exit) {

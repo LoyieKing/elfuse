@@ -1097,6 +1097,8 @@ static bool task_insert_into_queue_locked(thread_entry_t *t,
         s->queued_class = cls;
         s->queued_cpu = cpu_index;
         s->state = SCHED_STATE_READY;
+        if (profile_enabled())
+            profile_state(t, SCHED_STATE_READY, PARK_KIND_NONE, now);
         s->placement_cpu = cpu_index;
     }
     return ok;
@@ -1134,6 +1136,8 @@ static int enqueue_ready_locked(thread_entry_t *t,
          * the wake recorded so CONT can publish READY without losing it.
          */
         s->state = SCHED_STATE_BLOCKED;
+        if (profile_enabled())
+            profile_state(t, SCHED_STATE_BLOCKED, PARK_KIND_STOP, now);
         s->wake_pending = true;
         a->timer = true;
         return 0;
@@ -1150,6 +1154,8 @@ static int enqueue_ready_locked(thread_entry_t *t,
 
     if (!task_insert_into_queue_locked(t, cpu_index, now, a)) {
         s->state = SCHED_STATE_READY;
+        if (profile_enabled())
+            profile_state(t, SCHED_STATE_READY, PARK_KIND_NONE, now);
         s->placement_cpu = cpu_index;
         a->timer = true;
         return 0;
@@ -1471,6 +1477,8 @@ static thread_entry_t *pick_locked(sched_cpu_state_t *cpu,
     s->queued_class = SCHED_CLASS_NONE;
     s->queued_cpu = -1;
     s->state = SCHED_STATE_RUNNING;
+    if (profile_enabled())
+        profile_state(next, SCHED_STATE_RUNNING, PARK_KIND_NONE, now);
     s->current_cpu = cpu_index;
     s->run_class = cls;
     s->run_start_ns = now;
@@ -1751,6 +1759,8 @@ void sched_attach_thread(thread_entry_t *t)
     s->placement_cpu = cpu_index;
     s->run_class = task_eff_class(t);
     s->run_start_ns = sched_now_ns();
+    if (profile_enabled())
+        profile_state(t, SCHED_STATE_RUNNING, PARK_KIND_NONE, s->run_start_ns);
     s->resched_requested = false;
     s->block_requested = false;
     cpu->current = t;
@@ -1788,6 +1798,8 @@ void sched_enqueue_thread(thread_entry_t *t)
     if (!s->attrs_initialized)
         sched_init_defaults_locked(t);
     s->state = SCHED_STATE_READY;
+    if (profile_enabled())
+        profile_state(t, SCHED_STATE_READY, PARK_KIND_NONE, now);
     s->wake_pending = false;
     enqueue_ready_locked(t, now, &a);
     pthread_mutex_unlock(&sched_lock);
@@ -1826,6 +1838,8 @@ void sched_detach_thread(thread_entry_t *t)
     }
     dl_forget_locked(t);
     s->state = SCHED_STATE_DEAD;
+    if (profile_enabled())
+        profile_state(t, SCHED_STATE_DEAD, PARK_KIND_NONE, sched_now_ns());
     s->current_cpu = -1;
     s->run_class = SCHED_CLASS_NONE;
     s->run_start_ns = 0;
@@ -1866,6 +1880,8 @@ bool sched_task_claim_stopped(thread_entry_t *t)
         task_remove_from_queue_locked(t);
     dl_forget_locked(t);
     s->state = SCHED_STATE_DEAD;
+    if (profile_enabled())
+        profile_state(t, SCHED_STATE_DEAD, PARK_KIND_NONE, sched_now_ns());
     s->current_cpu = -1;
     s->run_class = SCHED_CLASS_NONE;
     s->run_start_ns = 0;
@@ -1897,6 +1913,8 @@ void sched_unblock(thread_entry_t *t)
 
     pthread_mutex_lock(&sched_lock);
     sched_task_state_t *s = TS(t);
+    if (profile_enabled())
+        profile_wake(t);
     if (s->state == SCHED_STATE_RUNNING) {
         /* Completion before the block commits: the put must publish READY
          * instead of BLOCKED.
@@ -1904,11 +1922,15 @@ void sched_unblock(thread_entry_t *t)
         s->wake_pending = true;
     } else if (s->state == SCHED_STATE_BLOCKED) {
         s->state = SCHED_STATE_READY;
+        if (profile_enabled())
+            profile_state(t, SCHED_STATE_READY, PARK_KIND_NONE, now);
         s->wake_pending = false;
         place_fair_wakeup_locked(t);
         enqueue_ready_locked(t, now, &a);
     } else if (s->state == SCHED_STATE_NEW) {
         s->state = SCHED_STATE_READY;
+        if (profile_enabled())
+            profile_state(t, SCHED_STATE_READY, PARK_KIND_NONE, now);
         enqueue_ready_locked(t, now, &a);
     }
     pthread_mutex_unlock(&sched_lock);
@@ -1964,6 +1986,10 @@ void sched_wake_stop(thread_entry_t *t)
     } else if (s->state == SCHED_STATE_BLOCKED) {
         s->stop_blocked = false;
         s->state = SCHED_STATE_READY;
+        if (profile_enabled()) {
+            profile_state(t, SCHED_STATE_READY, PARK_KIND_NONE, now);
+            profile_wake(t);
+        }
         place_fair_wakeup_locked(t);
         enqueue_ready_locked(t, now, &a);
     }
@@ -2000,6 +2026,8 @@ void sched_stop_task(thread_entry_t *t, unsigned reasons)
         if (s->on_rq)
             task_remove_from_queue_locked(t);
         s->state = SCHED_STATE_BLOCKED;
+        if (profile_enabled())
+            profile_state(t, SCHED_STATE_BLOCKED, PARK_KIND_STOP, now);
         s->stop_blocked = true;
         s->wake_pending = false;
         if (s->placement_cpu < 0 || s->placement_cpu >= sched_ncpu ||
@@ -2065,6 +2093,10 @@ void sched_resume_task(thread_entry_t *t, unsigned reasons)
     if (s->state == SCHED_STATE_BLOCKED && !exec_park_active_load(t) &&
         (s->stop_blocked || s->wake_pending)) {
         s->state = SCHED_STATE_READY;
+        if (profile_enabled()) {
+            profile_state(t, SCHED_STATE_READY, PARK_KIND_NONE, now);
+            profile_wake(t);
+        }
         s->stop_blocked = false;
         s->wake_pending = false;
         place_fair_wakeup_locked(t);
@@ -2164,6 +2196,8 @@ void sched_put_current(thread_entry_t *t, sched_put_disposition_t how)
     if (how == SCHED_PUT_READY && !s->yield_requested)
         how = SCHED_PUT_PREEMPTED;
     s->yield_requested = false;
+    if (profile_enabled() && how == SCHED_PUT_PREEMPTED)
+        profile_preempt(t);
 
     if (cpu_index < 0 || cpu_index >= sched_ncpu) {
         if (how == SCHED_PUT_DEAD) {
@@ -2171,6 +2205,8 @@ void sched_put_current(thread_entry_t *t, sched_put_disposition_t how)
                 task_remove_from_queue_locked(t);
             dl_forget_locked(t);
             s->state = SCHED_STATE_DEAD;
+            if (profile_enabled())
+                profile_state(t, SCHED_STATE_DEAD, PARK_KIND_NONE, now);
             s->run_class = SCHED_CLASS_NONE;
             atomic_store_explicit(&s->stop_reasons, 0, memory_order_release);
             s->stop_requested = false;
@@ -2234,6 +2270,8 @@ void sched_put_current(thread_entry_t *t, sched_put_disposition_t how)
             task_remove_from_queue_locked(t);
         dl_forget_locked(t);
         s->state = SCHED_STATE_DEAD;
+        if (profile_enabled())
+            profile_state(t, SCHED_STATE_DEAD, PARK_KIND_NONE, now);
         s->placement_cpu = -1;
         s->wake_pending = false;
         s->block_requested = false;
@@ -2257,6 +2295,10 @@ void sched_put_current(thread_entry_t *t, sched_put_disposition_t how)
         bool real_park = exec_park_active_load(t) &&
                          exec_park_kind_load(t) != PARK_KIND_STOP;
         s->state = SCHED_STATE_BLOCKED;
+        if (profile_enabled())
+            profile_state(t, SCHED_STATE_BLOCKED,
+                          real_park ? exec_park_kind_load(t) : PARK_KIND_STOP,
+                          now);
         s->block_requested = false;
         s->resched_requested = false;
 
@@ -2289,6 +2331,8 @@ void sched_put_current(thread_entry_t *t, sched_put_disposition_t how)
     if (how == SCHED_PUT_BLOCKED && !s->wake_pending &&
         s->state != SCHED_STATE_READY) {
         s->state = SCHED_STATE_BLOCKED;
+        if (profile_enabled())
+            profile_state(t, SCHED_STATE_BLOCKED, exec_park_kind_load(t), now);
         s->block_requested = false;
         s->resched_requested = false;
         s->dl_yielded = false;
@@ -2309,6 +2353,8 @@ void sched_put_current(thread_entry_t *t, sched_put_disposition_t how)
     bool waking = s->wake_pending;
     s->wake_pending = false;
     s->state = SCHED_STATE_READY;
+    if (profile_enabled())
+        profile_state(t, SCHED_STATE_READY, PARK_KIND_NONE, now);
     s->block_requested = false;
     s->resched_requested = false;
 
@@ -3040,6 +3086,8 @@ static thread_entry_t *drain_one_locked(void)
         task_remove_from_queue_locked(t);
         dl_forget_locked(t);
         TS(t)->state = SCHED_STATE_DEAD;
+        if (profile_enabled())
+            profile_state(t, SCHED_STATE_DEAD, PARK_KIND_NONE, sched_now_ns());
         TS(t)->wake_pending = false;
         atomic_store_explicit(&TS(t)->stop_reasons, 0, memory_order_release);
         return t;

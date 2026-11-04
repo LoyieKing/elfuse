@@ -450,12 +450,150 @@ Off by default, and useful when a guest misbehaves rather than in normal use:
   `syscalls` prints a per-syscall histogram of startup traffic (frozen at the
   first `execve`, so steady-state calls do not swamp it), `all` does both.
   Comma-separated tokens are accepted, and `1` is a legacy alias for `steps`.
+- `ELFUSE_PROFILE=/absolute/prefix`: write versioned runtime profile snapshots
+  to `prefix.<host-pid>.jsonl`. See [Runtime Profile](#runtime-profile).
 - `ELFUSE_SHIM_STATS=1`: dump the EL1 shim counter table to stderr at exit, so
   a syscall that should be served inside the shim but takes the HVC #5 exit is
   attributed without a rebuild.
 - `ELFUSE_DISABLE_TLBI_RANGE=1`: refuse `FEAT_TLBIRANGE` and fall back to
   per-page and broadcast invalidation, which separates a stale-TLB bug from
   the range-encoding path.
+
+## Runtime Profile
+
+```sh
+ELFUSE_PROFILE=/private/tmp/elfuse-run \
+  ELFUSE_PROFILE_INTERVAL_MS=1000 build/elfuse --cpus 4 guest-program
+python3 scripts/elfuse-profile.py /private/tmp/elfuse-run.*.jsonl
+python3 scripts/elfuse-profile.py /private/tmp/elfuse-run.12345.jsonl \
+  --from-seq 2 --to-seq 8 --limit 15
+```
+
+The host environment selects profiling, independently of `--clear-env` and
+guest `--env` entries. Embedded launches use the same host variables.
+`ELFUSE_PROFILE` must be an absolute output prefix, with an existing writable
+parent directory. Each host process creates a new mode-0600 file exclusively;
+an existing file is an error. Relative paths, empty values, invalid numeric
+knobs, allocation failures and output errors produce a host stderr diagnostic
+and disable profiling without changing the guest's result. Unset profiling
+has no profiling clock reads, storage allocation or locks on execution paths.
+
+`ELFUSE_PROFILE_INTERVAL_MS` defaults to 1000 and accepts 100 through 60000.
+The exporter sleeps on a relative host condition-variable timeout, then writes
+one bounded snapshot. Slow writes delay the exporter, never a guest worker.
+The exporter thread is created after SIGUSR2 and SIGALRM are blocked, so a
+fork helper inherits that mask before a sibling doorbell can arrive.
+No worker writes records or allocates per event. The exporter does not sample
+Mach CPU clocks; it reads counters updated by existing accounting hooks.
+Normal host exit joins the exporter and flushes a final snapshot. SIGTERM,
+SIGKILL, crashes and harness termination retain completed periodic snapshots;
+they need no exit handler. Files are not fsynced for power-loss durability.
+Guest fork uses a new host process with its own file, counters and exporter.
+The output descriptor is close-on-exec and is not transferred as a guest fd.
+
+The schema is JSONL version 1 (`v: 1` on every record). Records are:
+
+| `type` | Fields and meaning |
+|---|---|
+| `metadata` | Host PID/PPID, host architecture, clock, units, capacities, storage bytes and array field names |
+| `snapshot` | `seq`, `mono_ns`, `elapsed_ns`, process `epoch`, `rosetta`, `final`, loss counters and `cpu_sample` counters |
+| `thread` | `seq`, process-lifetime `task` index, guest `tid`, thread-slot `generation`, last mounted `worker`, state/kind, cumulative `values`/`wait_ns` and live span starts |
+| `syscall` | `seq`, `task`, `tid`, AArch64 `nr`/`name`, cumulative `values`, `active_hist`, last return and bounded Linux errno counts |
+| `pc` | `seq`, `task`, image `epoch`, PC/LR address pair, Rosetta flag and cumulative count |
+| `snapshot_end` | `seq` and ending `epoch`; completes the snapshot |
+
+A reader accepts only snapshots ending in a matching `snapshot_end`. A live
+or terminated file can end with a partial line or incomplete snapshot. The
+analyzer ignores this tail, rejects unsupported versions, ranks phases,
+syscalls and task lifetimes, and subtracts optional complete snapshot
+boundaries. Each file is analyzed separately. Counters are cumulative from
+process start; maxima remain lifetime maxima, not interval maxima. A changed
+epoch between the snapshot header and end indicates a concurrent guest exec.
+Exec increments the marker without clearing runtime or syscall totals; PC
+identities include their image epoch. Task indexes are never reused, so TID
+reuse and migration cannot combine different thread lifetimes.
+
+All durations and timestamps are integer nanoseconds on host
+`CLOCK_MONOTONIC`. `thread.values` follows `metadata.thread_fields`:
+`guest_cpu_ns`, `service_cpu_ns`, `guest_wall_ns`, `host_wall_ns`, `mounts`,
+`preempts`, `wakes`. CPU totals reuse scheduler interval settlement from host
+thread CPU accounting; they exclude parked time and can lag an active mount
+by one accounting batch. Guest CPU includes EL0 and EL1 shim execution.
+Service CPU includes syscall dispatch, accounting and other mounted host
+work. Guest wall spans bracket HVF execution; host wall spans bracket mounted
+host work. Both include host descheduling and are not CPU utilization.
+Accounting's `cpu_sample.wall_ns` is a nested subset, not an additional phase.
+Its owner and remote calls and nanoseconds measure the sources named in
+metadata: owner CLOCK_THREAD_CPUTIME_ID and foreign Mach thread_info.
+The shared high-water sample keeps their different freshness monotonic.
+Sampling durations include profiler clock bracket overhead.
+
+`thread.wait_ns` follows `metadata.wait_fields`: runnable READY residence,
+then blocked unknown, futex, sleep, IO, mqueue, stop, wait, vfork, IPC, service
+and signal residence. READY includes runnable bandwidth-throttled tasks.
+Only committed scheduler transitions accrue these counters. A completion
+racing before block publication contributes no blocked residence. The live
+`state_start_ns`, `kind`, `phase_start_ns`, `phase_guest`, `open_nr` and
+`open_start_ns` fields distinguish an active syscall or still-parked thread.
+`open_nr: -1` means none. Live phase spans apply only to RUNNING tasks.
+The analyzer adds open READY/BLOCKED residence at its snapshot boundary;
+phase totals are completed spans only. State numbers are NEW=0, READY=1,
+RUNNING=2, BLOCKED=3, DEAD=4. Kind numbers are unknown=0 through signal=10
+in the blocked field order above.
+
+`syscall.values` follows `metadata.syscall_fields`: logical host-forwarded
+`calls`, handler `attempts`, `completed`, `parks`, `active_ns`,
+`active_max_ns`, `latency_ns`, `latency_max_ns`, `errors`, `zero_returns`,
+`positive_returns`, `io_bytes`. Active wall brackets dispatch work up to
+handler return, excluding subsequent unmounted waits. Latency spans the
+logical call through final return or parked-result injection, including
+queue and blocked residence. IO park re-dispatch increments attempts, not
+calls; completion injection does not create another call. Signal-triggered
+SVC restart after an observed EINTR is another host-forwarded call, rather
+than an asserted libc-level logical call. Successful exec is return zero;
+rt_sigreturn's register-restoration sentinel is also completion zero.
+The exit syscall's sentinel is completion zero, not its guest exit status.
+Only returns -1 through -4095 count as Linux errors. `last_return` is one
+final result, not a distribution of positive results. `errno_counts` retains
+eight distinct errors per task/syscall; `errno_overflow` counts others.
+
+`active_hist` contains 16 dispatch-duration buckets. Bucket zero is
+0 through less than 2 microseconds. Bucket i (1 through 14) is
+`[2^i, 2^(i+1))` microseconds, and bucket 15 is at least 32768 microseconds.
+The buckets count attempts. `io_bytes` sums actual positive byte returns for
+read/write, vectored and positioned IO, sendto/recvfrom, sendmsg/recvmsg,
+sendfile and splice. Calls returning messages, descriptors or offsets do not
+report fabricated bytes. The EL1 fast paths do not exit to the host, so they
+are absent from these syscall counts; `ELFUSE_SHIM_STATS` can separately
+describe shim traffic. Host-forwarded Rosetta calls use the AArch64 ABI.
+
+Storage is bounded to 1024 task lifetimes, 64 distinct syscall numbers per
+task and 64 PC/LR pairs per task. `storage_bytes` reports reserved diagnostic
+storage. Later task lifetimes increment `task_overflow`; unrepresented
+syscall attempts increment `syscall_overflow`. No old lifetime is overwritten.
+`incomplete_calls` reports calls abandoned at death or replaced by another
+number. `clock_errors` reports unsupported duration readings; affected spans
+have zero duration rather than a guessed time. Snapshot fields are atomic
+but not a transaction: concurrent updates can appear in adjacent snapshots
+and a state/start pair can transiently disagree. The analyzer clamps live
+and delta arithmetic to zero. These records rank costs; they are not an
+event trace or exact causal timeline. Summed thread time overlaps across CPUs.
+
+Optional `ELFUSE_PROFILE_PC_MS=10` collects a throttled address pair on
+existing owner exits. Zero (the default) disables it; nonzero values through
+60000 are milliseconds between attempts per task. The profiler creates no
+extra exits and reads registers only on the owning worker. Direct EL0 exits
+use PC/LR; syscall HVC #5 uses ELR_EL1 and the restored EL0 LR after verifying
+SPSR_EL1. Other EL1 exits are rejected. `pc_non_el0` counts rejected/non-readable
+samples, and `pc_overflow` counts pairs beyond capacity. Samples are exit-biased,
+not uniform CPU samples or host callstacks. PC and LR are guest AArch64 virtual
+addresses; under Rosetta they belong to translated AArch64 execution, not
+guest x86 RIP.
+No address-to-symbol mapping is inferred. For native hotspots, capture the
+guest's `/proc/self/maps` during the same exec epoch and resolve file-backed
+addresses against that image's ELF segments and load bias. Mmap/munmap or
+JIT reuse within an epoch can invalidate a later map; no captured map means
+the address stays unresolved. LR is an address, not an unwound caller chain.
 
 ## OCI Images
 

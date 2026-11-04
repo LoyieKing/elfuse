@@ -49,6 +49,7 @@
 
 #include "debug/log.h"
 #include "debug/syscall-hist.h"
+#include "debug/profile.h"
 
 extern char **environ;
 
@@ -254,6 +255,7 @@ int main(int argc, char **argv)
      * histogram captures the very first dynamic-linker openat.
      */
     syscall_hist_init();
+    profile_init();
 
     bool verbose = false;
     guest_memory_mode_t memory_mode = GUEST_MEMORY_LAZY;
@@ -625,6 +627,9 @@ int main(int argc, char **argv)
      */
     if (proc_preempt_init() < 0)
         goto cleanup;
+
+    /* The fork helper does not enter elfuse_launch's writer-start path. */
+    profile_start_writer();
 
     /* Fork-child mode: receive VM state over IPC and run */
     if (fork_child_fd >= 0)
