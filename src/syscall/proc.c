@@ -5866,7 +5866,7 @@ static proc_leave_t run_loop_core(hv_vcpu_t vcpu,
     if (current_thread && current_thread->watchdog_progress_ns == 0)
         current_thread->watchdog_progress_ns = sched_now_ns();
 
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
 
     /* Main thread: arm the repeating watchdog timer. SIGALRM is blocked here
      * and consumed by the preemption thread (proc_preempt_init), which sets

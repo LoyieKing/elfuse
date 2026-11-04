@@ -1461,7 +1461,7 @@ static void *pool_worker_main(void *arg)
 {
     struct vcpu_slot *slot = (struct vcpu_slot *) arg;
 
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
 
     if (!pool_cfg_valid || configure_slot_vcpu(slot) != 0) {
         log_error("vcpu_pool: worker %d failed to create vCPU", slot->index);
@@ -1714,7 +1714,7 @@ int vcpu_pool_run_main(int timeout_sec)
         atomic_load_explicit(&slot->current, memory_order_acquire);
     int last_exit = 0;
 
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
 
     if (main_t && slot->vcpu_live) {
         int exit_code = 0;
