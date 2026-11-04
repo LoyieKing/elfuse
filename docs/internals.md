@@ -714,6 +714,11 @@ service job, so a snapshot cannot race its descriptor or session publication.
 - Each task receives a 4 KiB EL1 exception stack carved out of the shim
   data region.
 
+`guest_ctx` retains `ESR_EL1` and `FAR_EL1` with `ELR_EL1` and `SPSR_EL1`.
+Preemption can stop a task inside the shim before it reads the exception
+syndrome or fault address. Restoring those registers prevents another task's
+exception from changing the resumed task's dispatch or signal information.
+
 ### Futex
 
 `src/runtime/futex.c` implements:

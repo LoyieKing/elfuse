@@ -33,10 +33,13 @@
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/wait.h>
+#include <sys/syscall.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 #include "test-harness.h"
@@ -175,6 +178,66 @@ static void setup_blocked(void)
     sigprocmask(SIG_BLOCK, &set, NULL);
 }
 
+#ifdef __aarch64__
+#define MIGRATION_THREADS 16
+#define MIGRATION_FAULTS 30000
+static _Atomic bool migration_start;
+static _Atomic unsigned migration_errors;
+static _Thread_local unsigned migration_faults;
+static _Thread_local uintptr_t migration_address;
+
+static void migration_handler(int sig, siginfo_t *info, void *context)
+{
+    ucontext_t *uc = context;
+    if (sig != SIGSEGV || info->si_code != SEGV_MAPERR ||
+        info->si_addr != (void *) migration_address ||
+        uc->uc_mcontext.regs[8] != 0x12345678)
+        atomic_fetch_add_explicit(&migration_errors, 1, memory_order_relaxed);
+    migration_faults++;
+    uc->uc_mcontext.pc += 4;
+}
+
+static void *migration_worker(void *arg)
+{
+    migration_address = (uintptr_t) arg;
+    while (!atomic_load_explicit(&migration_start, memory_order_acquire))
+        ;
+    for (unsigned i = 0; i < MIGRATION_FAULTS; i++) {
+        register uint64_t x0 __asm__("x0") = migration_address;
+        register uint64_t x8 __asm__("x8") = 0x12345678;
+        __asm__ __volatile__("ldr xzr, [x0]" : "+r"(x0), "+r"(x8) : : "memory");
+        if (x0 != migration_address || x8 != 0x12345678)
+            atomic_fetch_add_explicit(&migration_errors, 1,
+                                      memory_order_relaxed);
+        syscall(SYS_getppid);
+    }
+    if (migration_faults != MIGRATION_FAULTS)
+        atomic_fetch_add_explicit(&migration_errors, 1, memory_order_relaxed);
+    return NULL;
+}
+
+static bool migration_check(void)
+{
+    struct sigaction sa = {.sa_sigaction = migration_handler,
+                           .sa_flags = SA_SIGINFO};
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGSEGV, &sa, NULL) != 0)
+        return false;
+    pthread_t threads[MIGRATION_THREADS];
+    int spawned = 0;
+    for (; spawned < MIGRATION_THREADS; spawned++)
+        if (pthread_create(&threads[spawned], NULL, migration_worker,
+                           (void *) (uintptr_t) (8 + spawned * 8)) != 0)
+            break;
+    atomic_store_explicit(&migration_start, true, memory_order_release);
+    bool ok = spawned == MIGRATION_THREADS;
+    for (int i = 0; i < spawned; i++)
+        ok &= pthread_join(threads[i], NULL) == 0;
+    return ok &&
+           atomic_load_explicit(&migration_errors, memory_order_relaxed) == 0;
+}
+#endif
+
 int main(void)
 {
     printf("test-fault-signal-mt: multi-threaded SIGSEGV delivery\n\n");
@@ -236,6 +299,11 @@ int main(void)
         FAIL("fault delivered to a non-faulting thread");
     else
         PASS();
+
+#ifdef __aarch64__
+    TEST("migration preserves fault class, address and registers");
+    EXPECT_TRUE(migration_check(), "fault became a syscall or changed address");
+#endif
 
     SUMMARY("test-fault-signal-mt");
     return fails ? 1 : 0;

@@ -23,6 +23,8 @@ void guest_ctx_save(hv_vcpu_t vcpu, guest_thread_ctx_t *ctx)
     ctx->tpidr_el0 = vcpu_get_sysreg(vcpu, HV_SYS_REG_TPIDR_EL0);
     ctx->elr_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_ELR_EL1);
     ctx->spsr_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_SPSR_EL1);
+    ctx->esr_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_ESR_EL1);
+    ctx->far_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_FAR_EL1);
     ctx->pc = vcpu_get_reg(vcpu, HV_REG_PC);
     ctx->cpsr = vcpu_get_reg(vcpu, HV_REG_CPSR);
     ctx->valid = true;
@@ -43,6 +45,8 @@ void guest_ctx_restore(hv_vcpu_t vcpu,
     vcpu_set_sysreg(vcpu, HV_SYS_REG_TPIDR_EL0, ctx->tpidr_el0);
     vcpu_set_sysreg(vcpu, HV_SYS_REG_ELR_EL1, ctx->elr_el1);
     vcpu_set_sysreg(vcpu, HV_SYS_REG_SPSR_EL1, ctx->spsr_el1);
+    vcpu_set_sysreg(vcpu, HV_SYS_REG_ESR_EL1, ctx->esr_el1);
+    vcpu_set_sysreg(vcpu, HV_SYS_REG_FAR_EL1, ctx->far_el1);
     vcpu_set_reg(vcpu, HV_REG_PC, ctx->pc);
     vcpu_set_reg(vcpu, HV_REG_CPSR, ctx->cpsr);
 

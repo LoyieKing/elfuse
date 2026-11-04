@@ -27,6 +27,8 @@ typedef struct guest_thread_ctx {
     uint64_t tpidr_el0;
     uint64_t elr_el1;
     uint64_t spsr_el1;
+    uint64_t esr_el1;
+    uint64_t far_el1;
     uint64_t pc;   /* HV_REG_PC at last save / initial entry */
     uint64_t cpsr; /* HV_REG_CPSR at last save / initial entry */
     bool valid;
