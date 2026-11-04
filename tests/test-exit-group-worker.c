@@ -23,12 +23,18 @@
  * an uncapped sleep would outlive the join cap, get detached, and race the
  * unmap.
  *
+ * A forked child also takes a default-action SIGSEGV on one worker among the
+ * same spinners and parkers. Linux ends the whole group with that signal; a
+ * regression lets only the faulting worker leave and the child later exits 42
+ * from its main thread.
+ *
  * Syscalls: clone(220), exit_group(94), wait4(260), sched_yield(124),
- * futex(98), read(63), pipe2(59)
+ * futex(98), read(63), pipe2(59), rt_sigaction(134)
  */
 
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -133,6 +139,43 @@ static void run_victim(int code)
         sched_yield();
 }
 
+/* A worker takes SIGSEGV under the default action while the same worker set
+ * runs and parks. Linux ends the whole thread group with the signal, so the
+ * parent must see WTERMSIG == SIGSEGV promptly, not the main thread's later
+ * exit code after the faulting worker has left alone.
+ */
+static void *crasher_fn(void *arg)
+{
+    (void) arg;
+    while (__sync_fetch_and_add(&workers_ready, 0) < N_WORKERS)
+        sched_yield();
+    usleep(20000);
+    signal(SIGSEGV, SIG_DFL);
+    *(volatile int *) 0 = 1;
+    return NULL;
+}
+
+static void run_crash_victim(void)
+{
+    pthread_t t;
+    workers_ready = 0;
+    if (pipe(park_pipe) != 0)
+        syscall(SYS_exit_group, 99);
+    for (int i = 0; i < N_SPINNERS; i++) {
+        if (pthread_create(&t, NULL, spinner_fn, NULL) != 0)
+            syscall(SYS_exit_group, 99);
+    }
+    if (pthread_create(&t, NULL, futex_parker_fn, NULL) != 0)
+        syscall(SYS_exit_group, 99);
+    if (pthread_create(&t, NULL, read_parker_fn, NULL) != 0)
+        syscall(SYS_exit_group, 99);
+    if (pthread_create(&t, NULL, crasher_fn, NULL) != 0)
+        syscall(SYS_exit_group, 99);
+    /* The group exit must stop this sleep; reaching the end is the bug. */
+    sleep(20);
+    syscall(SYS_exit_group, 42);
+}
+
 int main(void)
 {
     TEST("exit_group from worker thread (forked children)");
@@ -165,6 +208,33 @@ int main(void)
     }
 
 summary:
+    TEST("default fatal signal in a worker ends the thread group");
+    if (!fails) {
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        pid_t pid = fork();
+        if (pid < 0) {
+            FAIL("fork failed");
+        } else {
+            if (pid == 0)
+                run_crash_victim(); /* does not return */
+            int status;
+            if (waitpid(pid, &status, 0) != pid) {
+                FAIL("waitpid failed");
+            } else {
+                clock_gettime(CLOCK_MONOTONIC, &end);
+                double elapsed = (double) (end.tv_sec - start.tv_sec) +
+                                 (double) (end.tv_nsec - start.tv_nsec) / 1e9;
+                if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGSEGV)
+                    FAIL("group survived the worker's fatal SIGSEGV");
+                else if (elapsed >= 10.0)
+                    FAIL("group exit waited for the main thread's sleep");
+                else
+                    PASS();
+            }
+        }
+    }
+
     SUMMARY("test-exit-group-worker");
     if (fails)
         return 1;

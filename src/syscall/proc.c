@@ -229,6 +229,29 @@ void proc_request_exit_group(int code)
     proc_request_exit_group_status(code, (code & 0xff) << 8);
 }
 
+void proc_exit_group_broadcast(int code, int wait_status)
+{
+    proc_request_exit_group_status(code, wait_status);
+    /* Idle scheduler owners are outside HVF and must leave their queue wait. */
+    sched_request_shutdown();
+    wakeup_pipe_signal();
+    vcpu_pool_kick_all_mounted();
+
+    /* Workers parked on internal condvars (fork barrier, ptrace stop/wait) see
+     * neither the pipe nor the vCPU kick; broadcast so they re-check the
+     * exit-group flag and terminate before the authoritative join in main() (or
+     * guest_destroy, for the forked-child path) gives up on them.
+     */
+    thread_wake_exit_waiters();
+
+    /* Async futex/sleep/io parks are not on those condvars and are not inside
+     * hv_vcpu_run (force_exit is a no-op). Cancel them now so a forever
+     * FUTEX_WAIT helper (ks-futex_wait_timeout lock_pi) does not outlive the
+     * exiting thread and hang SoftNS child teardown until the harness timeout.
+     */
+    thread_wake_all_blocked();
+}
+
 void proc_clear_exit_group(void)
 {
     atomic_store_explicit(&exit_group_requested, 0, memory_order_relaxed);

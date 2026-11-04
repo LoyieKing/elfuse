@@ -4054,14 +4054,25 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
     return 1;
 }
 
+/* A terminating default action ends the whole thread group, as Linux
+ * get_signal() does through do_group_exit(). Recording the status on the task
+ * alone let only the faulting thread leave: a sibling such as the Java main
+ * thread then kept running past a crash, or the group survived with tasks
+ * that the crashed thread had been serving. A CLONE_VM child without
+ * CLONE_THREAD is its own group and still ends alone. The first group exit
+ * wins, so a later fatal signal cannot rewrite the reported status.
+ */
 static void signal_record_termination(int signum)
 {
     thread_entry_t *t = current_thread;
     if (!t)
         return;
-    t->termination_wait_status = signum;
+    int status = signum;
     if (signal_default_disposition(signum) == SIG_DISP_CORE)
-        t->termination_wait_status |= 0x80;
+        status |= 0x80;
+    t->termination_wait_status = status;
+    if (!t->is_vm_clone && !proc_exit_group_requested())
+        proc_exit_group_broadcast(128 + signum, status);
 }
 
 int signal_take_termination_wait_status(void)

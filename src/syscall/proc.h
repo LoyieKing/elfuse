@@ -728,6 +728,13 @@ int proc_exit_group_requested(void);
 int proc_exit_group_code(void);
 int proc_exit_group_wait_status(void);
 
+/* Request the group exit and wake every task so siblings leave promptly: those
+ * running in a vCPU, parked in futex/io/sleep waits, or held on internal
+ * condvars. Linux do_group_exit() plus zap_other_threads(); used by exit_group
+ * and by a fatal signal's default action.
+ */
+void proc_exit_group_broadcast(int code, int wait_status);
+
 /* vCPU run loop. */
 
 /* Request that the current host thread's HVC #6 run loop returns after the

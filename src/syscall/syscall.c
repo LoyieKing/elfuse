@@ -955,25 +955,7 @@ static int64_t sc_exit_group(guest_t *g,
      * own; the single authoritative join is in main() after vcpu_run_loop
      * returns, before guest teardown.
      */
-    proc_request_exit_group((int) x0);
-    /* Idle scheduler owners are outside HVF and must leave their queue wait. */
-    sched_request_shutdown();
-    wakeup_pipe_signal();
-    vcpu_pool_kick_all_mounted();
-
-    /* Workers parked on internal condvars (fork barrier, ptrace stop/wait) see
-     * neither the pipe nor the vCPU kick; broadcast so they re-check the
-     * exit-group flag and terminate before the authoritative join in main() (or
-     * guest_destroy, for the forked-child path) gives up on them.
-     */
-    thread_wake_exit_waiters();
-
-    /* Async futex/sleep/io parks are not on those condvars and are not inside
-     * hv_vcpu_run (force_exit is a no-op). Cancel them now so a forever
-     * FUTEX_WAIT helper (ks-futex_wait_timeout lock_pi) does not outlive the
-     * exiting thread and hang SoftNS child teardown until the harness timeout.
-     */
-    thread_wake_all_blocked();
+    proc_exit_group_broadcast((int) x0, ((int) x0 & 0xff) << 8);
     return SC_EXIT_SENTINEL | ((int) x0 & 0xFF);
 }
 
