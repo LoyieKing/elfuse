@@ -803,8 +803,8 @@ static uint64_t find_free_gap_inner(const guest_t *g,
     return UINT64_MAX; /* No suitable gap found */
 }
 
-/* Keep smaller skipped holes searchable, or varying-size temporary mappings
- * can advance through the arena indefinitely with constant live coverage.
+/* Keep smaller skipped holes searchable, or varying-size temporary mappings can
+ * advance through the arena indefinitely with constant live coverage.
  */
 static uint64_t find_free_gap(guest_t *g,
                               uint64_t length,
