@@ -446,7 +446,6 @@ int guest_init(guest_t *g,
     pthread_once(&tlbi_range_probe_once, tlbi_range_probe_run);
 
     memset(g, 0, sizeof(*g));
-    g->shm_fd = -1;
     g->memory_mode = memory_mode;
     g->ipa_base = GUEST_IPA_BASE;
     g->elf_load_min = ELF_DEFAULT_BASE;
@@ -519,9 +518,7 @@ int guest_init(guest_t *g,
     }
 
     /* Bisecting slab retry: try the largest slab first, halve on each failure
-     * down to a known-safe 64 GiB floor. The shm_fd CoW upgrade is attempted on
-     * every successful slab so file-backed memory is preserved at any size HVF
-     * accepts.
+     * down to a known-safe 64 GiB floor.
      */
     static const uint32_t slab_attempt_bits[] = {40, 38, 36};
     bool mapped = false;
@@ -551,6 +548,9 @@ int guest_init(guest_t *g,
         /* Reserve primary address space via mmap(MAP_ANON). macOS demand-pages
          * this so an unused 1 TiB reservation costs no physical memory. Do NOT
          * memset because that would touch every page and defeat demand paging.
+         * Anonymous private memory is also what lets fork hand the child a
+         * lazy copy-on-write view (guest_memory_snapshot_entry); a shared file
+         * backing would make that copy eager.
          */
         t0 = startup_trace_now_ns();
         g->host_base = mmap(NULL, try_size, PROT_READ | PROT_WRITE,
@@ -561,27 +561,6 @@ int guest_init(guest_t *g,
             g->host_base = NULL;
             continue;
         }
-
-        /* Try the file-backed CoW upgrade. If any step fails, fall back
-         * silently to MAP_ANON; fork will then use the IPC region-copy path
-         * instead of SCM_RIGHTS fd passing.
-         */
-        t0 = startup_trace_now_ns();
-        int sfd = tmpfile_anon("slab");
-        if (sfd >= 0) {
-            if (ftruncate(sfd, (off_t) try_size) == 0) {
-                void *p = mmap(g->host_base, try_size, PROT_READ | PROT_WRITE,
-                               MAP_SHARED | MAP_FIXED, sfd, 0);
-                if (p != MAP_FAILED) {
-                    g->shm_fd = sfd;
-                } else {
-                    close(sfd);
-                }
-            } else {
-                close(sfd);
-            }
-        }
-        startup_trace_step("cow_shm_upgrade", t0);
 
         t0 = startup_trace_now_ns();
         ret = hv_vm_map(g->host_base, GUEST_IPA_BASE, try_size,
@@ -596,10 +575,6 @@ int guest_init(guest_t *g,
 
         log_info("guest: hv_vm_map %u GiB failed (%d), trying smaller slab",
                  (unsigned) (try_size >> 30), (int) ret);
-        if (g->shm_fd >= 0) {
-            close(g->shm_fd);
-            g->shm_fd = -1;
-        }
         munmap(g->host_base, try_size);
         g->host_base = NULL;
     }
@@ -615,16 +590,15 @@ int guest_init(guest_t *g,
     return 0;
 }
 
-int guest_init_from_shm(guest_t *g,
-                        int shm_fd,
-                        uint64_t size,
-                        uint32_t ipa_bits,
-                        guest_memory_mode_t memory_mode)
+int guest_init_from_snapshot(guest_t *g,
+                             void *host_base,
+                             uint64_t size,
+                             uint32_t ipa_bits,
+                             guest_memory_mode_t memory_mode)
 {
     uint64_t t0;
 
     memset(g, 0, sizeof(*g));
-    g->shm_fd = -1;
     g->memory_mode = memory_mode;
     g->ipa_base = GUEST_IPA_BASE;
     g->elf_load_min = ELF_DEFAULT_BASE;
@@ -640,29 +614,11 @@ int guest_init_from_shm(guest_t *g,
     g->mmap_limit = size - 0x200000000ULL;
     g->overflow_ipa_next = size;
     if (!compute_infra_layout(g)) {
-        /* Layout computation may reject a malformed header (impossible
-         * guest_size / ipa_bits combination) before the mapping is set up;
-         * close the inherited shm fd here so the caller's contract -- this
-         * function takes ownership of shm_fd -- holds on every error path.
-         */
-        close(shm_fd);
+        munmap(host_base, size);
         return -1;
     }
     g->pt_pool_next = g->pt_pool_base;
-
-    /* The snapshot is independent of the parent; retain it for nested fork. */
-    t0 = startup_trace_now_ns();
-    g->host_base =
-        mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-    startup_trace_step("shm_mmap", t0);
-    if (g->host_base == MAP_FAILED) {
-        perror("guest: mmap shm");
-        g->host_base = NULL;
-        close(shm_fd);
-        return -1;
-    }
-
-    g->shm_fd = shm_fd;
+    g->host_base = host_base;
 
     /* Create HVF VM with the same IPA width as the parent */
     hv_return_t ret = HV_ERROR;
@@ -676,40 +632,28 @@ int guest_init_from_shm(guest_t *g,
             break;
         usleep(500000);
     }
-    startup_trace_step("hv_vm_create_shm", t0);
+    startup_trace_step("hv_vm_create_fork", t0);
     if (ret != HV_SUCCESS) {
-        log_error("guest: hv_vm_create (shm) failed: %d", (int) ret);
+        log_error("guest: hv_vm_create (fork) failed: %d", (int) ret);
         munmap(g->host_base, size);
         g->host_base = NULL;
-        if (g->shm_fd >= 0) {
-            close(g->shm_fd);
-            g->shm_fd = -1;
-        }
         return -1;
     }
 
     t0 = startup_trace_now_ns();
     ret = hv_vm_map(g->host_base, GUEST_IPA_BASE, size,
                     HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
-    startup_trace_step("hv_vm_map_shm", t0);
+    startup_trace_step("hv_vm_map_fork", t0);
     if (ret != HV_SUCCESS) {
-        log_error("guest: hv_vm_map (shm) failed: %d", (int) ret);
+        log_error("guest: hv_vm_map (fork) failed: %d", (int) ret);
         hv_vm_destroy();
         munmap(g->host_base, size);
         g->host_base = NULL;
-        if (g->shm_fd >= 0) {
-            close(g->shm_fd);
-            g->shm_fd = -1;
-        }
         return -1;
     }
 
-
-    log_debug(
-        "guest: fork snapshot: mapped %llu GiB from shm "
-        "(ipa=%u bits)",
-        (unsigned long long) (size / (1024ULL * 1024 * 1024)), ipa_bits);
-
+    log_debug("guest: fork snapshot: mapped %llu GiB (ipa=%u bits)",
+              (unsigned long long) (size / (1024ULL * 1024 * 1024)), ipa_bits);
     return 0;
 }
 
@@ -779,11 +723,6 @@ void guest_destroy(guest_t *g)
     free(g->regions);
     g->regions = NULL;
     g->regions_capacity = 0;
-    /* Close the shm fd if guest memory owns one (parent with shm backing) */
-    if (g->shm_fd >= 0) {
-        close(g->shm_fd);
-        g->shm_fd = -1;
-    }
 }
 
 /* Check whether a candidate IPA range [gpa, gpa+size) overlaps the primary
@@ -1858,95 +1797,6 @@ void guest_reset(guest_t *g)
 
     /* Clear semantic region tracking (will be re-populated after exec) */
     guest_region_clear(g);
-}
-
-/* Used region enumeration. */
-
-int guest_get_used_regions(const guest_t *g,
-                           unsigned int shim_size,
-                           used_region_t *out,
-                           int max)
-{
-    int n = 0;
-
-    /* Page table pool (high IPA, just below interp_base) */
-    if (n < max && g->pt_pool_next > g->pt_pool_base) {
-        out[n].offset = g->pt_pool_base;
-        out[n].size = g->pt_pool_next - g->pt_pool_base;
-        n++;
-    }
-
-    /* Shim code (high IPA) */
-    if (n < max && shim_size > 0) {
-        out[n].offset = g->shim_base;
-        out[n].size = shim_size;
-        n++;
-    }
-
-    /* Shim data/stack (full 2MiB block, high IPA) */
-    if (n < max) {
-        out[n].offset = g->shim_data_base;
-        out[n].size = BLOCK_2MIB;
-        n++;
-    }
-
-    /* ELF + brk region: from elf_load_min (set by ELF loader) to brk_current.
-     * The lower bound is the actual ELF load address, not ELF_DEFAULT_BASE:
-     * ET_EXECs linked below 0x400000 (e.g. at 0x200000) have segments below the
-     * legacy default and would otherwise be silently dropped from the legacy
-     * fork-IPC copy.
-     */
-    if (n < max && g->brk_current > g->elf_load_min) {
-        out[n].offset = g->elf_load_min;
-        out[n].size = g->brk_current - g->elf_load_min;
-        n++;
-    }
-
-    /* Stack (dynamic position, stored in guest_t) */
-    if (n < max) {
-        out[n].offset = g->stack_base;
-        out[n].size = g->stack_top - g->stack_base;
-        n++;
-    }
-
-    /* mmap RW region (up to high-water mark). With the gap-finding allocator,
-     * mmap_next is a high-water mark; freed regions within this range may
-     * contain PROT_NONE pages (zero-fill, no cost to copy). This is
-     * conservative but correct for fork state transfer.
-     */
-    if (n < max && g->mmap_next > MMAP_BASE) {
-        out[n].offset = MMAP_BASE;
-        out[n].size = g->mmap_next - MMAP_BASE;
-        n++;
-    }
-
-    /* mmap RX region (code mappings from dynamic linker) */
-    if (n < max && g->mmap_rx_next > MMAP_RX_BASE) {
-        out[n].offset = MMAP_RX_BASE;
-        out[n].size = g->mmap_rx_next - MMAP_RX_BASE;
-        n++;
-    }
-
-    /* Rosetta image and TTBR1 kbuf live near the top of the primary buffer
-     * (between the mmap RW high-water mark and the infra reserve), so the
-     * MMAP_BASE..mmap_next range above misses them. Snapshot each as its own
-     * block so the fork child inherits the translator image and the kernel-VA
-     * scratchpad without rebuilding either.
-     */
-    if (g->is_rosetta) {
-        if (n < max && g->rosetta_guest_base && g->rosetta_size) {
-            out[n].offset = g->rosetta_guest_base;
-            out[n].size = g->rosetta_size;
-            n++;
-        }
-        if (n < max && g->kbuf_gpa) {
-            out[n].offset = g->kbuf_gpa;
-            out[n].size = KBUF_SIZE;
-            n++;
-        }
-    }
-
-    return n;
 }
 
 /* Semantic region tracking.

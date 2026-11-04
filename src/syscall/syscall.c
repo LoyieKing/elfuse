@@ -495,20 +495,18 @@ SC_FORWARD(sc_futex, sys_futex(g, x0, (int) x1, (uint32_t) x2, x3, x4, (uint32_t
 
 /* Sync.
  *
- * Linux sync(2) flushes all dirty buffers. Forwarding to host sync() stalls
- * because the guest slab is mmap'd MAP_SHARED to internal tempfile (g->shm_fd)
- * for the CoW fork fast path: a global flush has to walk multi-GB of
- * demand-paged dirty pages from that tempfile, plus the same from any other
- * elfuse process running on the host. The slab tempfile is implementation
- * detail; the guest never opened it. Iterate the guest fd table and the region
- * overlay backing fds, dup each under its lock, release the lock, and fsync the
- * dups outside any guest lock so a slow disk cannot stall concurrent mmap/fd
- * operations on other threads. fsync on non-regular fds returns EINVAL on
- * macOS, which is benign and ignored. Always returns 0 to mirror sync(2)'s
- * "void" spirit. Inline fallback: under malloc failure the bulk-dup path cannot
- * proceed, so iterate one fd at a time, dupping under the matching lock and
- * fsync outside it. Slower (acquires/releases fd_lock per regular fd) but keeps
- * sync(2) honest under memory pressure instead of silently no-opping.
+ * Linux sync(2) flushes all dirty buffers. Forwarding to host sync() would
+ * flush every dirty file on the host, including other elfuse processes' file
+ * overlays, for files this guest never opened. Iterate the guest fd table and
+ * the region overlay backing fds instead, dup each under its lock, release the
+ * lock, and fsync the dups outside any guest lock so a slow disk cannot stall
+ * concurrent mmap/fd operations on other threads. fsync on non-regular fds
+ * returns EINVAL on macOS, which is benign and ignored. Always returns 0 to
+ * mirror sync(2)'s "void" spirit. Inline fallback: under malloc failure the
+ * bulk-dup path cannot proceed, so iterate one fd at a time, dupping under the
+ * matching lock and fsync outside it. Slower (acquires/releases fd_lock per
+ * regular fd) but keeps sync(2) honest under memory pressure instead of
+ * silently no-opping.
  */
 static void sc_sync_fdtable_inline(void)
 {

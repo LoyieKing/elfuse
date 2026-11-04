@@ -31,8 +31,9 @@ time is not copied as child CPU time.
 The current HVF backend has one VM per host process. src/runtime/forkipc.c
 implements fork using posix_spawn and IPC: another elfuse process creates a
 VM, restores the child registers and resources, and maps a memory snapshot.
-A sparse file holds an independent snapshot of current guest backing. Linux
-shared mappings require their own shared backing and child reattachment.
+A Mach copy-on-write entry over the slab hands the child an independent
+snapshot of current guest backing. Linux shared mappings require their own
+shared backing and child reattachment.
 
 elfuse keeps this execution mechanism and gives the child an independent
 local scheduler. Attribute inheritance remains required, but parent and
@@ -111,6 +112,40 @@ sibling teardown and replacement are safe. Exact de_thread identity/ptrace
 corner cases are not a full-compatibility requirement. Unsupported cases
 must fail before destructive changes; leader storage reuse never changes
 another task's identity.
+
+## TODO: vfork without a slab snapshot
+
+`CLONE_VM|CLONE_VFORK` (bionic `vfork`, `posix_spawn`, Java
+`ProcessBuilder`) still takes the full fork path: quiesce, copy-on-write slab
+entry, helper spawn, state IPC. The entry costs about 50 ms per resident GiB,
+and both sides then pay copy-on-write faults, so an Android app process with
+several GiB resident stops all threads for 250-480 ms per `getprop` or `sh -c`.
+The child only runs a few syscalls before `execve`.
+
+Planned replacement:
+
+1. Run the vfork child as an in-process task on the parent's slab, like
+   `sys_clone_vm`, with the parent parked until exec or exit.
+2. Give that task a private view of what children mutate before exec: fd
+   table (inherited slots borrowed, so closing one drops only the child's
+   slot), cwd, umask, signal dispositions, pgid/sid and effective ids. Bionic
+   `posix_spawn` file actions and `ApplyAttrs`, and libcore `childProcess`,
+   mutate exactly this set.
+3. Raise a shim attention bit while such a task exists so EL1 fast paths
+   (identity, urandom bitmap) defer to the host.
+4. At `execve`, after `exec_preload_interp` succeeds (the last recoverable
+   point), spawn a fresh elfuse with the resolved path, argv, envp, non-CLOEXEC
+   fds, cwd, umask, creds, rlimits, session, signal state and chown overlay.
+   Skip `thread_exec_de_thread` and the CLOEXEC sweep: neither may touch the
+   parent. The spawned process owns the guest pid; the in-process task retires
+   without reporting a vm-clone exit.
+5. Exit before exec (libcore writes errno to its fail pipe and `_exit`s)
+   reports through the process table, since libcore reaps from a different
+   thread than the one that forked.
+
+Acceptance: `tests/test-vfork-sibling`, a posix_spawn file-action and
+attribute matrix, Java `ProcessBuilder` with a redirect and a failing exec,
+and per-spawn parent stop time independent of resident size.
 
 ## Observable checks
 

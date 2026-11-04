@@ -641,11 +641,10 @@ edge preservation copies only backed guest pages, including private writes in
 the file's last page. Retained whole pages beyond EOF stay invalid and deliver
 `SIGBUS/BUS_ADRERR`; `mprotect` regrant keeps those pages invalid.
 
-Fork snapshots copy file-backed pages only through the rounded guest EOF page,
-including private writes in its zero-filled tail. Whole EOF pages are omitted
-from both sparse snapshot population and the region-copy fallback; the child
-restores their invalid PTEs after receiving backing descriptors. Anonymous
-compressed or paged-out data is still copied rather than treated as a hole.
+Fork snapshots carry file-backed pages as slab bytes, including private writes
+in the zero-filled tail of the last EOF page. The child restores invalid PTEs
+for whole pages past EOF after receiving backing descriptors, so they keep
+delivering `SIGBUS/BUS_ADRERR` there.
 
 Direct private file installation replaces the old backing without first
 resetting it to anonymous memory. Unmap resets plain slab pages and tears down
@@ -871,28 +870,30 @@ reaper is currently provided.
 
 ### CoW Fork Path
 
-Fork creates an independent, unlinked `shm_open` object and copies current
-primary backing while sibling tasks are quiesced. Anonymous replacements and
-private-file CoW bytes are included, along with page tables, shim state and
-Rosetta/kbuf memory. The populated fd reaches the child through `SCM_RIGHTS`.
+The primary slab is anonymous private memory. Fork takes one Mach
+copy-on-write memory entry over the whole slab
+(`mach_make_memory_entry_64` with `MAP_MEM_VM_COPY`) while sibling tasks are
+quiesced and `mmap_lock` is held, so the entry matches the header and region
+table sent over IPC. Page tables, shim state, private-file CoW bytes and
+Rosetta/kbuf memory all live in the slab and ride along. On anonymous memory
+the copy is lazy: taking the entry walks the VM map, and whichever side next
+writes a shared page pays for that page.
 
-Bounded Mach page-disposition batches distinguish resident, paged-out and
-external-file pages from absent anonymous pages. Compressed pages retain data
-and are copied. A wholly empty anonymous Mach region stays a hole without a
-per-page query. Host-page edge bytes are copied exactly.
-Contiguous anonymous GPA spans share the scan across protection splits.
-Populated runs use guarded bulk copies into the shared-memory snapshot,
-avoiding filesystem writeback while siblings are paused.
+The entry reaches the helper in its first registered port slot
+(`posix_spawnattr_set_registered_ports_np`), which is why the helper is
+spawned after the snapshot. The child reads it with `mach_ports_lookup`,
+clears its own slots, and maps the entry privately (`mach_vm_map` without
+copy) before creating its HVF VM. Nested fork takes a fresh entry from the
+child's mapping. There is no fallback copy path: a failed entry fails the fork
+with `ENOMEM`.
 
-The child maps the independent snapshot shared and retains its fd for nested
-fork; later anonymous resets remain private to that process. Private file
-mappings retain snapshot bytes rather than reattaching the original file.
-Snapshot allocation failure uses region copy, never a live parent slab fd.
-The child restores `ttbr0` from the IPC header.
+`MAP_SHARED` file overlays are frozen inside the entry like everything else;
+the child reinstalls them from the backing fds that follow over `SCM_RIGHTS`.
 `MAP_SHARED|MAP_ANONYMOUS` regions are promoted to a memfd-style overlay before
 fork (`mmap_fork_prepare_anon_shared_locked`) and reattached in the child
-(`mmap_fork_restore_overlays`) for cross-fork coherence.
-
+(`mmap_fork_restore_overlays`) for cross-fork coherence. The child restores
+`ttbr0` from the IPC header. Private-file pages past EOF are carried as bytes
+and invalidated in the child before it runs guest code.
 
 `madvise(MADV_DONTFORK)` marks page-aligned mapping ranges for exclusion from
 fork children. `MADV_DOFORK` restores inheritance. Partial ranges split the
@@ -906,14 +907,6 @@ restoring shared overlays or entering guest code. It consumes and closes the
 excluded backing descriptors without zeroing shared files. The same rule
 applies to snapshot-backed and copied memory. Excluded pages fault with
 `SIGSEGV/SEGV_MAPERR` in the child; parent `smaps` reports `VmFlags: dc`.
-
-### Legacy IPC Copy Path
-
-When `g->shm_fd < 0`, the parent serializes used memory regions in 1 MiB
-chunks over the socket pair, the child calls `guest_init()` and receives the
-data into fresh guest memory. CLOEXEC semantics follow POSIX: all FDs
-(including those marked CLOEXEC) are inherited across `fork`. CLOEXEC takes
-effect at `execve` (see `src/syscall/exec.c` step 4).
 
 ### `clone(CLONE_VM)`
 

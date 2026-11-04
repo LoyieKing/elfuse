@@ -56,13 +56,23 @@ int guest_memory_mapped_resident_pages(const guest_t *g,
                                        uint64_t *vsize_out,
                                        uint64_t *pages_out);
 
-/* Populate a fresh sparse fork snapshot, including page tables and shim state.
- * File pages past EOF and DONTFORK regions are omitted. Caller holds mmap_lock
- * and has quiesced siblings.
+/* Take a copy-on-write Mach memory entry over the whole primary slab for a fork
+ * child: page tables, shim state and Rosetta/kbuf memory included. Lazy on the
+ * anonymous slab, so a page is copied only when either side next writes it.
+ * Caller holds mmap_lock and has quiesced siblings, and owns the send right
+ * stored in *entry_out (a mach_port_t; spelled uint32_t so this header stays
+ * free of the Mach headers, whose PAGE_SIZE collides with the guest one).
  *
  * Returns 0 or a negative Linux errno.
  */
-int guest_memory_snapshot(const guest_t *g, int fd);
+int guest_memory_snapshot_entry(const guest_t *g, uint32_t *entry_out);
+
+/* Map a fork child's copy of the parent's slab from the entry that
+ * guest_memory_snapshot_entry produced. Consumes the send right.
+ *
+ * Returns the private mapping, or NULL on failure.
+ */
+void *guest_memory_map_snapshot(uint32_t entry, uint64_t size);
 
 /* Remove private file EOF translations after fork restore or mprotect regrant.
  * Caller holds mmap_lock.

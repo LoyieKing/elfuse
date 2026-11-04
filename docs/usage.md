@@ -214,8 +214,8 @@ Notes:
 
 - `--gdb` is rejected for x86_64 guests: the stub serves the aarch64
   view Rosetta produces, not the original x86_64 architectural state.
-- Fork uses an independent sparse snapshot, including Rosetta TTBR1 and kbuf
-  state; snapshot allocation failure uses region copy.
+- Fork hands the child a copy-on-write view of the whole slab, including
+  Rosetta TTBR1 and kbuf state.
 - Two Rosetta-internal divergences are documented and not papered
   over: `SA_RESETHAND` is shadowed by Rosetta's own signal-handler
   state, and `clone(..., CLONE_SETTLS, tls=0, ...)` can hang.

@@ -28,6 +28,15 @@
 #include <sys/wait.h>
 #include <mach-o/dyld.h>
 #include <poll.h>
+#include <mach/mach.h>
+
+/* libsystem_kernel SPI, exported but not in the public spawn.h: seeds the
+ * spawned task's registered port slots, which is how the slab snapshot entry
+ * reaches the fork helper (fork_child_main reads it with mach_ports_lookup).
+ */
+extern int posix_spawnattr_set_registered_ports_np(posix_spawnattr_t *attr,
+                                                   mach_port_t portarray[],
+                                                   uint32_t count);
 
 #include "hvutil.h"
 #include "utils.h"
@@ -152,7 +161,7 @@ int fork_child_main(int ipc_fd,
     proc_set_session(hdr.sid, hdr.pgid);
 
     /* Validate header layout fields before any size-derived arithmetic.
-     * guest_init / guest_init_from_shm derive interp_base, mmap_limit, and the
+     * guest_init_from_snapshot derives interp_base, mmap_limit, and the
      * high-IPA infra reserve from these inputs; underflow on tiny or malformed
      * values would place pt_pool_base and friends near UINT64_MAX, which then
      * feeds unchecked host-buffer offsets in pt_alloc_page and pt_at. Reject
@@ -190,34 +199,38 @@ int fork_child_main(int ipc_fd,
     }
 
     /* Create guest memory before receiving state so all incoming offsets can be
-     * bounds-checked against the negotiated guest size.
+     * bounds-checked against the negotiated guest size. The parent's slab
+     * arrives as a copy-on-write memory entry in the first registered port
+     * slot (sys_clone attaches it before posix_spawn).
      */
     guest_t g;
+    mach_port_array_t ports = NULL;
+    mach_msg_type_number_t nports = 0;
+    if (mach_ports_lookup(mach_task_self(), &ports, &nports) != KERN_SUCCESS ||
+        nports < 1 || ports[0] == MACH_PORT_NULL) {
+        log_error("fork-child: no slab snapshot in the registered ports");
+        close(ipc_fd);
+        return 1;
+    }
+    mach_port_t slab_entry = ports[0];
+    for (mach_msg_type_number_t i = 1; i < nports; i++)
+        if (ports[i] != MACH_PORT_NULL)
+            mach_port_deallocate(mach_task_self(), ports[i]);
+    vm_deallocate(mach_task_self(), (vm_address_t) ports,
+                  nports * sizeof(mach_port_t));
 
-    if (hdr.has_shm) {
-        /* The parent sent an independent populated sparse file. */
-        int shm_fd = -1, shm_count = 0;
-        if (fork_ipc_recv_fds(ipc_fd, &shm_fd, 1, &shm_count) < 0 ||
-            shm_count != 1) {
-            log_error("fork-child: failed to receive shm fd");
-            close(ipc_fd);
-            return 1;
-        }
-        if (guest_init_from_shm(&g, shm_fd, hdr.guest_size, hdr.ipa_bits,
-                                (guest_memory_mode_t) hdr.memory_mode) < 0) {
-            log_error("fork-child: guest_init_from_shm failed");
-            close(ipc_fd);
-            return 1;
-        }
-        log_debug("fork-child: sparse snapshot via shm fd");
-    } else {
-        /* Region copy also handles guests whose region tracker is stale. */
-        if (guest_init(&g, hdr.guest_size, hdr.ipa_bits,
-                       (guest_memory_mode_t) hdr.memory_mode) < 0) {
-            log_error("fork-child: failed to init guest");
-            close(ipc_fd);
-            return 1;
-        }
+    /* The registered slots keep their own reference to the entry. Drop it so
+     * the only one left is the right guest_memory_map_snapshot consumes.
+     */
+    (void) mach_ports_register(mach_task_self(), NULL, 0);
+
+    void *slab = guest_memory_map_snapshot(slab_entry, hdr.guest_size);
+    if (!slab ||
+        guest_init_from_snapshot(&g, slab, hdr.guest_size, hdr.ipa_bits,
+                                 (guest_memory_mode_t) hdr.memory_mode) < 0) {
+        log_error("fork-child: cannot map the parent's slab");
+        close(ipc_fd);
+        return 1;
     }
 
     /* Restore allocator/page-table cursors before mmap/brk can run in child.
@@ -284,12 +297,6 @@ int fork_child_main(int ipc_fd,
     ipc_registers_t regs;
     if (fork_ipc_read_all(ipc_fd, &regs, sizeof(regs)) < 0) {
         log_error("fork-child: failed to read registers");
-        launch_destroy_guest(&g);
-        return 1;
-    }
-
-    if (fork_ipc_recv_memory_regions(ipc_fd, &g) < 0) {
-        log_error("fork-child: failed to receive memory regions");
         launch_destroy_guest(&g);
         return 1;
     }
@@ -470,8 +477,8 @@ int fork_child_main(int ipc_fd,
      * passes CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID so the child's TCB
      * caches its own TID; without the SETTID write the child keeps the parent's
      * cached TID and modern glibc trips stack-canary / TLS checks ("stack
-     * smashing detected"). The write goes through guest memory, valid for both
-     * the CoW and region-copy paths. A faulting ctid_gva is the guest's own bad
+     * smashing detected"). The write goes through the child's private copy of
+     * guest memory. A faulting ctid_gva is the guest's own bad
      * pointer: warn and continue, matching how the kernel ignores a
      * child_tidptr fault.
      *
@@ -490,8 +497,8 @@ int fork_child_main(int ipc_fd,
                      (unsigned long long) hdr.ctid_gva);
     }
 
-    /* Re-publish identity into the child's shim-globals cache: the CoW / region
-     * copy inherits the parent's pid/uid values, and the shim's identity fast
+    /* Re-publish identity into the child's shim-globals cache: the slab copy
+     * inherits the parent's pid/uid values, and the shim's identity fast
      * path would otherwise return the parent's pid to the child. Identity is
      * now committed via the same path the bootstrap uses.
      */
@@ -913,30 +920,6 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu,
     return child_tid;
 }
 
-
-/* Unlinked shared memory avoids filesystem writeback while siblings are frozen.
- */
-static int fork_snapshot_shm_create(uint64_t size)
-{
-    uint64_t nonce;
-    arc4random_buf(&nonce, sizeof(nonce));
-    char name[32];
-    snprintf(name, sizeof(name), "/elfuse-fork-%016llx",
-             (unsigned long long) nonce);
-    int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
-    if (fd < 0)
-        return -1;
-    int unlink_rc = shm_unlink(name);
-    if (unlink_rc < 0 || fd_set_cloexec(fd) < 0 ||
-        ftruncate(fd, (off_t) size) < 0) {
-        int saved_errno = errno;
-        close(fd);
-        errno = saved_errno;
-        return -1;
-    }
-    return fd;
-}
-
 static int64_t fork_vfork_wait(thread_entry_t *t)
 {
     int fd = t->vfork_wait_fd_plus1 - 1;
@@ -1190,21 +1173,62 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     }
     extern char **environ;
     pid_t child_host_pid = -1;
+    int ipc_sock = sock_fds[0];
+    mmap_fork_anon_shared_txn_t *anon_shared_txn = NULL;
+    guest_region_t *regions_snapshot = NULL;
+    mach_port_t slab_entry = MACH_PORT_NULL;
+    bool mmap_locked = false;
+    bool siblings_quiesced = false;
+    int64_t fail_rc = -LINUX_ENOMEM;
+    int clone_pidfd = -1;
+    bool spawn_attrs_live = true;
 
     /* Refuse an unsafe snapshot before creating a helper that expects a header.
      * The window remains owned through spawn and every snapshot failure.
      */
     if (!thread_quiesce_siblings()) {
-        posix_spawn_file_actions_destroy(&file_actions);
-        posix_spawnattr_destroy(&spawn_attr);
-        proc_cancel_child(child_guest_pid);
-        close(sock_fds[0]);
-        close(sock_fds[1]);
-        if (vfork_notify_fds[0] >= 0)
-            close(vfork_notify_fds[0]);
-        if (vfork_notify_fds[1] >= 0)
-            close(vfork_notify_fds[1]);
-        return thread_exec_stop_requested() ? -LINUX_EINTR : -LINUX_EAGAIN;
+        fail_rc = thread_exec_stop_requested() ? -LINUX_EINTR : -LINUX_EAGAIN;
+        goto fail_snapshot;
+    }
+    siblings_quiesced = true;
+
+    /* Convert MAP_SHARED|MAP_ANONYMOUS regions that have no backing fd into
+     * memfd-backed overlay regions. The conversion seeds a private temp file
+     * with the current bytes and installs a host MAP_SHARED|MAP_FIXED overlay
+     * on the parent. The child receives the fd via SCM_RIGHTS and re-installs
+     * its own overlay so subsequent writes from either side flow through the
+     * kernel page cache and reach the other. File-backed MAP_SHARED regions
+     * already carry a backing fd and are unaffected. Misaligned shared regions
+     * (snapshot-style) remain incoherent across fork by design.
+     *
+     * mmap_lock is held from here until the process-state send has passed the
+     * region backing fds over SCM_RIGHTS. The quiesce above gives up after its
+     * timeout, and a sibling already queued on mmap_lock never reaches the
+     * barrier, so without the lock its munmap could rewrite the region table
+     * during the overlay sync, the slab snapshot, the header, or the region
+     * table copy, or close a backing fd before it is sent. Everything taken
+     * beneath it (fd_lock, pty_keepalive_lock, elf_path_lock, sysroot_lock,
+     * sig_lock) follows mmap_lock in the order in syscall/internal.h. The IPC
+     * writes under it cannot deadlock: the child only reads until admission and
+     * needs nothing from this process to keep reading, and a child that dies
+     * turns the next write into EPIPE (SO_NOSIGPIPE above).
+     */
+    mmap_lock_acquire();
+    mmap_locked = true;
+    if (mmap_fork_prepare_anon_shared_locked(g, &anon_shared_txn) < 0)
+        goto fail_snapshot;
+
+    /* Copy-on-write view of the whole slab, taken while every sibling is
+     * quiesced and the region table is locked, so it matches the header and
+     * region table sent below. It reaches the child in the first registered
+     * port slot, which is why the helper is spawned only now.
+     */
+    if (guest_memory_snapshot_entry(g, &slab_entry) < 0)
+        goto fail_snapshot;
+    if (posix_spawnattr_set_registered_ports_np(&spawn_attr, &slab_entry, 1) !=
+        0) {
+        log_error("clone: cannot attach slab snapshot to the helper");
+        goto fail_snapshot;
     }
 
     /* macOS posix_spawn returns EAGAIN under brief process-table pressure
@@ -1224,89 +1248,36 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     }
     posix_spawn_file_actions_destroy(&file_actions);
     posix_spawnattr_destroy(&spawn_attr);
-
+    spawn_attrs_live = false;
     if (spawn_ret != 0) {
         log_error("clone: posix_spawn failed: %s", strerror(spawn_ret));
-        proc_cancel_child(child_guest_pid);
-        close(sock_fds[0]);
-        close(sock_fds[1]);
-        if (vfork_notify_fds[0] >= 0)
-            close(vfork_notify_fds[0]);
-        if (vfork_notify_fds[1] >= 0)
-            close(vfork_notify_fds[1]);
-        thread_resume_siblings();
-        return -LINUX_ENOMEM;
+        child_host_pid = -1;
+        goto fail_snapshot;
     }
 
+    /* The child holds its own send right now; this one only kept the
+     * snapshot alive until the spawn committed.
+     */
+    mach_port_deallocate(mach_task_self(), slab_entry);
+    slab_entry = MACH_PORT_NULL;
+
     /* The parent keeps only its end of the control channel. Reset the closed
-     * write end to -1 so the fail_snapshot guarded close at the bottom of the
-     * function cannot double-close it. In a multithreaded guest, another vCPU
+     * write ends to -1 so the fail_snapshot guarded close at the bottom of the
+     * function cannot double-close them. In a multithreaded guest, another vCPU
      * could open a new fd between the two closes and get the same number, which
      * the second close would then steal.
      */
     close(sock_fds[1]);
+    sock_fds[1] = -1;
     if (vfork_notify_fds[1] >= 0) {
         close(vfork_notify_fds[1]);
         vfork_notify_fds[1] = -1;
     }
-    int ipc_sock = sock_fds[0];
 
-    mmap_fork_anon_shared_txn_t *anon_shared_txn = NULL;
-    guest_region_t *regions_snapshot = NULL;
-    int snapshot_shm_fd = -1;
-    bool mmap_locked = false;
-    int64_t fail_rc = -LINUX_ENOMEM;
-    int clone_pidfd = -1;
-
-    /* Convert MAP_SHARED|MAP_ANONYMOUS regions that have no backing fd into
-     * memfd-backed overlay regions. The conversion seeds a private temp file
-     * with the current bytes and installs a host MAP_SHARED|MAP_FIXED overlay
-     * on the parent. The child receives the fd via SCM_RIGHTS and re-installs
-     * its own overlay so subsequent writes from either side flow through the
-     * kernel page cache and reach the other. File-backed MAP_SHARED regions
-     * already carry a backing fd and are unaffected. Misaligned shared regions
-     * (snapshot-style) remain incoherent across fork by design.
-     *
-     * mmap_lock is held from here until the process-state send has passed the
-     * region backing fds over SCM_RIGHTS. The quiesce above gives up after its
-     * timeout, and a sibling already queued on mmap_lock never reaches the
-     * barrier, so without the lock its munmap could rewrite the region table
-     * during the overlay sync, the clone snapshot, the header, or the region
-     * copy, or close a backing fd before it is sent. Everything taken beneath
-     * it (fd_lock, pty_keepalive_lock, elf_path_lock, sysroot_lock, sig_lock)
-     * follows mmap_lock in the order in syscall/internal.h. The IPC writes
-     * under it cannot deadlock: the child only reads until admission and needs
-     * nothing from this process to keep reading, and a child that dies turns
-     * the next write into EPIPE (SO_NOSIGPIPE above). The cost lands on that
-     * same straggler: it now waits in pthread_mutex_lock for the whole send,
-     * the region copy included on the non-shm path, where no teardown wake
-     * reaches it, so an exit_group join during a slow fork can time out on it.
-     */
-    mmap_lock_acquire();
-    mmap_locked = true;
-    if (mmap_fork_prepare_anon_shared_locked(g, &anon_shared_txn) < 0)
-        goto fail_snapshot;
-
-    /* Populate an independent sparse file while every sibling is quiesced. */
-    bool use_shm = (g->shm_fd >= 0) && !g->regions_tracker_stale;
-
-    if (use_shm) {
-        snapshot_shm_fd = fork_snapshot_shm_create(g->guest_size);
-        if (snapshot_shm_fd >= 0 &&
-            guest_memory_snapshot(g, snapshot_shm_fd) < 0)
-            goto fail_snapshot;
-        if (snapshot_shm_fd < 0)
-            use_shm = false;
-    }
-
-    /* Snapshot of the semantic region array, populated after the memory dump
-     * but before sibling vCPUs resume. Declared up front so all goto paths to
-     * fail_snapshot can free it unconditionally. Header
-     */
+    /* Header */
     ipc_header_t hdr = {
         .magic = IPC_MAGIC_HEADER,
         .ipa_bits = g->ipa_bits,
-        .has_shm = use_shm,
         .child_pid = child_guest_pid,
         .parent_pid = proc_get_pid(),
         .guest_size = g->guest_size,
@@ -1368,15 +1339,6 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         goto fail_snapshot;
     }
 
-    /* Only independent snapshots are sent; clone failure uses region copy. */
-    if (use_shm) {
-        int fd_to_send = snapshot_shm_fd;
-        if (fork_ipc_send_fds(ipc_sock, &fd_to_send, 1) < 0) {
-            log_error("clone: failed to send shm fd");
-            goto fail_snapshot;
-        }
-    }
-
     /* Registers: capture current vCPU state */
     ipc_registers_t regs = {0};
     regs.elr_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_ELR_EL1);
@@ -1402,11 +1364,6 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         log_error("clone: failed to send registers");
         goto fail_snapshot;
     }
-    if (fork_ipc_send_memory_regions_locked(ipc_sock, g, use_shm) < 0) {
-        log_error("clone: failed to send memory regions");
-        goto fail_snapshot;
-    }
-
     /* Snapshot the semantic region array before resuming siblings. Siblings may
      * mmap/munmap/mprotect after resume, so the code needs a stable copy for
      * the IPC send. Heap-allocated because GUEST_MAX_REGIONS *
@@ -1508,8 +1465,6 @@ int64_t sys_clone(hv_vcpu_t vcpu,
               child_host_pid);
 
     free(regions_snapshot);
-    if (snapshot_shm_fd >= 0)
-        close(snapshot_shm_fd);
     if (is_vfork) {
         current_thread->vfork_wait_fd_plus1 = vfork_notify_fds[0] + 1;
         current_thread->vfork_child_pid = child_guest_pid;
@@ -1523,12 +1478,16 @@ fail_snapshot:
     /* mmap_fork_abort_anon_shared takes mmap_lock itself. */
     if (mmap_locked)
         mmap_lock_release();
+    if (spawn_attrs_live) {
+        posix_spawn_file_actions_destroy(&file_actions);
+        posix_spawnattr_destroy(&spawn_attr);
+    }
+    if (slab_entry != MACH_PORT_NULL)
+        mach_port_deallocate(mach_task_self(), slab_entry);
     if (clone_pidfd >= 0)
         sys_close(clone_pidfd);
     proc_cancel_child(child_guest_pid);
     free(regions_snapshot);
-    if (snapshot_shm_fd >= 0)
-        close(snapshot_shm_fd);
 
     /* Roll back the in-place anon-shared overlay conversion while siblings are
      * still parked. A partial rollback failure (e.g., region drift past the
@@ -1543,8 +1502,11 @@ fail_snapshot:
             "clone: anon-shared rollback partial failure (%d); parent "
             "may have stale memfd-backed regions",
             abort_rc);
-    thread_resume_siblings();
+    if (siblings_quiesced)
+        thread_resume_siblings();
     close(ipc_sock);
+    if (sock_fds[1] >= 0)
+        close(sock_fds[1]);
     if (vfork_notify_fds[0] >= 0)
         close(vfork_notify_fds[0]);
     if (vfork_notify_fds[1] >= 0)
@@ -1553,13 +1515,15 @@ fail_snapshot:
     /* The helper has not passed admission on any failure path. Closing IPC
      * terminates its receive, and waitpid collects the unregistered host child.
      */
-    pid_t reaped;
-    do {
-        reaped = waitpid(child_host_pid, NULL, 0);
-    } while (reaped < 0 && errno == EINTR);
-    if (reaped < 0)
-        log_warn("clone: failed to reap fork-child pid=%d: %s",
-                 (int) child_host_pid, strerror(errno));
+    if (child_host_pid > 0) {
+        pid_t reaped;
+        do {
+            reaped = waitpid(child_host_pid, NULL, 0);
+        } while (reaped < 0 && errno == EINTR);
+        if (reaped < 0)
+            log_warn("clone: failed to reap fork-child pid=%d: %s",
+                     (int) child_host_pid, strerror(errno));
+    }
     return fail_rc;
 }
 

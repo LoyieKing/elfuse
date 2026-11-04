@@ -431,9 +431,7 @@ typedef enum {
 
 /* Guest state. */
 typedef struct {
-    void *host_base; /* Host pointer to allocated guest memory */
-    int shm_fd;      /* Primary backing fd for sparse fork (-1 if MAP_ANON) */
-
+    void *host_base;     /* Host pointer to allocated guest memory */
     uint64_t guest_size; /* Total size (determined by IPA capacity) */
     uint64_t ipa_base;   /* IPA base for hv_vm_map (GUEST_IPA_BASE) */
     guest_memory_mode_t memory_mode; /* Policy for retiring ranges to zero */
@@ -852,17 +850,18 @@ int guest_init(guest_t *g,
                uint32_t ipa_bits,
                guest_memory_mode_t memory_mode);
 
-/* Initialize guest from an independent sparse fork snapshot. Creates the HVF VM
- * and retains a MAP_SHARED mapping and fd for nested fork. Takes ownership of
- * shm_fd on every path.
+/* Initialize a fork child's guest around host_base, the parent's slab mapped
+ * privately from its copy-on-write entry (guest_memory_map_snapshot). Creates
+ * the HVF VM at ipa_bits and maps the slab. Takes ownership of the mapping on
+ * every path.
  *
  * Returns 0 on success, -1 on failure.
  */
-int guest_init_from_shm(guest_t *g,
-                        int shm_fd,
-                        uint64_t size,
-                        uint32_t ipa_bits,
-                        guest_memory_mode_t memory_mode);
+int guest_init_from_snapshot(guest_t *g,
+                             void *host_base,
+                             uint64_t size,
+                             uint32_t ipa_bits,
+                             guest_memory_mode_t memory_mode);
 
 /* Tear down VM and free guest memory. The caller has already destroyed every
  * vCPU, which is what launch_destroy_guest in core/launch.h does before calling
@@ -1201,23 +1200,6 @@ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms);
  * mapping and VM/vCPU handles.
  */
 void guest_reset(guest_t *g);
-
-/* A used memory region for fork state transfer */
-typedef struct {
-    uint64_t offset; /* Offset from host_base (0-based) */
-    uint64_t size;   /* Size in bytes */
-} used_region_t;
-
-/* Enumerate used memory regions for fork state transfer. Writes up to max
- * entries into out[].
- *
- * Returns the count written. shim_size is the shim binary size (needed to
- * determine shim region).
- */
-int guest_get_used_regions(const guest_t *g,
-                           unsigned int shim_size,
-                           used_region_t *out,
-                           int max);
 
 /* Semantic region tracking API. */
 

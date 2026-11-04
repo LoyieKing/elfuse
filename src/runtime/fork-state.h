@@ -21,7 +21,7 @@
 /* Fork IPC protocol identity. Bump this whenever the header layout or ordered
  * fork payload changes incompatibly.
  */
-#define FORK_IPC_PROTOCOL_MAGIC 0x454C4659U /* "ELFY": sparse snapshot */
+#define FORK_IPC_PROTOCOL_MAGIC 0x454C465AU /* "ELFZ": Mach CoW slab entry */
 
 #define IPC_HDR_SOFT_NEWPID 0x1u
 
@@ -31,7 +31,6 @@
 typedef struct {
     uint32_t magic;
     uint32_t ipa_bits;
-    bool has_shm;
     int64_t child_pid, parent_pid;
     uint64_t guest_size;
     uint64_t elf_load_min;
@@ -106,10 +105,6 @@ typedef struct {
 } ipc_registers_t;
 
 typedef struct {
-    uint64_t offset, size;
-} ipc_region_header_t;
-
-typedef struct {
     int32_t guest_fd, type, linux_flags, seals;
     uint64_t ofd_id;
     int32_t fasync_owner_type, fasync_owner;
@@ -152,14 +147,6 @@ int fork_ipc_write_all(int fd, const void *buf, size_t len);
 int fork_ipc_read_all(int fd, void *buf, size_t len);
 int fork_ipc_send_fds(int sock, const int *fds, int count);
 int fork_ipc_recv_fds(int sock, int *fds, int max_count, int *out_count);
-
-/* Caller holds mmap_lock, so the region table this walks stays the one the
- * header and region snapshot describe.
- */
-int fork_ipc_send_memory_regions_locked(int ipc_sock,
-                                        const guest_t *g,
-                                        bool use_shm);
-int fork_ipc_recv_memory_regions(int ipc_fd, guest_t *g);
 
 int fork_ipc_send_fd_table(int ipc_sock);
 int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g);

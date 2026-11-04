@@ -8,10 +8,10 @@
 # Measures the per-fork wall-clock cost of clone(SIGCHLD) (subshell fork without
 # exec) at a few resident-memory levels, on the same host, comparing:
 #
-#   - aarch64-musl static busybox  (CoW shm fast path in forkipc.c)
-#   - x86_64-musl  static busybox  (Rosetta helper path; APFS clonefile-backed
-#                                   CoW snapshot when available, otherwise
-#                                   legacy region-copy fallback)
+#   - aarch64-musl static busybox
+#   - x86_64-musl  static busybox  (Rosetta helper path)
+#
+#   Both fork through one Mach copy-on-write entry over the guest slab.
 #
 # Issue #45 tracks the fork-cost gap that this benchmark quantifies.
 #
@@ -199,11 +199,11 @@ if [ "$have_rosetta" = 1 ]; then
         > /dev/null 2>&1 || true
 fi
 
-report "aarch64 (CoW shm fast path)" "$ARM_DIR" "$ITERS"
+report "aarch64" "$ARM_DIR" "$ITERS"
 
 if [ "$have_rosetta" = 1 ]; then
     rosetta_iters="${ROSETTA_ITERATIONS:-$((ITERS / 10 > 2 ? ITERS / 10 : 2))}"
-    report "x86_64-via-Rosetta (clonefile CoW when available)" "$X86_DIR" \
+    report "x86_64-via-Rosetta" "$X86_DIR" \
         "$rosetta_iters" --timeout "$VCPU_TIMEOUT"
 fi
 
@@ -213,7 +213,6 @@ printf '  - per_fork_excl_startup is (iter_total - baseline) / iters and\n'
 printf '    isolates the per-fork cost from elfuse + sh bring-up.\n'
 printf '  - rss is the size of an inflated parent-sh variable, which\n'
 printf '    sits in the parent guest brk and crosses the fork IPC.\n'
-printf '  - Fork synchronizes anonymous/private-file backing into an APFS clone.\n'
-printf '    Cost can grow with private resident bytes even when cloning succeeds.\n'
-printf '    Without a clone, both architectures use the region-copy path.\n'
+printf '  - Fork hands the child a copy-on-write view of the slab; the copy\n'
+printf '    is paid per page by whichever side next writes it.\n'
 printf '  - See issue #45 for context.\n'

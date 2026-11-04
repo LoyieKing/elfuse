@@ -1047,183 +1047,60 @@ int guest_memory_mapped_resident_pages(const guest_t *g,
 }
 
 
-static int snapshot_write_range(const guest_t *g,
-                                uint8_t *snapshot,
-                                uint64_t cursor,
-                                uint64_t len)
-{
-    const uint8_t *src = (const uint8_t *) g->host_base + cursor;
-    bool faulted;
-    HOST_SIGBUS_GUARD(faulted, memcpy(snapshot + cursor, src, len));
-    return faulted ? -LINUX_EFAULT : 0;
-}
-
-static int snapshot_memory_range(const guest_t *g,
-                                 uint8_t *snapshot,
-                                 uint64_t cursor,
-                                 uint64_t len,
-                                 bool anonymous)
-{
-    /* File mappings and page tables are copied in full regardless of page
-     * disposition. Only anonymous mappings can contribute sparse holes.
-     */
-    if (!anonymous)
-        return snapshot_write_range(g, snapshot, cursor, len);
-    size_t hps = host_page_size_cached();
-    while (len) {
-        uint8_t *host = (uint8_t *) g->host_base + cursor;
-        mach_vm_address_t address = (mach_vm_address_t) host;
-        mach_vm_size_t size = 0;
-        natural_t depth = 0;
-        vm_region_submap_short_info_data_64_t info;
-        mach_msg_type_number_t info_count =
-            VM_REGION_SUBMAP_SHORT_INFO_COUNT_64;
-        kern_return_t kr = mach_vm_region_recurse(
-            mach_task_self(), &address, &size, &depth,
-            (vm_region_recurse_info_t) &info, &info_count);
-        if (kr != KERN_SUCCESS || address > (mach_vm_address_t) host ||
-            (mach_vm_address_t) host - address >= size || info.is_submap)
-            return -LINUX_EIO;
-        uint64_t host_offset = (mach_vm_address_t) host - address;
-        uint64_t region_len = size - host_offset;
-        if (region_len > len)
-            region_len = len;
-        if (!info.external_pager && cursor % hps == 0 &&
-            region_len % hps == 0) {
-            vm_region_submap_info_data_64_t full_info;
-            info_count = VM_REGION_SUBMAP_INFO_COUNT_64;
-            kr = mach_vm_region_recurse(
-                mach_task_self(), &address, &size, &depth,
-                (vm_region_recurse_info_t) &full_info, &info_count);
-            if (kr != KERN_SUCCESS || full_info.is_submap ||
-                address > (mach_vm_address_t) host ||
-                (mach_vm_address_t) host - address >= size)
-                return -LINUX_EIO;
-
-            /* No resident or compressed pages anywhere in this anonymous object
-             * and its shadows means the entire range reads zero.
-             */
-            if (!full_info.external_pager && full_info.pages_resident == 0 &&
-                full_info.pages_swapped_out == 0) {
-                cursor += region_len;
-                len -= region_len;
-                continue;
-            }
-        }
-        while (region_len) {
-            int dispositions[512];
-            uint64_t prefix = cursor % hps;
-            uint64_t chunk =
-                sizeof(dispositions) / sizeof(dispositions[0]) * hps - prefix;
-            if (chunk > len)
-                chunk = len;
-            if (chunk > region_len)
-                chunk = region_len;
-            mach_vm_size_t count = ALIGN_UP(prefix + chunk, hps) / hps;
-            if (mach_vm_page_range_query(
-                    mach_task_self(),
-                    (mach_vm_address_t) ((uint8_t *) g->host_base + cursor -
-                                         prefix),
-                    ALIGN_UP(prefix + chunk, hps),
-                    (mach_vm_address_t) dispositions, &count) != KERN_SUCCESS ||
-                count != ALIGN_UP(prefix + chunk, hps) / hps)
-                return -LINUX_EIO;
-            uint64_t pos = 0;
-            while (pos < chunk) {
-                uint64_t run = hps - (cursor + pos) % hps;
-                if (run > chunk - pos)
-                    run = chunk - pos;
-                int keep = VM_PAGE_QUERY_PAGE_PRESENT |
-                           VM_PAGE_QUERY_PAGE_PAGED_OUT |
-                           VM_PAGE_QUERY_PAGE_EXTERNAL;
-                bool hole =
-                    !(dispositions[(prefix + pos) / hps] & keep) && run == hps;
-                while (pos + run + hps <= chunk) {
-                    bool next_hole =
-                        !(dispositions[(prefix + pos + run) / hps] & keep);
-                    if (next_hole != hole || (cursor + pos) % hps)
-                        break;
-                    run += hps;
-                }
-                if (!hole) {
-                    int err =
-                        snapshot_write_range(g, snapshot, cursor + pos, run);
-                    if (err < 0)
-                        return err;
-                }
-                pos += run;
-            }
-            cursor += chunk;
-            len -= chunk;
-            region_len -= chunk;
-        }
-    }
-    return 0;
-}
-
-static int snapshot_populate(const guest_t *g, uint8_t *snapshot)
+int guest_memory_snapshot_entry(const guest_t *g, uint32_t *entry_out)
 {
     assert(mmap_lock_held());
-    for (int i = 0; i < g->nregions; i++) {
-        const guest_region_t *r = &g->regions[i];
-        uint64_t len = r->end - r->start;
-        if (r->dontfork || r->gpa_base >= g->guest_size ||
-            len > g->guest_size - r->gpa_base)
-            continue;
-        bool anonymous = (r->flags & LINUX_MAP_ANONYMOUS) != 0;
-        if (anonymous && r->backing_fd < 0) {
-            while (i + 1 < g->nregions) {
-                const guest_region_t *next = &g->regions[i + 1];
-                uint64_t next_len = next->end - next->start;
-                if (next->dontfork || next->backing_fd >= 0 ||
-                    !(next->flags & LINUX_MAP_ANONYMOUS) ||
-                    next->gpa_base != r->gpa_base + len ||
-                    next_len > g->guest_size - r->gpa_base - len)
-                    break;
-                len += next_len;
-                i++;
-            }
-        }
-        if (r->backing_fd >= 0) {
-            struct stat st;
-            if (fstat(r->backing_fd, &st) < 0)
-                return linux_errno();
-            uint64_t file_end;
-            if (st.st_size < 0 ||
-                !align_up_ok((uint64_t) st.st_size, GUEST_PAGE_SIZE, &file_end))
-                return -LINUX_EIO;
-            slice_clamp(file_end, r->offset, len, &len);
-        }
-        int err =
-            snapshot_memory_range(g, snapshot, r->gpa_base, len, anonymous);
-        if (err < 0)
-            return err;
+
+    /* One copy-on-write entry over the whole primary slab: anonymous pages,
+     * private-file CoW bytes, page tables, shim state and Rosetta/kbuf memory
+     * all live inside it. On anonymous memory the copy is lazy, so the cost
+     * here is the VM map walk; whichever side writes a shared page first pays
+     * for that page. MAP_SHARED file overlays are frozen too, and the child
+     * reattaches them from their backing fds. DONTFORK ranges and pages past a
+     * private file's EOF ride along as bytes, and the child invalidates their
+     * PTEs before running guest code (fork_ipc_recv_process_state).
+     */
+    memory_object_size_t size = g->guest_size;
+    mach_port_t entry = MACH_PORT_NULL;
+    kern_return_t kr = mach_make_memory_entry_64(
+        mach_task_self(), &size, (memory_object_offset_t) g->host_base,
+        VM_PROT_READ | VM_PROT_WRITE | MAP_MEM_VM_COPY, &entry,
+        MEMORY_OBJECT_NULL);
+    if (kr != KERN_SUCCESS) {
+        log_error("fork: slab snapshot entry failed: %s",
+                  mach_error_string(kr));
+        return -LINUX_ENOMEM;
     }
-    int err = snapshot_memory_range(g, snapshot, g->pt_pool_base,
-                                    g->pt_pool_next - g->pt_pool_base, false);
-    if (err < 0)
-        return err;
-    if (g->is_rosetta && g->rosetta_guest_base && g->rosetta_size) {
-        err = snapshot_memory_range(g, snapshot, g->rosetta_guest_base,
-                                    g->rosetta_size, false);
-        if (err < 0)
-            return err;
+    if (size != g->guest_size) {
+        log_error("fork: slab snapshot entry covers 0x%llx of 0x%llx",
+                  (unsigned long long) size,
+                  (unsigned long long) g->guest_size);
+        mach_port_deallocate(mach_task_self(), entry);
+        return -LINUX_ENOMEM;
     }
-    if (g->is_rosetta && g->kbuf_gpa)
-        return snapshot_memory_range(g, snapshot, g->kbuf_gpa, KBUF_SIZE,
-                                     false);
+    *entry_out = entry;
     return 0;
 }
 
-int guest_memory_snapshot(const guest_t *g, int fd)
+void *guest_memory_map_snapshot(uint32_t entry, uint64_t size)
 {
-    uint8_t *snapshot =
-        mmap(NULL, g->guest_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (snapshot == MAP_FAILED)
-        return linux_errno();
-    int err = snapshot_populate(g, snapshot);
-    munmap(snapshot, g->guest_size);
-    return err;
+    /* Mapping the entry without copy gives this process private pages: a write
+     * here breaks the share for that page only, and neither side sees the
+     * other's later stores. Nothing is inherited further; a nested fork takes
+     * its own entry from this range.
+     */
+    mach_vm_address_t addr = 0;
+    kern_return_t kr =
+        mach_vm_map(mach_task_self(), &addr, size, 0, VM_FLAGS_ANYWHERE, entry,
+                    0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
+                    VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
+    mach_port_deallocate(mach_task_self(), entry);
+    if (kr != KERN_SUCCESS) {
+        log_error("fork-child: mapping the slab snapshot failed: %s",
+                  mach_error_string(kr));
+        return NULL;
+    }
+    return (void *) (uintptr_t) addr;
 }
 
 static int guest_memory_reset_range_quiesced(guest_t *g,
@@ -2492,24 +2369,16 @@ static int rollback_fresh_mmap_allocation(guest_t *g,
  */
 #define HVF_SEGMENT_FLAGS (HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC)
 
-/* Restore the slab's original file or anonymous backing after a file overlay.
- * Caller holds mmap_lock, pauses guest execution and detaches this stage-2
- * range.
+/* Restore the slab's anonymous backing after a file overlay. Caller holds
+ * mmap_lock, pauses guest execution and detaches this stage-2 range.
  *
  * Returns 0 or a negative Linux errno.
  */
 static int hvf_restore_slab_backing(guest_t *g, uint64_t ipa, uint64_t len)
 {
     void *target = (uint8_t *) g->host_base + ipa;
-    void *p;
-    if (g->shm_fd >= 0) {
-        p = mmap(target, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
-                 g->shm_fd, (off_t) ipa);
-    } else {
-        p = mmap(target, len, PROT_READ | PROT_WRITE,
-                 MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0);
-    }
-    if (p == MAP_FAILED)
+    if (mmap(target, len, PROT_READ | PROT_WRITE,
+             MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0) == MAP_FAILED)
         return linux_errno();
     return 0;
 }
