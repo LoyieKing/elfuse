@@ -2578,28 +2578,17 @@ static int intercept_open_dispatch(const guest_t *g,
          * regions, so a PROT_NONE page that was faulted in still counts, as it
          * does on Linux.
          */
-        uint64_t vm_size_kb = 0, vm_rss_kb = 0;
-        int query_err = 0;
+        uint64_t vm_size = 0, rss_pages = 0;
         mmap_lock_acquire();
-        for (int i = 0; i < g->nregions; i++) {
-            const guest_region_t *r = &g->regions[i];
-            if (!guest_region_in_process_vm(g, r))
-                continue;
-            uint64_t resident = 0;
-            query_err =
-                proc_region_resident_pages(g, r, r->start, r->end, &resident);
-            if (query_err < 0)
-                break;
-            vm_size_kb += r->end - r->start;
-            vm_rss_kb += resident * GUEST_PAGE_SIZE;
-        }
+        int query_err =
+            guest_memory_mapped_resident_pages(g, &vm_size, &rss_pages);
         mmap_lock_release();
         if (query_err < 0) {
             errno = (query_err == -LINUX_ENOMEM) ? ENOMEM : EIO;
             return -1;
         }
-        vm_size_kb /= 1024;
-        vm_rss_kb /= 1024;
+        uint64_t vm_size_kb = vm_size / 1024;
+        uint64_t vm_rss_kb = rss_pages * (GUEST_PAGE_SIZE / 1024);
 
         /* Linux uses the comm name (basename truncated to 15 chars). */
         const char *name = proc_comm_name();
@@ -3042,20 +3031,9 @@ static int intercept_open_dispatch(const guest_t *g,
          * only host-resident pages.
          */
         uint64_t vsize = 0, rss_pages = 0;
-        int query_err = 0;
         mmap_lock_acquire();
-        for (int i = 0; i < g->nregions; i++) {
-            const guest_region_t *r = &g->regions[i];
-            if (!guest_region_in_process_vm(g, r))
-                continue;
-            uint64_t resident = 0;
-            query_err =
-                proc_region_resident_pages(g, r, r->start, r->end, &resident);
-            if (query_err < 0)
-                break;
-            vsize += r->end - r->start;
-            rss_pages += resident;
-        }
+        int query_err =
+            guest_memory_mapped_resident_pages(g, &vsize, &rss_pages);
         mmap_lock_release();
         if (query_err < 0) {
             errno = (query_err == -LINUX_ENOMEM) ? ENOMEM : EIO;

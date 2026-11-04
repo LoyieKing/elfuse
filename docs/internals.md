@@ -856,15 +856,18 @@ reaper is currently provided.
 
 ### CoW Fork Path
 
-Fork creates an independent sparse file and copies current primary backing
-while sibling tasks are quiesced. Anonymous replacements and private-file CoW
-bytes are included, along with page tables, shim state and Rosetta/kbuf memory.
-The populated fd reaches the child through `SCM_RIGHTS`.
+Fork creates an independent, unlinked `shm_open` object and copies current
+primary backing while sibling tasks are quiesced. Anonymous replacements and
+private-file CoW bytes are included, along with page tables, shim state and
+Rosetta/kbuf memory. The populated fd reaches the child through `SCM_RIGHTS`.
 
 Bounded Mach page-disposition batches distinguish resident, paged-out and
 external-file pages from absent anonymous pages. Compressed pages retain data
 and are copied. A wholly empty anonymous Mach region stays a hole without a
 per-page query. Host-page edge bytes are copied exactly.
+Contiguous anonymous GPA spans share the scan across protection splits.
+Populated runs use guarded bulk copies into the shared-memory snapshot,
+avoiding filesystem writeback while siblings are paused.
 
 The child maps the independent snapshot shared and retains its fd for nested
 fork; later anonymous resets remain private to that process. Private file
@@ -875,9 +878,6 @@ The child restores `ttbr0` from the IPC header.
 fork (`mmap_fork_prepare_anon_shared_locked`) and reattached in the child
 (`mmap_fork_restore_overlays`) for cross-fork coherence.
 
-
-macOS rejects `MAP_PRIVATE` on `shm_open` fds (`EINVAL`), so the backing
-file is created via `mkstemp` + `unlink`.
 
 `madvise(MADV_DONTFORK)` marks page-aligned mapping ranges for exclusion from
 fork children. `MADV_DOFORK` restores inheritance. Partial ranges split the

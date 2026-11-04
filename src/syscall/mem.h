@@ -47,6 +47,15 @@ int guest_memory_resident_pages(const guest_t *g,
                                 uint64_t len,
                                 uint64_t *pages_out);
 
+/* Count resident guest pages over every process VMA, coalescing only contiguous
+ * backing. Also returns that VMA byte size. Caller holds mmap_lock.
+ *
+ * Returns 0 or a negative Linux errno.
+ */
+int guest_memory_mapped_resident_pages(const guest_t *g,
+                                       uint64_t *vsize_out,
+                                       uint64_t *pages_out);
+
 /* Populate a fresh sparse fork snapshot, including page tables and shim state.
  * File pages past EOF and DONTFORK regions are omitted. Caller holds mmap_lock
  * and has quiesced siblings.

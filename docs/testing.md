@@ -885,6 +885,9 @@ bash tests/qemu-runner.sh exec /mnt/host/build/test-memory-mode
 ```
 
 `mincore`, guest `VmRSS` and stat RSS query actual host backing residency.
+`stat` and `status` coalesce consecutive GPA spans before querying residency;
+each open measures current backing without a cache. Aliased VMAs retain their
+separate contributions, and `smaps` measures each VMA individually.
 The reporting granule is still the host page: four 4 KiB guest pages can share
 one resident 16 KiB host page. Host process RSS also includes elfuse/HVF and
 shared cached files; Darwin `phys_footprint` excludes much of the shared slab.
@@ -906,10 +909,18 @@ Linux run is within about 6% of elfuse's median-of-medians; host scheduling and
 warmup variability prevent a general claim of superiority. All runs completed
 with `MEM_OK`.
 
-Fork synchronizes private anonymous and file-CoW backing into its cloned file.
-This trades some fork cost for lower GC reset cost; fork-heavy applications
-must be benchmarked separately. The shell fork benchmark includes process
-spawn and should not be read as a page-table-only CoW cost.
+Fork copies private anonymous and file-CoW backing into an independent shared
+memory snapshot. This trades some fork cost for lower GC reset cost;
+fork-heavy applications must be benchmarked separately. The shell fork
+benchmark includes process spawn and should not be read as a page-table-only
+CoW cost.
+
+A synthetic 456 MiB private file plus 2 GiB split anonymous mapping checks
+eight forks and a sibling heartbeat. One paired run measured 4.508 seconds
+and a 655 ms maximum heartbeat gap with the saved file-snapshot binary,
+versus 0.969 seconds and 149 ms with shared-memory snapshots and coalesced
+backing scans. Both runs preserved parent and child bytes. This is one local
+sample, not a latency bound.
 
 The pre-recovery baseline for untouched 64 MiB private file mmap/unmap was
 11.6 us under elfuse and 2.0 us under Linux. Both verified file/CoW bytes after

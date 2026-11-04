@@ -914,13 +914,21 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu,
 }
 
 
-/* The child owns this independent sparse file, including across nested fork. */
+/* Unlinked shared memory avoids filesystem writeback while siblings are frozen.
+ */
 static int fork_snapshot_shm_create(uint64_t size)
 {
-    int fd = tmpfile_anon("fork");
+    uint64_t nonce;
+    arc4random_buf(&nonce, sizeof(nonce));
+    char name[32];
+    snprintf(name, sizeof(name), "/elfuse-fork-%016llx",
+             (unsigned long long) nonce);
+    int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
     if (fd < 0)
         return -1;
-    if (fd_set_cloexec(fd) < 0 || ftruncate(fd, (off_t) size) < 0) {
+    int unlink_rc = shm_unlink(name);
+    if (unlink_rc < 0 || fd_set_cloexec(fd) < 0 ||
+        ftruncate(fd, (off_t) size) < 0) {
         int saved_errno = errno;
         close(fd);
         errno = saved_errno;

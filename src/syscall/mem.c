@@ -26,6 +26,7 @@
 #include "debug/log.h"
 #include "utils.h"
 
+#include "core/host-sigbus.h"
 #include "core/vdso.h"
 
 #include "proved/align.h"
@@ -987,31 +988,78 @@ int guest_memory_resident_pages(const guest_t *g,
     return 0;
 }
 
+/* Resident guest pages across every tracked process VMA, plus the byte size of
+ * those VMAs. Caller holds mmap_lock.
+ *
+ * regions[] is sorted by guest address and an mprotect split leaves adjacent
+ * records with contiguous backing. One query covers each such run. A hole, an
+ * infra mapping, or a second VMA over the same backing starts a new run, so an
+ * alias is counted once per VMA. Nothing is retained after the call.
+ *
+ * Returns 0 or a negative Linux errno. On failure neither output is written.
+ */
+int guest_memory_mapped_resident_pages(const guest_t *g,
+                                       uint64_t *vsize_out,
+                                       uint64_t *pages_out)
+{
+    assert(mmap_lock_held());
+    uint64_t vsize = 0;
+    uint64_t resident = 0;
+    uint64_t span_gpa = 0;
+    uint64_t span_end = 0;
+    for (int i = 0; i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        bool infra = guest_range_hits_infra(g, r->start, r->end);
+        uint64_t gpa = r->gpa_base;
+        uint64_t len = r->end - r->start;
+        if (!infra && span_end == gpa) {
+            vsize += len;
+            span_end = gpa + len;
+            continue;
+        }
+        if (span_end > span_gpa) {
+            uint64_t pages = 0;
+            int rc = guest_memory_resident_pages(g, span_gpa,
+                                                 span_end - span_gpa, &pages);
+            if (rc < 0)
+                return rc;
+            resident += pages;
+        }
+        if (infra) {
+            span_end = 0;
+            continue;
+        }
+        vsize += len;
+        span_gpa = gpa;
+        span_end = gpa + len;
+    }
+    if (span_end > span_gpa) {
+        uint64_t pages = 0;
+        int rc = guest_memory_resident_pages(g, span_gpa, span_end - span_gpa,
+                                             &pages);
+        if (rc < 0)
+            return rc;
+        resident += pages;
+    }
+    *vsize_out = vsize;
+    *pages_out = resident;
+    return 0;
+}
+
 
 static int snapshot_write_range(const guest_t *g,
-                                int fd,
+                                uint8_t *snapshot,
                                 uint64_t cursor,
                                 uint64_t len)
 {
     const uint8_t *src = (const uint8_t *) g->host_base + cursor;
-    uint64_t copied = 0;
-    while (copied < len) {
-        ssize_t n =
-            pwrite(fd, src + copied, len - copied, (off_t) (cursor + copied));
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            return linux_errno();
-        }
-        if (n == 0)
-            return -LINUX_EIO;
-        copied += (uint64_t) n;
-    }
-    return 0;
+    bool faulted;
+    HOST_SIGBUS_GUARD(faulted, memcpy(snapshot + cursor, src, len));
+    return faulted ? -LINUX_EFAULT : 0;
 }
 
 static int snapshot_memory_range(const guest_t *g,
-                                 int fd,
+                                 uint8_t *snapshot,
                                  uint64_t cursor,
                                  uint64_t len,
                                  bool anonymous)
@@ -1020,7 +1068,7 @@ static int snapshot_memory_range(const guest_t *g,
      * disposition. Only anonymous mappings can contribute sparse holes.
      */
     if (!anonymous)
-        return snapshot_write_range(g, fd, cursor, len);
+        return snapshot_write_range(g, snapshot, cursor, len);
     size_t hps = host_page_size_cached();
     while (len) {
         uint8_t *host = (uint8_t *) g->host_base + cursor;
@@ -1062,54 +1110,58 @@ static int snapshot_memory_range(const guest_t *g,
                 continue;
             }
         }
-        int dispositions[512];
-        uint64_t prefix = cursor % hps;
-        uint64_t chunk =
-            sizeof(dispositions) / sizeof(dispositions[0]) * hps - prefix;
-        if (chunk > len)
-            chunk = len;
-        if (chunk > region_len)
-            chunk = region_len;
-        mach_vm_size_t count = ALIGN_UP(prefix + chunk, hps) / hps;
-        if (mach_vm_page_range_query(
-                mach_task_self(),
-                (mach_vm_address_t) ((uint8_t *) g->host_base + cursor -
-                                     prefix),
-                ALIGN_UP(prefix + chunk, hps), (mach_vm_address_t) dispositions,
-                &count) != KERN_SUCCESS ||
-            count != ALIGN_UP(prefix + chunk, hps) / hps)
-            return -LINUX_EIO;
-        uint64_t pos = 0;
-        while (pos < chunk) {
-            uint64_t run = hps - (cursor + pos) % hps;
-            if (run > chunk - pos)
-                run = chunk - pos;
-            int keep = VM_PAGE_QUERY_PAGE_PRESENT |
-                       VM_PAGE_QUERY_PAGE_PAGED_OUT |
-                       VM_PAGE_QUERY_PAGE_EXTERNAL;
-            bool hole =
-                !(dispositions[(prefix + pos) / hps] & keep) && run == hps;
-            while (pos + run + hps <= chunk) {
-                bool next_hole =
-                    !(dispositions[(prefix + pos + run) / hps] & keep);
-                if (next_hole != hole || (cursor + pos) % hps)
-                    break;
-                run += hps;
+        while (region_len) {
+            int dispositions[512];
+            uint64_t prefix = cursor % hps;
+            uint64_t chunk =
+                sizeof(dispositions) / sizeof(dispositions[0]) * hps - prefix;
+            if (chunk > len)
+                chunk = len;
+            if (chunk > region_len)
+                chunk = region_len;
+            mach_vm_size_t count = ALIGN_UP(prefix + chunk, hps) / hps;
+            if (mach_vm_page_range_query(
+                    mach_task_self(),
+                    (mach_vm_address_t) ((uint8_t *) g->host_base + cursor -
+                                         prefix),
+                    ALIGN_UP(prefix + chunk, hps),
+                    (mach_vm_address_t) dispositions, &count) != KERN_SUCCESS ||
+                count != ALIGN_UP(prefix + chunk, hps) / hps)
+                return -LINUX_EIO;
+            uint64_t pos = 0;
+            while (pos < chunk) {
+                uint64_t run = hps - (cursor + pos) % hps;
+                if (run > chunk - pos)
+                    run = chunk - pos;
+                int keep = VM_PAGE_QUERY_PAGE_PRESENT |
+                           VM_PAGE_QUERY_PAGE_PAGED_OUT |
+                           VM_PAGE_QUERY_PAGE_EXTERNAL;
+                bool hole =
+                    !(dispositions[(prefix + pos) / hps] & keep) && run == hps;
+                while (pos + run + hps <= chunk) {
+                    bool next_hole =
+                        !(dispositions[(prefix + pos + run) / hps] & keep);
+                    if (next_hole != hole || (cursor + pos) % hps)
+                        break;
+                    run += hps;
+                }
+                if (!hole) {
+                    int err =
+                        snapshot_write_range(g, snapshot, cursor + pos, run);
+                    if (err < 0)
+                        return err;
+                }
+                pos += run;
             }
-            if (!hole) {
-                int err = snapshot_write_range(g, fd, cursor + pos, run);
-                if (err < 0)
-                    return err;
-            }
-            pos += run;
+            cursor += chunk;
+            len -= chunk;
+            region_len -= chunk;
         }
-        cursor += chunk;
-        len -= chunk;
     }
     return 0;
 }
 
-int guest_memory_snapshot(const guest_t *g, int fd)
+static int snapshot_populate(const guest_t *g, uint8_t *snapshot)
 {
     assert(mmap_lock_held());
     for (int i = 0; i < g->nregions; i++) {
@@ -1118,6 +1170,20 @@ int guest_memory_snapshot(const guest_t *g, int fd)
         if (r->dontfork || r->gpa_base >= g->guest_size ||
             len > g->guest_size - r->gpa_base)
             continue;
+        bool anonymous = (r->flags & LINUX_MAP_ANONYMOUS) != 0;
+        if (anonymous && r->backing_fd < 0) {
+            while (i + 1 < g->nregions) {
+                const guest_region_t *next = &g->regions[i + 1];
+                uint64_t next_len = next->end - next->start;
+                if (next->dontfork || next->backing_fd >= 0 ||
+                    !(next->flags & LINUX_MAP_ANONYMOUS) ||
+                    next->gpa_base != r->gpa_base + len ||
+                    next_len > g->guest_size - r->gpa_base - len)
+                    break;
+                len += next_len;
+                i++;
+            }
+        }
         if (r->backing_fd >= 0) {
             struct stat st;
             if (fstat(r->backing_fd, &st) < 0)
@@ -1128,24 +1194,36 @@ int guest_memory_snapshot(const guest_t *g, int fd)
                 return -LINUX_EIO;
             slice_clamp(file_end, r->offset, len, &len);
         }
-        int err = snapshot_memory_range(g, fd, r->gpa_base, len,
-                                        (r->flags & LINUX_MAP_ANONYMOUS) != 0);
+        int err =
+            snapshot_memory_range(g, snapshot, r->gpa_base, len, anonymous);
         if (err < 0)
             return err;
     }
-    int err = snapshot_memory_range(g, fd, g->pt_pool_base,
+    int err = snapshot_memory_range(g, snapshot, g->pt_pool_base,
                                     g->pt_pool_next - g->pt_pool_base, false);
     if (err < 0)
         return err;
     if (g->is_rosetta && g->rosetta_guest_base && g->rosetta_size) {
-        err = snapshot_memory_range(g, fd, g->rosetta_guest_base,
+        err = snapshot_memory_range(g, snapshot, g->rosetta_guest_base,
                                     g->rosetta_size, false);
         if (err < 0)
             return err;
     }
     if (g->is_rosetta && g->kbuf_gpa)
-        return snapshot_memory_range(g, fd, g->kbuf_gpa, KBUF_SIZE, false);
+        return snapshot_memory_range(g, snapshot, g->kbuf_gpa, KBUF_SIZE,
+                                     false);
     return 0;
+}
+
+int guest_memory_snapshot(const guest_t *g, int fd)
+{
+    uint8_t *snapshot =
+        mmap(NULL, g->guest_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (snapshot == MAP_FAILED)
+        return linux_errno();
+    int err = snapshot_populate(g, snapshot);
+    munmap(snapshot, g->guest_size);
+    return err;
 }
 
 static int guest_memory_reset_range_quiesced(guest_t *g,
