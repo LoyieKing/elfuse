@@ -274,6 +274,83 @@ Practical notes:
   time; `elfuse` creates a case-sensitive APFS sparsebundle, mounts it
   at `PATH`, and uses it as the sysroot for this run.
 
+## Native macOS GTK Windows
+
+The optional `elfuse-gtk` executable presents GTK 4.24 Broadway surface
+requests in macOS GtkWindows. It uses the local Unix-socket protocol;
+no Broadway web daemon, browser, or X server is involved. PNG textures arrive
+through passed file descriptors. The host reconstructs GSK nodes and draws
+them through Cairo in a GtkDrawingArea. GTK remains optional for `elfuse`.
+
+```sh
+brew install gtk4 pkg-config
+make elfuse-gtk
+build/elfuse-gtk build/elfuse --sysroot "$SYSROOT" \
+  --env GDK_BACKEND --env GSK_RENDERER --env BROADWAY_DISPLAY \
+  --env XDG_RUNTIME_DIR "$SYSROOT/usr/bin/android-translation-layer" "$APK"
+```
+
+`elfuse-gtk` sets the four imported variables for its child and removes its
+private socket directory when that child exits. Explicit imports are needed
+when using `--clear-env`. Guest HOME, cache, application data, and a session
+DBus address must also be supplied when the application requires them. Install
+fonts in the guest sysroot (for Alpine, `apk add font-dejavu`); host GTK fonts
+do not supply guest Pango fonts. Use an account present in the sysroot; the
+evaluated Alpine fixture has only uid 0. `--user 0:0` selects that guest
+identity without changing host uid.
+
+Mouse buttons, motion, vertical scroll, keys, focus and size changes are
+returned to the guest. Closing the host window terminates its child;
+the guest's own drawn close control follows the application's close handler.
+This transport does not supply Android services, EGL surfaces, clipboard,
+IME, or a full host GObject/JNI bridge. It requires a guest GTK build with
+the matching local Broadway protocol, which GTK 5 removes.
+
+With Alpine `android-translation-layer 0_git20261019-r0`, GTK `4.24.1-r0`,
+and `font-dejavu 2.37-r6`, the real `demo_app.apk` displays its
+`demo_application` title, `hello PoC world!`, and `second one (static)`.
+Its drawn close button reaches `onPause`, `onStop`, `onDestroy`, and exit
+status 0. Without guest fonts, both the title and body text are absent.
+The zero-size allocations of ATL's content wrappers are intentional and
+do not prevent the text from rendering.
+
+The unmodified `com.leocardz.multitouch.test_19.apk` also renders its
+ActionBar and custom touch view. Its image resources require a guest
+GdkPixbuf decoder. The tested configuration uses the ABI-compatible
+`gdk-pixbuf 2.42.12-r1` loaders, which decode PNG/JPEG in-process.
+GdkPixbuf 2.44 uses glycin and bubblewrap; its namespace sandbox is not
+supported by elfuse. Selecting 2.42 leaves that sandbox enabled wherever
+glycin is used and does not substitute fake namespace operations.
+
+Fetch the pinned AArch64 decoder alongside the sysroot, then generate its
+loader cache with the guest binary:
+
+```sh
+PIXBUF=$(bash tests/fetch-gtk-pixbuf.sh)
+MODULES="$PIXBUF/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders"
+build/elfuse --sysroot "$SYSROOT" \
+  --env "LD_LIBRARY_PATH=$PIXBUF/usr/lib" \
+  --env "GDK_PIXBUF_MODULEDIR=$MODULES" \
+  "$PIXBUF/usr/bin/gdk-pixbuf-query-loaders" > "$PIXBUF/loaders.cache"
+```
+
+Add these options to the `build/elfuse` arguments in the GTK launch above:
+
+```sh
+--env "LD_LIBRARY_PATH=$PIXBUF/usr/lib" \
+--env "GDK_PIXBUF_MODULEDIR=$MODULES" \
+--env "GDK_PIXBUF_MODULE_FILE=$PIXBUF/loaders.cache"
+```
+
+Validation covers a mouse press, a drag, release back to the idle screen,
+and two simultaneous touch sequences with independent movement and release.
+Closing the host GtkWindow terminates the guest with SIGTERM (status 143).
+Touch sequences were injected into the live bridge protocol; physical
+multitouch hardware and vibration are not validated.
+
+`make test-gtk-native-host` checks retained scene descendants and malformed
+frame rollback without starting a VM or opening a window.
+
 ## USB Devices
 
 Linux USB tools see the Mac's attached devices. `/dev/bus/usb` and
