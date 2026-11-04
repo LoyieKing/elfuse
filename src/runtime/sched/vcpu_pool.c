@@ -131,6 +131,8 @@ struct vcpu_slot {
      * whole settlement, so a live sampler never reads half of one.
      */
     _Atomic uint64_t cpu_account_base_ns;
+    _Atomic uint64_t
+        cpu_sample_high_ns; /* Monotonic CPU sample, not wall time. */
     _Atomic bool accounting_guest;
     _Atomic uint64_t accounting_seq;
     _Atomic uint64_t pending_exec_ns;
@@ -461,35 +463,46 @@ static void slot_cpu_port_init(struct vcpu_slot *slot)
                               memory_order_release);
 }
 
-/* Thread CPU time from the one source a foreign observer can also read.
- * CLOCK_THREAD_CPUTIME_ID is a fresh reading of the calling thread only; the
- * basic-info totals are the per-thread counter the kernel refreshes on
- * scheduling events, and a remote reader can obtain them through the cached
- * port. Using the public clock for the owner would put the baseline and a
- * remote reading in different freshness domains, where the remote value can sit
- * a scheduling quantum below the baseline and lose that slice. Both sides
- * therefore read this source, so a baseline and any later reading of it are
- * directly comparable. The cost is one thread_info call per sample.
- *
- * The bool is the availability signal: a caller must not read a failed sample
- * as zero time, which would look like a clock that went backwards.
+/* XNU recount backs both clocks. The public owner clock includes the interval
+ * since the last kernel snapshot; foreign thread_info can lag that value. A
+ * shared high-water sample keeps later observers monotonic without charging
+ * wall time or discarding an owner interval. See osfmk/kern/recount.c.
  */
 static bool slot_cpu_ns(struct vcpu_slot *slot, uint64_t *ns)
 {
-    mach_port_t port =
-        atomic_load_explicit(&slot->cpu_port, memory_order_acquire);
-    if (port == MACH_PORT_NULL)
+    bool owner = slot == owner_slot;
+    bool success;
+    uint64_t sampled = 0;
+    if (owner) {
+        struct timespec ts;
+        success = clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0;
+        if (success)
+            sampled =
+                (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+    } else {
+        mach_port_t port =
+            atomic_load_explicit(&slot->cpu_port, memory_order_acquire);
+        thread_basic_info_data_t info;
+        mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+        success = port != MACH_PORT_NULL &&
+                  thread_info(port, THREAD_BASIC_INFO, (thread_info_t) &info,
+                              &count) == KERN_SUCCESS;
+        if (success)
+            sampled = (uint64_t) info.user_time.seconds * 1000000000ULL +
+                      (uint64_t) info.user_time.microseconds * 1000ULL +
+                      (uint64_t) info.system_time.seconds * 1000000000ULL +
+                      (uint64_t) info.system_time.microseconds * 1000ULL;
+    }
+    if (!success)
         return false;
-    thread_basic_info_data_t info;
-    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
-    kern_return_t kr =
-        thread_info(port, THREAD_BASIC_INFO, (thread_info_t) &info, &count);
-    if (kr != KERN_SUCCESS)
-        return false;
-    *ns = (uint64_t) info.user_time.seconds * 1000000000ULL +
-          (uint64_t) info.user_time.microseconds * 1000ULL +
-          (uint64_t) info.system_time.seconds * 1000000000ULL +
-          (uint64_t) info.system_time.microseconds * 1000ULL;
+    uint64_t previous =
+        atomic_load_explicit(&slot->cpu_sample_high_ns, memory_order_relaxed);
+    while (sampled > previous &&
+           !atomic_compare_exchange_weak_explicit(
+               &slot->cpu_sample_high_ns, &previous, sampled,
+               memory_order_relaxed, memory_order_relaxed)) {
+    }
+    *ns = sampled > previous ? sampled : previous;
     return true;
 }
 
@@ -499,11 +512,8 @@ static bool slot_cpu_ns(struct vcpu_slot *slot, uint64_t *ns)
  */
 #define POOL_SLOT_GEN_SHIFT 48
 
-/* Unsettled CPU time for @t: the batch the owner folded in, plus the phase
- * still in progress, both measured with the one clock every observer shares
- * (slot_cpu_ns). The in-progress term is what keeps a guest that never leaves
- * EL0 visible: without it the value would only move at phase boundaries, which
- * for a compute-bound task is one slice apart.
+/* The unsettled batch plus the current CPU interval. Both owner and foreign
+ * observations share slot_cpu_ns's monotonic high-water sample.
  */
 static sched_live_sample_t pool_live_sample(const struct thread_entry *t)
 {
