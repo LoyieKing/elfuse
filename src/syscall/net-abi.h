@@ -18,6 +18,7 @@ int translate_small_int_sockopt(int level,
                                 int *mac_level,
                                 int *mac_optname);
 int translate_af_to_mac(int linux_af);
+int translate_af_to_linux(int mac_af);
 int linux_to_mac_sockaddr(const void *linux_sa,
                           uint32_t linux_len,
                           struct sockaddr_storage *mac_sa);

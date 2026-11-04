@@ -76,6 +76,35 @@ int main(void)
         failures++;
     }
 
+    printf("test-socket: getsockopt(SO_DOMAIN)... ");
+    int domain = -1;
+    optlen = sizeof(domain);
+    if (getsockopt(sv[0], SOL_SOCKET, SO_DOMAIN, &domain, &optlen) < 0 ||
+        domain != AF_UNIX || optlen != sizeof(domain)) {
+        printf("FAIL (domain=%d len=%u: %m)\n", domain, (unsigned) optlen);
+        failures++;
+    } else {
+        printf("PASS\n");
+    }
+    unsigned char short_domain[2] = {0xff, 0x5a};
+    optlen = 1;
+    if (getsockopt(sv[0], SOL_SOCKET, SO_DOMAIN, short_domain, &optlen) < 0 ||
+        short_domain[0] != AF_UNIX || short_domain[1] != 0x5a || optlen != 1) {
+        printf("test-socket: short SO_DOMAIN FAIL\n");
+        failures++;
+    }
+    int inet6 = socket(AF_INET6, SOCK_DGRAM, 0);
+    domain = -1;
+    optlen = sizeof(domain);
+    if (inet6 < 0 ||
+        getsockopt(inet6, SOL_SOCKET, SO_DOMAIN, &domain, &optlen) < 0 ||
+        domain != AF_INET6) {
+        printf("test-socket: IPv6 SO_DOMAIN FAIL (domain=%d: %m)\n", domain);
+        failures++;
+    }
+    if (inet6 >= 0)
+        close(inet6);
+
     /* Test 4: getsockname/getpeername */
     printf("test-socket: 4. getsockname/getpeername... ");
     {

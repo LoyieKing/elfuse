@@ -519,6 +519,10 @@ Socket syscalls are translated in `src/syscall/net.c` and friends:
   type argument; both bits must be extracted before calling `socket()`.
 - `SOL_SOCKET` option numbers (`SO_TYPE`, `SO_SNDBUF`, `SO_RCVBUF`, …)
   differ between platforms and are remapped per option.
+- `SO_DOMAIN` reads the pinned host socket's family through `getsockname` and
+  translates it to Linux, including macOS IPv6 30 to Linux 10. Its integer
+  result respects short-buffer copyout. AOSP BlockGuardOs uses it before
+  accepting a Unix socket.
 
 Netlink sockets are emulated in `src/syscall/netlink.c`: `NETLINK_ROUTE`
 answers the `RTM_GETLINK` / `RTM_GETADDR` dumps `getifaddrs` issues, and

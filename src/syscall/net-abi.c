@@ -187,7 +187,7 @@ int translate_af_to_mac(int linux_af)
     }
 }
 
-static int translate_af_to_linux(int mac_af)
+int translate_af_to_linux(int mac_af)
 {
     switch (mac_af) {
     case AF_UNSPEC:

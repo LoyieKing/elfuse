@@ -1724,6 +1724,25 @@ int64_t sys_getsockopt(guest_t *g,
     if (ref_err < 0)
         return ref_err;
 
+    if (level == LINUX_SOL_SOCKET && optname == LINUX_SO_DOMAIN) {
+        struct sockaddr_storage address;
+        socklen_t length = sizeof(address);
+        if (getsockname(host_ref.fd, (struct sockaddr *) &address, &length) <
+            0) {
+            int64_t error = linux_errno();
+            host_fd_ref_close(&host_ref);
+            return error;
+        }
+        int32_t domain = translate_af_to_linux(address.ss_family);
+        host_fd_ref_close(&host_ref);
+        uint32_t out_len = sockopt_write_len(sizeof(domain), guest_optlen);
+        if ((out_len &&
+             guest_write_small(g, optval_gva, &domain, out_len) < 0) ||
+            guest_write_small(g, optlen_gva, &out_len, sizeof(out_len)) < 0)
+            return -LINUX_EFAULT;
+        return 0;
+    }
+
     int mac_level = level, mac_optname = optname;
     int small_int_opt = socket_opt_uses_small_int(level, optname);
 
