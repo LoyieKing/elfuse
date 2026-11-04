@@ -15,6 +15,11 @@ bash tests/scheduler/run.sh --filter nice-inherit-isolate
 bash tests/scheduler/run.sh --filter signal-affinity-migrate
 bash tests/scheduler/run.sh --filter process-cputime-thread-exit
 bash tests/scheduler/run.sh --filter fork-inherit-isolate
+ELFUSE_CPUS=2 bash tests/scheduler/run.sh --filter cpu-domain-inherit
+ELFUSE_CPUS=4 bash tests/scheduler/run.sh --filter cpu-domain-inherit
+ELFUSE_CPUS=6 bash tests/scheduler/run.sh --filter cpu-domain-inherit
+ELFUSE_CPUS=invalid build/elfuse --cpus 4 \
+    build/test-sched-fork-domain cpu-domain-inherit 4
 bash tests/scheduler/run.sh --filter rt-fifo-excludes-fork
 bash tests/scheduler/run.sh --filter test-sched-attr-abi
 bash tests/scheduler/run.sh --filter rr-rotation
@@ -47,9 +52,14 @@ case classification below for cutover decisions. Filter required cases
 individually using the commands above. The script commands use the existing
 build/elfuse. Do not overlap timing-sensitive test runs.
 
+`cpu-domain-inherit` checks that CPU files, libc's online count and affinity
+agree, pins the highest logical CPU, then checks fork and exec with an empty
+guest environment. CPU overrides must not exceed the host online CPU count.
+
 `make check` also runs `test-sched-placement-host` against the scheduler core
-without HVF timing. It covers busy-CPU load selection, the 25 us early-out,
-deadline-demand tie breaking, affinity-filtered stealing, demand transfer,
+without HVF timing. It covers default CPU limits and explicit-domain stability,
+busy-CPU load selection, the 25 us early-out, deadline-demand tie breaking,
+affinity-filtered stealing, demand transfer,
 virtual timeline migration, peak/quarter-decay estimation, Linux RT/DL queue
 exclusion, solo FAIR timer suppression and budget expiry after contention.
 RR and DEADLINE retain live budget sampling. `test-sched-policy-rt` waits for

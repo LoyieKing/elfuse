@@ -17,6 +17,7 @@ test-sched-task-state process-cputime-thread-exit
 
 test-sched-attr-abi -
 test-sched-fork-domain fork-inherit-isolate
+test-sched-fork-domain cpu-domain-inherit
 
 test-sched-fork-domain rt-fifo-excludes-fork
 

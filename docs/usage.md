@@ -17,6 +17,7 @@ Supported user-facing options:
 | `-V`, `--version` | Print the build version and exit |
 | `-v`, `--verbose` | Enable syscall-level and loader diagnostics |
 | `-t`, `--timeout N` | Guest execution watchdog, in seconds (default `10`, `0` disables) |
+| `--cpus N` | Guest logical CPUs, from `1` to the host online CPU count (also `ELFUSE_CPUS=N`; the flag wins) |
 | `--memory-mode=lazy\|eager` | Private anonymous backing policy (default `lazy`); `--memory-mode MODE` also works |
 | `--sysroot PATH` | Resolve guest absolute paths under `PATH`, falling back to the host for paths it does not hold |
 | `--create-sysroot PATH` | Provision a case-sensitive APFS sparsebundle mounted at `PATH`, then use it as the sysroot |
@@ -29,6 +30,12 @@ Supported user-facing options:
 | `--env KEY=VALUE` | Set a guest environment variable. Repeatable; a bare `KEY` imports the host value |
 | `--clear-env` | Start from an empty environment; only `--env` entries apply |
 | `--` | End `elfuse` option parsing; remaining tokens are guest argv |
+
+The default CPU limit is half the host online CPUs, rounded down, with at least
+one and at most four. Guest CPU files and affinity use that same logical CPU
+domain. The limit is per VM, preserved across guest fork and exec, and does not
+reserve host cores. `--clear-env` and `--env` affect the guest environment, not
+the host-side `ELFUSE_CPUS` setting. Invalid counts fail before guest execution.
 
 `ELFUSE_FAKEROOT_EXEC` has no flag form. It names one executable, by absolute
 path, whose `execve` enters fakeroot mode, so a guest can run unprivileged and

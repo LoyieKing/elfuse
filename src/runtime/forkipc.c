@@ -1098,9 +1098,13 @@ int64_t sys_clone(hv_vcpu_t vcpu,
 
     /* argv is intentionally minimal; guest argv is restored later from IPC. */
     char notify_fd_str[32];
+    char cpu_str[16];
+    snprintf(cpu_str, sizeof(cpu_str), "%d", sched_domain_ncpu());
     char *child_argv[16];
     int ci = 0;
     child_argv[ci++] = self_path;
+    child_argv[ci++] = "--cpus";
+    child_argv[ci++] = cpu_str;
     if (verbose)
         child_argv[ci++] = "--verbose";
 

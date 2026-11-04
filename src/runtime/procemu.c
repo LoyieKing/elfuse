@@ -65,6 +65,7 @@
 #include "runtime/usb-sysfs.h"
 #include "core/rosetta.h"
 #include "runtime/thread.h"
+#include "runtime/sched/sched.h"
 
 #include "syscall/linux-wire.h"
 #include "syscall/fd.h"
@@ -1327,10 +1328,7 @@ static int syscpu_format_range(char *buf, size_t bufsz, int ncpu)
 
 static int syscpu_count(void)
 {
-    int n = (int) sysconf(_SC_NPROCESSORS_ONLN);
-    if (n < 1)
-        n = 1;
-    return n;
+    return sched_domain_ncpu();
 }
 
 /* Walk syscpu_dir and remove every entry plus the dir itself. Caller is
@@ -2547,9 +2545,7 @@ static int intercept_open_dispatch(const guest_t *g,
      * CPUs.
      */
     if (!strcmp(path, "/proc/cpuinfo")) {
-        int ncpu = (int) sysconf(_SC_NPROCESSORS_ONLN);
-        if (ncpu < 1)
-            ncpu = 1;
+        int ncpu = sched_domain_ncpu();
         size_t bufsz = (size_t) ncpu * 256 + 64;
         char stackbuf[4096];
         char *buf = (bufsz <= sizeof(stackbuf)) ? stackbuf : malloc(bufsz);
@@ -3108,9 +3104,7 @@ static int intercept_open_dispatch(const guest_t *g,
         size_t bt_len = sizeof(boottime);
         int mib[2] = {CTL_KERN, KERN_BOOTTIME};
         sysctl(mib, 2, &boottime, &bt_len, NULL, 0);
-        int ncpu = (int) sysconf(_SC_NPROCESSORS_ONLN);
-        if (ncpu < 1)
-            ncpu = 1;
+        int ncpu = sched_domain_ncpu();
         char buf[4096];
         int off = 0;
 

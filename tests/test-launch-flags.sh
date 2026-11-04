@@ -43,7 +43,7 @@ check()
             report_fail "$desc (accepted, want rejection)"
             return
         fi
-        if ! printf '%s' "$out" | grep -qF "$pattern"; then
+        if ! printf '%s' "$out" | grep -qF -- "$pattern"; then
             report_fail "$desc (exit $status but message lacks '$pattern')"
             printf '%s\n' "$out" >&2
             return
@@ -89,6 +89,19 @@ check reject "--user GID with a sign" "invalid --user" --user 1000:+7
 check reject "--user empty GID" "invalid --user" --user 1000:
 # Both sides of parse_id_component's UINT32_MAX bail.
 check reject "--user one past UINT32_MAX" "invalid --user" --user 4294967296
+
+check reject "--cpus zero" "--cpus requires" --cpus 0
+check reject "--cpus negative" "--cpus requires" --cpus -1
+check reject "--cpus non-numeric" "--cpus requires" --cpus bogus
+check reject "--cpus trailing junk" "--cpus requires" --cpus 2x
+check reject "--cpus overflow" "--cpus requires" --cpus 999999999999999999999
+check accept "--cpus one" '' --cpus 1
+ELFUSE_CPUS=invalid check reject "ELFUSE_CPUS invalid" \
+    "ELFUSE_CPUS requires"
+ELFUSE_CPUS=0 check reject "ELFUSE_CPUS zero" "ELFUSE_CPUS requires"
+ELFUSE_CPUS=1 check accept "ELFUSE_CPUS one" ''
+ELFUSE_CPUS=invalid check accept "--cpus overrides invalid ELFUSE_CPUS" '' \
+    --cpus 1
 
 # --memory-mode changes physical backing, not guest bytes, so the launch path
 # merely has to accept both spellings in both modes and refuse every other value

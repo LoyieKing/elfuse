@@ -39,7 +39,7 @@
  * The table grows with host memory (calloc failure -> clone EAGAIN). Each task
  * still needs a 4KiB SP_EL1 slot carved from the shim_data IPA block above the
  * shim-globals cache; exhausting that pool returns ENOMEM. Physical HVF vCPUs
- * stay bound to sched_host_ncpu() worker slots; creating many CLONE_THREAD
+ * stay bound to sched_domain_ncpu() worker slots; creating many CLONE_THREAD
  * tasks does not create one vCPU each.
  *
  * Callers that need a snapshot buffer size should use thread_table_capacity()

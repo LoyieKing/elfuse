@@ -6,6 +6,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/wait.h>
 
 #include "runtime/thread.h"
 #include "test-harness.h"
@@ -105,10 +106,45 @@ static void pinned(unsigned id, int cpu)
     SCHED_BIT_SET(tasks[id].sched.affinity, cpu);
 }
 
+static void domain_case(int host, int requested, int expected)
+{
+    pid_t child = fork();
+    if (child == 0) {
+        sched_host_ncpu_cache = host;
+        if (sched_domain_init(requested) != 0 ||
+            sched_domain_ncpu() != expected || sched_host_ncpu() != host ||
+            sched_domain_init(expected) != 0 || sched_domain_init(0) != 0 ||
+            sched_domain_init(expected == 1 ? 2 : 1) !=
+                (host == 1 ? 0 : -SCHED_ERR_EINVAL))
+            _exit(1);
+        _exit(0);
+    }
+    int status = 0;
+    EXPECT_TRUE(child > 0 && waitpid(child, &status, 0) == child &&
+                    WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                "default domain policy or idempotence is wrong");
+}
+
 int main(void)
 {
+    TEST("default domain leaves host headroom without changing host count");
+    domain_case(1, 0, 1);
+    domain_case(2, 0, 1);
+    domain_case(3, 0, 1);
+    domain_case(14, 0, 4);
+    domain_case(64, 0, 4);
+    domain_case(14, 2, 2);
+    domain_case(14, 4, 4);
+    domain_case(14, 6, 6);
+    domain_case(14, 14, 14);
     if (sched_domain_init(3) || sched_domain_ncpu() < 3)
         return 77;
+    TEST("explicit domain size is independent of the default policy");
+    EXPECT_EQ(sched_domain_ncpu(), 3, "explicit domain size was changed");
+    EXPECT_EQ(sched_domain_init(0), 0, "default reinitialized explicit domain");
+    EXPECT_EQ(sched_domain_ncpu(), 3, "default changed explicit domain");
+    EXPECT_EQ(sched_domain_init(2), -SCHED_ERR_EINVAL,
+              "conflicting explicit domain size was accepted");
     reset();
     queue(0, 0, 8000000);
     queue(1, 1, 1000000);

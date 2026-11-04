@@ -1570,7 +1570,14 @@ int sched_host_ncpu(void)
 
 int sched_domain_init(int ncpu)
 {
-    int want = ncpu > 0 ? ncpu : sched_host_ncpu();
+    int want = ncpu;
+    if (want <= 0) {
+        want = sched_host_ncpu() / 2;
+        if (want < 1)
+            want = 1;
+        if (want > 4)
+            want = 4;
+    }
 
     if (want < 1)
         return -SCHED_ERR_EINVAL;

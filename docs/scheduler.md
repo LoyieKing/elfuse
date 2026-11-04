@@ -5,6 +5,14 @@ Guest tasks share a lazy pool of HVF workers, bounded by the VM CPU limit.
 A blocked task releases its logical CPU; worker count follows runnable demand.
 Darwin schedules the host processes and worker pthreads.
 
+The default domain has half the host online CPUs, rounded down, with a minimum
+of one and a maximum of four. `--cpus N` overrides `ELFUSE_CPUS=N`; an explicit
+count can use all host online CPUs, up to the scheduler CPU-set limit. Fork
+helpers receive the resolved domain count, and guest exec preserves it. Guest
+CPU reporting and affinity share this domain. Each VM has its own limit, so
+forked processes can together exceed it. HVF execution workers use Darwin
+`QOS_CLASS_USER_INITIATED`; the signal/preemption consumer remains interactive.
+
 ## Sources and licensing
 
 Fair scheduling derives from Zircon's

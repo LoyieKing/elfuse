@@ -40,6 +40,7 @@
 
 #include "runtime/forkipc.h"
 #include "runtime/proctitle.h"
+#include "runtime/sched/sched.h"
 
 #include "syscall/fuse.h"
 #include "syscall/path.h"
@@ -228,11 +229,11 @@ static int host_dc_zva_assert(void)
  * 80 columns. Sharing one body keeps the flag list from drifting between them
  * (one copy had already lost the --gdb flags).
  */
-#define ELFUSE_USAGE_BODY(sep)                                             \
-    "usage: elfuse [--verbose] [--timeout N] [--memory-mode MODE] "        \
-    "[--sysroot PATH]" sep                                                 \
-    "[--create-sysroot PATH] [--no-rosetta] [--fakeroot] [--gdb PORT]" sep \
-    "[--gdb-stop-on-entry] [--user UID[:GID]] [--workdir DIR]" sep         \
+#define ELFUSE_USAGE_BODY(sep)                                                 \
+    "usage: elfuse [--verbose] [--timeout N] [--cpus N] [--memory-mode MODE] " \
+    "[--sysroot PATH]" sep                                                     \
+    "[--create-sysroot PATH] [--no-rosetta] [--fakeroot] [--gdb PORT]" sep     \
+    "[--gdb-stop-on-entry] [--user UID[:GID]] [--workdir DIR]" sep             \
     "[--env KEY=VALUE] [--clear-env] <elf-path> [args...]"
 
 #define ELFUSE_USAGE ELFUSE_USAGE_BODY(" ")
@@ -264,6 +265,7 @@ int main(int argc, char **argv)
      */
     bool rosetta_enabled = true;
     int timeout_sec = 10, fork_child_fd = -1, vfork_notify_fd = -1;
+    int ncpu = 0;
     const char *sysroot = NULL;
     const char *create_sysroot = NULL;
     int gdb_port = 0;
@@ -332,6 +334,8 @@ int main(int argc, char **argv)
                 "  -v, --verbose           Trace each guest syscall\n"
                 "  --timeout N             vCPU watchdog period "
                 "(seconds, default 10; 0 disables)\n"
+                "  --cpus N                Guest CPUs (default half the host, "
+                "at least 1, at most 4)\n"
                 "  --memory-mode MODE      Guest memory reset: lazy discards "
                 "pages, eager zeroes\n"
                 "  --sysroot PATH          Resolve absolute guest paths under "
@@ -358,6 +362,7 @@ int main(int argc, char **argv)
                 "environ\n"
                 "\n"
                 "Environment:\n"
+                "  ELFUSE_CPUS=N           Same as --cpus; the flag wins\n"
                 "  ELFUSE_NO_ROSETTA=1     Same as --no-rosetta\n"
                 "  ELFUSE_FAKEROOT=1       Same as --fakeroot\n"
                 "  ELFUSE_FAKEROOT_EXEC    Absolute path of the one executable "
@@ -386,6 +391,14 @@ int main(int argc, char **argv)
             if (parse_int_arg(argv[arg_start + 1], 0, INT_MAX, &timeout_sec) <
                 0)
                 timeout_sec = 10;
+            arg_start += 2;
+        } else if (!strcmp(argv[arg_start], "--cpus") && arg_start + 1 < argc) {
+            if (parse_int_arg(argv[arg_start + 1], 1, sched_host_ncpu(),
+                              &ncpu) < 0) {
+                log_error("--cpus requires a count from 1 to %d",
+                          sched_host_ncpu());
+                goto cleanup;
+            }
             arg_start += 2;
         } else if (!strcmp(argv[arg_start], "--memory-mode") ||
                    !strncmp(argv[arg_start], "--memory-mode=", 14)) {
@@ -519,6 +532,17 @@ int main(int argc, char **argv)
     if (sysroot && create_sysroot) {
         log_error(
             "use either --sysroot PATH or --create-sysroot PATH, not both");
+        goto cleanup;
+    }
+    const char *cpu_env = getenv("ELFUSE_CPUS");
+    if (ncpu == 0 && cpu_env &&
+        parse_int_arg(cpu_env, 1, sched_host_ncpu(), &ncpu) < 0) {
+        log_error("ELFUSE_CPUS requires a count from 1 to %d",
+                  sched_host_ncpu());
+        goto cleanup;
+    }
+    if (sched_domain_init(ncpu) != 0) {
+        log_error("failed to initialize guest CPU domain");
         goto cleanup;
     }
 

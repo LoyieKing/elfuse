@@ -2118,6 +2118,10 @@ test-usbdev-urb-host: $(BUILD_DIR)/test-usbdev-urb-host
 test-elf-headers-host: $(BUILD_DIR)/test-elf-headers-host
 	$(BUILD_DIR)/test-elf-headers-host
 
+.PHONY: test-sched-placement-host
+## Run scheduler CPU policy, placement, and stealing tests on the host
+test-sched-placement-host: $(BUILD_DIR)/test-sched-placement-host
+	$(BUILD_DIR)/test-sched-placement-host
 # Wakeup pipe concurrency unit test. Only a -fsanitize=thread build carries a
 # race detector, so check-sanitizer is where this lane has its full weight.
 ## Run the wakeup pipe concurrency unit test natively on the host

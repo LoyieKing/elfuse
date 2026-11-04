@@ -31,7 +31,7 @@
 struct thread_entry;
 struct vcpu_slot;
 
-/* Allocate the (initially stopped) slot table sized to sched_host_ncpu().
+/* Allocate the (initially stopped) slot table sized to sched_domain_ncpu().
  * Idempotent. No worker or HVF vCPU is created here.
  */
 int vcpu_pool_init(void);

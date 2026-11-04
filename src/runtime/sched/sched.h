@@ -328,13 +328,15 @@ void sched_set_host_ops(const sched_host_ops_t *ops);
 
 /* Domain lifecycle and clocks */
 
-/* Initialize the domain from the host CPU count. Idempotent. */
+/* Initialize the domain with the default host-headroom policy. Idempotent. */
 void sched_init(void);
 
-/* Initialize (or re-initialize before any task is attached) a domain with @ncpu
- * logical CPUs; 0 means sched_host_ncpu().
+/* Initialize a domain with @ncpu logical CPUs, capped by sched_host_ncpu().
+ * Zero selects half the host CPUs, at least one and at most four. An
+ * initialized domain accepts zero or its existing count; other counts return
+ * -EINVAL.
  *
- * Returns 0 or -EINVAL.
+ * Returns 0, -EINVAL, or -EBUSY on allocation failure.
  */
 int sched_domain_init(int ncpu);
 

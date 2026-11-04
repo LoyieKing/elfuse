@@ -14,6 +14,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
@@ -29,6 +30,7 @@
 
 static int passes;
 static int fails;
+static int expected_ncpu;
 
 static int skip(const char *why)
 {
@@ -502,16 +504,114 @@ out:
     return status;
 }
 
+static int topology_matches(int ncpu, int cpu)
+{
+    cpu_set_t mask;
+    char line[256];
+    int count = 0, first, second;
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    if (!f)
+        return 1;
+    while (fgets(line, sizeof(line), f)) {
+        if (!strncmp(line, "processor\t:", 11))
+            count++;
+    }
+    fclose(f);
+    f = fopen("/sys/devices/system/cpu/online", "r");
+    if (!f)
+        return 1;
+    int first_cpu = -1, last_cpu = -1;
+    if (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "%d-%d", &first_cpu, &last_cpu) == 1)
+            last_cpu = first_cpu;
+    }
+    fclose(f);
+    if (first_cpu != 0 || last_cpu != ncpu - 1)
+        return 1;
+    if (count != ncpu || sysconf(_SC_NPROCESSORS_ONLN) != ncpu ||
+        sched_getaffinity(0, sizeof(mask), &mask) != 0)
+        return 1;
+    if (cpu >= 0) {
+        if (!affinity_is_only(&mask, cpu))
+            return 1;
+    } else if (affinity_count(&mask, &first, &second) != ncpu) {
+        return 1;
+    }
+    return 0;
+}
+
+static int scenario_cpu_domain(void)
+{
+    int ncpu = (int) sysconf(_SC_NPROCESSORS_ONLN);
+    cpu_set_t saved;
+    char count_str[16], cpu_str[16];
+    pid_t child;
+    int status = 1;
+
+    arm(0, ALARM_SEC);
+    if (ncpu < 1 || sched_getaffinity(0, sizeof(saved), &saved) != 0)
+        return 1;
+    int first, second;
+    if (affinity_count(&saved, &first, &second) != ncpu || first != 0)
+        return skip("CPU domain requires an unrestricted initial affinity");
+    EXPECT_EQ(topology_matches(ncpu, -1), 0,
+              "CPU files and initial affinity disagree");
+    if (expected_ncpu > 0)
+        EXPECT_EQ(ncpu, expected_ncpu, "configured CPU count was ignored");
+    if (affinity_set_one(ncpu - 1) != 0) {
+        FAIL("pin highest logical CPU");
+        return 1;
+    }
+    snprintf(count_str, sizeof(count_str), "%d", ncpu);
+    snprintf(cpu_str, sizeof(cpu_str), "%d", ncpu - 1);
+    child = fork();
+    if (child == 0) {
+        arm(0, CHILD_ALARM_SEC);
+        if (topology_matches(ncpu, ncpu - 1) != 0)
+            _exit(1);
+        char *args[] = {"test-sched-fork-domain", "--cpu-domain-exec",
+                        count_str, cpu_str, NULL};
+        char *empty_env[] = {NULL};
+        execve("/proc/self/exe", args, empty_env);
+        _exit(1);
+    }
+    if (child < 0) {
+        FAIL("fork CPU domain");
+    } else {
+        arm(child, ALARM_SEC);
+        EXPECT_EQ(
+            reap_ok(child), 0,
+            "CPU domain or affinity changed across fork and empty-env exec");
+        alarm_child = 0;
+        status = fails ? 1 : 0;
+    }
+    EXPECT_EQ(sched_setaffinity(0, sizeof(saved), &saved), 0,
+              "restore parent affinity");
+    EXPECT_EQ(topology_matches(ncpu, -1), 0, "parent CPU domain changed");
+    return fails ? 1 : status;
+}
+
 static const struct scenario {
     const char *name;
     int (*run)(void);
 } scenarios[] = {
     {"fork-inherit-isolate", scenario_fork_inherit},
     {"rt-fifo-excludes-fork", scenario_rt_excludes},
+    {"cpu-domain-inherit", scenario_cpu_domain},
 };
 
 int main(int argc, char **argv)
 {
+    if (argc == 4 && strcmp(argv[1], "--cpu-domain-exec") == 0) {
+        arm(0, CHILD_ALARM_SEC);
+        return topology_matches(atoi(argv[2]), atoi(argv[3]));
+    }
+    if (argc == 3 && strcmp(argv[1], "cpu-domain-inherit") == 0) {
+        expected_ncpu = atoi(argv[2]);
+        if (expected_ncpu < 1)
+            return 2;
+        argc = 2;
+    }
     if (argc == 2 && strcmp(argv[1], "--list") == 0) {
         for (size_t i = 0; i < sizeof(scenarios) / sizeof(scenarios[0]); i++)
             printf("%s\n", scenarios[i].name);
@@ -528,6 +628,6 @@ int main(int argc, char **argv)
             SUMMARY(scenarios[i].name);
         return rc;
     }
-    fprintf(stderr, "usage: %s --list | SCENARIO\n", argv[0]);
+    fprintf(stderr, "usage: %s --list | SCENARIO [EXPECTED_CPUS]\n", argv[0]);
     return 2;
 }
