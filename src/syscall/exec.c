@@ -1577,7 +1577,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     /* The surviving task keeps its own SP_EL1 slot across execve. de_thread
      * just retired the old leader, so slot 0 (the shim data block top, which
      * the old staging used) is free for the next clone; re-entering on it would
-     * hand a new thread the same 4KiB EL1 stack the new leader is still using,
+     * hand a new thread the same EL1 stack the new leader is still using,
      * and the two would overwrite each other's saved SVC frames. Use the task's
      * allocation instead: the recorded stack must resolve to the slot the
      * thread table allocated to it, the same address guest_ctx_restore installs
