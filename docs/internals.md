@@ -710,8 +710,10 @@ service job, so a snapshot cannot race its descriptor or session publication.
   exception stack. It owns no HVF handle or host pthread. Lifetime references
   prevent storage reuse while asynchronous operations still name the task.
 - `_Thread_local current_thread` gives O(1) access from syscall handlers.
-- Each task receives a 4 KiB EL1 exception stack carved out of the shim
-  data region.
+- Each task receives a 1 KiB EL1 exception stack carved out of the shim
+  data region. The deepest shim path uses 528 bytes (two 256-byte GPR frames
+  and one 16-byte recovery slot). The globals floor remains page-aligned;
+  four stacks share each guest page. The residual pool holds 2036 tasks.
 
 `guest_ctx` retains `ESR_EL1` and `FAR_EL1` with `ELR_EL1` and `SPSR_EL1`.
 Preemption can stop a task inside the shim before it reads the exception

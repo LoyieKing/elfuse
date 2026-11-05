@@ -881,6 +881,7 @@ run_unit_tests()
     test_check "$runner" "test-simd-clone" "0 failed" "$bindir/test-simd-clone"
     test_check "$runner" "test-stress" "0 failed" "$bindir/test-stress"
     test_rc "$runner" "test-thread-churn" 0 "$bindir/test-thread-churn"
+    test_rc "$runner" "test-thread-parked" 0 "$bindir/test-thread-parked"
     test_rc "$runner" "test-sched-wake-balance" 0 "$bindir/test-sched-wake-balance"
     test_rc "$runner" "test-threaded-exec" 0 "$bindir/test-threaded-exec"
     test_rc "$runner" "test-threaded-exec-worker" 0 \

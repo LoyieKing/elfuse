@@ -55,10 +55,10 @@ static int thread_can_add_deferred_unmap_locked(thread_entry_t *t,
                                                 uint64_t start,
                                                 uint64_t end);
 
-/* Top of the EL1 exception stack region (one 4KiB slot per thread). The shim
- * data block sits at high IPA, computed at guest_init time and stored in
- * g->shim_data_base; the top of the EL1 stacks is the next 2MiB boundary above
- * that. Caller must hold a guest_t reference.
+/* Top of the EL1 exception stack region. The shim data block sits at high IPA,
+ * computed at guest_init time and stored in g->shim_data_base; the top of the
+ * EL1 stacks is the next 2MiB boundary above that. Caller must hold a guest_t
+ * reference.
  */
 static inline uint64_t sp_el1_top(const guest_t *g)
 {
@@ -70,15 +70,25 @@ static inline uint64_t sp_el1_top(const guest_t *g)
  * grows under thread_lock up to SP_EL1_SLOT_MAX (IPA pool).
  */
 
-/* Residual shim_data IPA above the globals cache, in 4KiB SP_EL1 slots. Align
- * the globals end up to a page so stacks never overlap the cache.
+/* Residual shim_data IPA above the globals cache, in SP_EL1 slots. The floor
+ * is a guest page, not a slot: a slot is smaller than a page, and aligning the
+ * cache end to a slot would let the lowest slot share a page with the cache.
  */
 #define SP_EL1_GLOBALS_END                                      \
-    (((uint64_t) SHIM_GLOBALS_SIZE + (SP_EL1_SLOT_BYTES - 1)) & \
-     ~((uint64_t) SP_EL1_SLOT_BYTES - 1))
+    (((uint64_t) SHIM_GLOBALS_SIZE + (GUEST_PAGE_SIZE - 1)) & \
+     ~((uint64_t) GUEST_PAGE_SIZE - 1))
 #define SP_EL1_SLOT_MAX \
     ((int) ((BLOCK_2MIB - SP_EL1_GLOBALS_END) / SP_EL1_SLOT_BYTES))
 #define SP_EL1_BITMAP_WORDS ((SP_EL1_SLOT_MAX + 63) / 64)
+
+_Static_assert(SP_EL1_SLOT_BYTES >= 256 + 16 + 256,
+               "an EL1 slot must hold an outer frame, a recovery slot, and a "
+               "nested frame");
+_Static_assert(SP_EL1_SLOT_BYTES <= GUEST_PAGE_SIZE &&
+                   (GUEST_PAGE_SIZE % SP_EL1_SLOT_BYTES) == 0,
+               "EL1 slots must tile a guest page");
+_Static_assert((SP_EL1_GLOBALS_END % GUEST_PAGE_SIZE) == 0,
+               "the stack floor must stay clear of the shim-globals page");
 
 /* Seed capacity; grows by doubling until SP_EL1_SLOT_MAX. */
 #define THREAD_TABLE_INITIAL_CAP 64
@@ -147,7 +157,8 @@ static _Atomic bool exec_de_thread_active;
 
 /* Bitmap tracking allocated SP_EL1 slots. Bit N set = slot N in use. Sized for
  * SP_EL1_SLOT_MAX (shim_data residual), not a fixed 64. Slot 0 is the main
- * thread (top of shim data region); each subsequent slot is 4KiB below.
+ * thread (top of the shim data region); each later slot is SP_EL1_SLOT_BYTES
+ * below the one before it.
  */
 static uint64_t sp_el1_allocated[SP_EL1_BITMAP_WORDS];
 

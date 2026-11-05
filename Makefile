@@ -627,6 +627,11 @@ $(BUILD_DIR)/test-thread-churn: tests/test-thread-churn.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
+# test-thread-parked keeps more tasks alive than the old 4KiB EL1 slot cap.
+$(BUILD_DIR)/test-thread-parked: tests/test-thread-parked.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
 $(BUILD_DIR)/test-gdbstub-threads: tests/test-gdbstub-threads.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -g -o $@ $< -lpthread

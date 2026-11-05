@@ -12,11 +12,13 @@
  * Blocking parks unmount so another READY task can run on that slot. A
  * _Thread_local pointer provides O(1) access from any syscall handler.
  *
- * SP_EL1 allocation: each task gets a 4KiB EL1 exception stack carved from the
+ * SP_EL1 allocation: each task gets a 1KiB EL1 exception stack carved from the
  * shim data region (g->shim_data_base + 2MiB). Task 0 (main) gets the top, task
- * N gets offset -(N * 4096). Slot count is bounded only by the residual IPA
- * above the shim-globals cache (see thread.c), not by a uint64_t bitset or a
- * fixed MAX_THREADS.
+ * N gets offset -(N * SP_EL1_SLOT_BYTES). The slot holds the deepest stack the
+ * shim uses (an outer SAVE_GPRS frame, a 16-byte recovery slot, and a nested
+ * SAVE_GPRS frame), with unused capacity below it. Slot count is
+ * bounded only by the residual IPA above the shim-globals cache (see
+ * thread.c), not by a uint64_t bitset or a fixed MAX_THREADS.
  */
 
 #pragma once
@@ -35,13 +37,14 @@
 #include "runtime/sched/sched.h"
 #include "debug/profile.h"
 
-/* Concurrent kernel tasks are not hard-capped at a fixed 64.
+/* Concurrent kernel tasks are not hard-capped at a fixed 64, nor at one task
+ * per guest page of the shim data block.
  *
  * The table grows with host memory (calloc failure -> clone EAGAIN). Each task
- * still needs a 4KiB SP_EL1 slot carved from the shim_data IPA block above the
- * shim-globals cache; exhausting that pool returns ENOMEM. Physical HVF vCPUs
- * stay bound to sched_domain_ncpu() worker slots; creating many CLONE_THREAD
- * tasks does not create one vCPU each.
+ * still needs an SP_EL1_SLOT_BYTES stack carved from the shim_data IPA block
+ * above the shim-globals cache; exhausting that pool returns ENOMEM. Physical
+ * HVF vCPUs stay bound to sched_domain_ncpu() worker slots; creating many
+ * CLONE_THREAD tasks does not create one vCPU each.
  *
  * Callers that need a snapshot buffer size should use thread_table_capacity()
  * (or thread_active_count()) rather than a compile-time MAX_THREADS.
@@ -51,8 +54,13 @@
  * occupy is a bound as well as an allocation: the host writes into a live shim
  * frame on that stack, and anything below the lowest slot is the shim-globals
  * cache rather than stack.
+ *
+ * The deepest shim path uses 528 bytes: an outer 256-byte SAVE_GPRS frame,
+ * a 16-byte ELR/SPSR recovery slot, and a nested 256-byte data-abort frame.
+ * A 1KiB slot leaves 496 bytes unused. The globals floor stays page-aligned.
+ * IRQ, FIQ and SError halt without pushing another frame.
  */
-#define SP_EL1_SLOT_BYTES 4096
+#define SP_EL1_SLOT_BYTES 1024
 #define MAX_DEFERRED_STACK_UNMAPS 8
 
 /* Restart witnesses span guest entries and follow the migrating task. */
@@ -117,8 +125,8 @@ typedef struct thread_entry {
     uint64_t sp_el1;          /* Per-thread EL1 stack top (IPA) */
     int sp_el1_slot;          /* Slot index in sp_el1_allocated (-1 = none).
                                * Stored at alloc time so the free path does
-                               * not need to recompute (top - sp) / 4096; the
-                               * shim data block is now at high IPA and only
+                               * not recompute (top - sp) / SP_EL1_SLOT_BYTES;
+                               * the shim data block is at high IPA and only
                                * known via guest_t.
                                */
     uint64_t generation;      /* Slot identity; protected by thread_lock. */

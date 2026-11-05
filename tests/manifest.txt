@@ -105,6 +105,7 @@ test-sigpipe
 test-thread                    # diff=skip
 test-pthread
 test-thread-churn
+test-thread-parked
 test-sched-affinity
 test-threaded-exec
 test-threaded-exec worker
