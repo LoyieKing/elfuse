@@ -524,6 +524,11 @@ Socket syscalls are translated in `src/syscall/net.c` and friends:
   result respects short-buffer copyout. AOSP BlockGuardOs uses it before
   accepting a Unix socket.
 
+Blocking sends try the nonblocking host send before waiting for POLLOUT.
+Darwin's readiness low-water mark can remain false after enough space for
+a small write becomes available. EAGAIN enters the interruptible wait;
+partial stream sends retain their offset and attach SCM_RIGHTS only once.
+
 Netlink sockets are emulated in `src/syscall/netlink.c`: `NETLINK_ROUTE`
 answers the `RTM_GETLINK` / `RTM_GETADDR` dumps `getifaddrs` issues, and
 `NETLINK_KOBJECT_UEVENT` sockets are accepted as silent sockets -- no uevent

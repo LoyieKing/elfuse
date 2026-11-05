@@ -185,18 +185,16 @@ int64_t net_send_xfer(const fd_block_state_t *st,
     int spins = 0;
     unsigned backoff = 0;
     for (;;) {
-        if (blocking) {
+        ssize_t ret = sendmsg(host_fd, msg, host_flags);
+        if (ret < 0) {
+            if (!blocking || errno != EAGAIN)
+                break;
             int64_t waited =
                 net_wait_progress(st, host_fd, POLLOUT, linux_flags, total);
             if (waited == SYSCALL_PARKED)
                 return waited;
             if (waited < 0)
                 return total > 0 ? (int64_t) total : waited;
-        }
-        ssize_t ret = sendmsg(host_fd, msg, host_flags);
-        if (ret < 0) {
-            if (!blocking || errno != EAGAIN)
-                break;
 
             /* The wait reports ready on POLLHUP and POLLERR too, so a send that
              * keeps answering EAGAIN would spin a core; back off as io_xfer

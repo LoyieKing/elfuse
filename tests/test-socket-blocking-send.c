@@ -188,6 +188,47 @@ static void on_alarm(int sig)
     handler_ran = 1;
 }
 
+static void check_small_send_progress(void)
+{
+    int sv[2];
+    TEST("small send uses newly freed socket space");
+    if (make_pair(sv) != 0) {
+        FAIL("socketpair failed");
+        return;
+    }
+    unsigned char packet[256];
+    memset(packet, 0x6d, sizeof(packet));
+    ssize_t sent;
+    do {
+        sent = send(sv[0], packet, sizeof(packet), MSG_DONTWAIT);
+    } while (sent > 0);
+    int full_err = errno;
+    ssize_t drained = recv(sv[1], packet, sizeof(packet), 0);
+    if (sent != -1 || full_err != EAGAIN || drained != sizeof(packet)) {
+        FAIL("could not fill and partially drain socket");
+        close(sv[0]);
+        close(sv[1]);
+        return;
+    }
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_alarm;
+    sigaction(SIGALRM, &sa, NULL);
+    struct itimerval timer;
+    memset(&timer, 0, sizeof(timer));
+    timer.it_value.tv_sec = 1;
+    handler_ran = 0;
+    setitimer(ITIMER_REAL, &timer, NULL);
+    sent = send(sv[0], packet, 1, 0);
+    memset(&timer, 0, sizeof(timer));
+    setitimer(ITIMER_REAL, &timer, NULL);
+    EXPECT_TRUE(sent == 1 && !handler_ran,
+                "one byte must fit without waiting for another peer read");
+    close(sv[0]);
+    close(sv[1]);
+    handler_ran = 0;
+}
+
 int main(void)
 {
     buf = malloc(BIG);
@@ -204,6 +245,7 @@ int main(void)
     check_full_send("sendmsg 1 iov completes", VIA_SENDMSG1);
     check_full_send("sendmsg 3 iovs completes", VIA_SENDMSG3);
     check_full_send("sendmsg SCM_RIGHTS completes", VIA_SCM);
+    check_small_send_progress();
 
     int sv[2];
     if (make_pair(sv) != 0) {
