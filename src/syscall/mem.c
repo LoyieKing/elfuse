@@ -1047,60 +1047,382 @@ int guest_memory_mapped_resident_pages(const guest_t *g,
 }
 
 
-int guest_memory_snapshot_entry(const guest_t *g, uint32_t *entry_out)
+/* Host-page span of one live piece of the primary slab. gpa is the offset from
+ * host_base; the Mach copy packs these back to back.
+ */
+typedef struct {
+    uint64_t gpa;
+    uint64_t len;
+    bool shared;
+} slab_span_t;
+
+static bool slab_span_push(slab_span_t **spans,
+                           uint32_t *n,
+                           uint32_t *cap,
+                           uint64_t gpa,
+                           uint64_t len,
+                           uint64_t guest_size)
+{
+    if (len == 0 || gpa >= guest_size || len > guest_size - gpa)
+        return false;
+    if (*n == *cap) {
+        uint32_t next = *cap ? *cap * 2 : 16;
+        slab_span_t *grown = realloc(*spans, (size_t) next * sizeof(*grown));
+        if (!grown)
+            return false;
+        *spans = grown;
+        *cap = next;
+    }
+    (*spans)[(*n)++] = (slab_span_t) {.gpa = gpa, .len = len};
+    return true;
+}
+
+/* Pages that hold bytes: resident, or compressed or swapped
+ * (VM_PAGE_QUERY_PAGE_PRESENT or VM_PAGE_QUERY_PAGE_PAGED_OUT). mincore's
+ * resident bit drops the second class, and a compressed anonymous page still
+ * returns its data. A page with neither bit was never faulted and reads as
+ * zero, so the child keeps that zero. A query failure copies the page.
+ */
+static bool slab_page_has_data(const void *host)
+{
+    integer_t disp = 0, refs = 0;
+    kern_return_t kr = mach_vm_page_query(
+        mach_task_self(), (mach_vm_address_t) (uintptr_t) host, &disp, &refs);
+    if (kr != KERN_SUCCESS)
+        return true;
+    return (disp &
+            (VM_PAGE_QUERY_PAGE_PRESENT | VM_PAGE_QUERY_PAGE_PAGED_OUT)) != 0;
+}
+
+static bool slab_note_run(slab_span_t **spans,
+                          uint32_t *n,
+                          uint32_t *cap,
+                          const guest_t *g,
+                          uint64_t gpa,
+                          uint64_t len)
+{
+    size_t hps = host_page_size_cached();
+    if (len == 0)
+        return true;
+    if (gpa % hps || len % hps)
+        return false;
+    uint8_t *host = (uint8_t *) g->host_base + gpa;
+    uint64_t run = UINT64_MAX;
+    for (uint64_t off = 0; off < len; off += hps) {
+        if (slab_page_has_data(host + off)) {
+            if (run == UINT64_MAX)
+                run = off;
+            continue;
+        }
+        if (run != UINT64_MAX) {
+            if (!slab_span_push(spans, n, cap, gpa + run, off - run,
+                                g->guest_size))
+                return false;
+            run = UINT64_MAX;
+        }
+    }
+    if (run != UINT64_MAX &&
+        !slab_span_push(spans, n, cap, gpa + run, len - run, g->guest_size))
+        return false;
+    return true;
+}
+
+static bool slab_collect_live_spans(const guest_t *g,
+                                    slab_span_t **spans,
+                                    uint32_t *n,
+                                    uint32_t *cap)
+{
+    size_t hps = host_page_size_cached();
+    for (int i = 0; i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (r->gpa_base >= g->guest_size)
+            continue;
+        uint64_t len = r->end - r->start;
+        if (len > g->guest_size - r->gpa_base)
+            return false;
+        uint64_t gpa = ALIGN_DOWN(r->gpa_base, hps);
+        uint64_t end = ALIGN_UP(r->gpa_base + len, hps);
+        if (end > g->guest_size)
+            end = g->guest_size;
+
+        /* An overlay or a private file object is not the reservation. Copy the
+         * whole host-page span; residency would drop a clean file page the
+         * child still has to fault from that object.
+         */
+        if (r->overlay_active || r->backing_fd >= 0) {
+            if (!slab_span_push(spans, n, cap, gpa, end - gpa, g->guest_size))
+                return false;
+        } else if (!slab_note_run(spans, n, cap, g, gpa, end - gpa)) {
+            return false;
+        }
+    }
+    if (g->pt_pool_next > g->pt_pool_base) {
+        uint64_t gpa = ALIGN_DOWN(g->pt_pool_base, hps);
+        uint64_t end = ALIGN_UP(g->pt_pool_next, hps);
+        if (end > gpa && !slab_note_run(spans, n, cap, g, gpa, end - gpa))
+            return false;
+    }
+    if (g->shim_data_base > g->shim_base) {
+        uint64_t gpa = ALIGN_DOWN(g->shim_base, hps);
+        uint64_t end = ALIGN_UP(g->shim_data_base + BLOCK_2MIB, hps);
+        if (!slab_note_run(spans, n, cap, g, gpa, end - gpa))
+            return false;
+    }
+    if (g->kbuf_gpa && !slab_note_run(spans, n, cap, g, g->kbuf_gpa, KBUF_SIZE))
+        return false;
+    return true;
+}
+
+static int slab_span_cmp(const void *a, const void *b)
+{
+    const slab_span_t *sa = a;
+    const slab_span_t *sb = b;
+    if (sa->gpa < sb->gpa)
+        return -1;
+    if (sa->gpa > sb->gpa)
+        return 1;
+    return 0;
+}
+
+static bool slab_spans_merge(slab_span_t *spans, uint32_t *n)
+{
+    if (*n < 2)
+        return true;
+    qsort(spans, *n, sizeof(*spans), slab_span_cmp);
+    uint32_t w = 0;
+    for (uint32_t i = 0; i < *n; i++) {
+        if (w > 0 && spans[i].gpa <= spans[w - 1].gpa + spans[w - 1].len) {
+            uint64_t end = spans[i].gpa + spans[i].len;
+            uint64_t prev_end = spans[w - 1].gpa + spans[w - 1].len;
+            if (end > prev_end)
+                spans[w - 1].len = end - spans[w - 1].gpa;
+            continue;
+        }
+        spans[w++] = spans[i];
+    }
+    *n = w;
+    return true;
+}
+
+int guest_memory_snapshot_entry(const guest_t *g,
+                                bool share_vm,
+                                uint32_t *entry_out,
+                                guest_snapshot_span_t *spans_out,
+                                uint32_t *nspans_out)
 {
     assert(mmap_lock_held());
 
-    /* One copy-on-write entry over the whole primary slab: anonymous pages,
-     * private-file CoW bytes, page tables, shim state and Rosetta/kbuf memory
-     * all live inside it. On anonymous memory the copy is lazy, so the cost
-     * here is the VM map walk; whichever side writes a shared page first pays
-     * for that page. MAP_SHARED file overlays are frozen too, and the child
-     * reattaches them from their backing fds. DONTFORK ranges and pages past a
-     * private file's EOF ride along as bytes, and the child invalidates their
-     * PTEs before running guest code (fork_ipc_recv_process_state).
+    /* Shared vfork includes unfaulted storage; ordinary fork packs only pages
+     * holding bytes. Infrastructure always has private backing.
      */
-    memory_object_size_t size = g->guest_size;
+    slab_span_t *raw = NULL;
+    uint32_t nraw = 0;
+    uint32_t cap = 0;
+    if (share_vm) {
+        uint64_t lo, hi;
+        guest_infra_window(g, &lo, &hi);
+        if (lo % host_page_size_cached() || hi % host_page_size_cached() ||
+            !slab_span_push(&raw, &nraw, &cap, 0, lo, g->guest_size) ||
+            !slab_span_push(&raw, &nraw, &cap, lo, hi - lo, g->guest_size) ||
+            !slab_span_push(&raw, &nraw, &cap, hi, g->guest_size - hi,
+                            g->guest_size)) {
+            free(raw);
+            return -LINUX_ENOMEM;
+        }
+        raw[0].shared = true;
+        raw[2].shared = true;
+    } else if (!slab_collect_live_spans(g, &raw, &nraw, &cap) ||
+               !slab_spans_merge(raw, &nraw)) {
+        free(raw);
+        return -LINUX_ENOMEM;
+    }
+    if (nraw > GUEST_SNAPSHOT_MAX_SPANS) {
+        log_error("fork: slab snapshot has %u spans (max %u)", nraw,
+                  GUEST_SNAPSHOT_MAX_SPANS);
+        free(raw);
+        return -LINUX_ENOMEM;
+    }
+
+    /* Each run is contiguous in the packing alias. Private runs shadow the
+     * source; shared runs keep its backing object.
+     */
+    mach_vm_address_t packed = 0;
+    uint64_t packed_size = 0;
+    for (uint32_t i = 0; i < nraw; i++)
+        packed_size += raw[i].len;
+    if (nraw > 0) {
+        kern_return_t kr = mach_vm_allocate(mach_task_self(), &packed,
+                                            packed_size, VM_FLAGS_ANYWHERE);
+        if (kr != KERN_SUCCESS) {
+            free(raw);
+            return -LINUX_ENOMEM;
+        }
+        mach_vm_address_t cursor = packed;
+        for (uint32_t i = 0; i < nraw; i++) {
+            vm_prot_t cur = VM_PROT_NONE, max = VM_PROT_NONE;
+            kr = mach_vm_remap(
+                mach_task_self(), &cursor, raw[i].len, 0,
+                VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
+                (mach_vm_address_t) g->host_base + raw[i].gpa,
+                raw[i].shared ? FALSE : TRUE, &cur, &max, VM_INHERIT_NONE);
+            if (kr != KERN_SUCCESS) {
+                mach_vm_deallocate(mach_task_self(), packed, packed_size);
+                log_error("fork: packing slab span 0x%llx failed: %s",
+                          (unsigned long long) raw[i].gpa,
+                          mach_error_string(kr));
+                free(raw);
+                return -LINUX_ENOMEM;
+            }
+            cursor += raw[i].len;
+        }
+    }
+
+    memory_object_size_t size =
+        packed_size ? packed_size : host_page_size_cached();
+    mach_vm_address_t entry_base = packed;
+    bool entry_placeholder = nraw == 0;
+    if (entry_placeholder) {
+        kern_return_t kr = mach_vm_allocate(mach_task_self(), &entry_base, size,
+                                            VM_FLAGS_ANYWHERE);
+        if (kr != KERN_SUCCESS) {
+            free(raw);
+            return -LINUX_ENOMEM;
+        }
+    }
     mach_port_t entry = MACH_PORT_NULL;
     kern_return_t kr = mach_make_memory_entry_64(
-        mach_task_self(), &size, (memory_object_offset_t) g->host_base,
-        VM_PROT_READ | VM_PROT_WRITE | MAP_MEM_VM_COPY, &entry,
-        MEMORY_OBJECT_NULL);
-    if (kr != KERN_SUCCESS) {
-        log_error("fork: slab snapshot entry failed: %s",
+        mach_task_self(), &size, (memory_object_offset_t) entry_base,
+        VM_PROT_READ | VM_PROT_WRITE |
+            (share_vm ? MAP_MEM_VM_SHARE : MAP_MEM_VM_COPY),
+        &entry, MEMORY_OBJECT_NULL);
+    if (entry_placeholder)
+        mach_vm_deallocate(mach_task_self(), entry_base, size);
+    else if (packed)
+        mach_vm_deallocate(mach_task_self(), packed, packed_size);
+    if (kr != KERN_SUCCESS ||
+        size != (entry_placeholder ? host_page_size_cached() : packed_size)) {
+        if (entry != MACH_PORT_NULL)
+            mach_port_deallocate(mach_task_self(), entry);
+        free(raw);
+        log_error("fork: packed slab snapshot failed: %s",
                   mach_error_string(kr));
         return -LINUX_ENOMEM;
     }
-    if (size != g->guest_size) {
-        log_error("fork: slab snapshot entry covers 0x%llx of 0x%llx",
-                  (unsigned long long) size,
-                  (unsigned long long) g->guest_size);
-        mach_port_deallocate(mach_task_self(), entry);
-        return -LINUX_ENOMEM;
+
+    uint64_t off = 0;
+    for (uint32_t i = 0; i < nraw; i++) {
+        spans_out[i].gpa = raw[i].gpa;
+        spans_out[i].len = raw[i].len;
+        spans_out[i].packed_off = off;
+        spans_out[i].shared = raw[i].shared;
+        off += raw[i].len;
     }
+    free(raw);
+    *nspans_out = nraw;
     *entry_out = entry;
     return 0;
 }
 
-void *guest_memory_map_snapshot(uint32_t entry, uint64_t size)
+void *guest_memory_map_snapshot(uint32_t entry,
+                                uint64_t size,
+                                const guest_snapshot_span_t *spans,
+                                uint32_t nspans)
 {
-    /* Mapping the entry without copy gives this process private pages: a write
-     * here breaks the share for that page only, and neither side sees the
-     * other's later stores. Nothing is inherited further; a nested fork takes
-     * its own entry from this range.
+    /* Private spans take another CoW mapping. Shared spans retain the live
+     * parent objects, including pages that have not been faulted yet.
      */
-    mach_vm_address_t addr = 0;
+    uint64_t packed = 0;
+    for (uint32_t i = 0; i < nspans; i++) {
+        if (spans[i].packed_off != packed || spans[i].len == 0 ||
+            spans[i].gpa >= size || spans[i].len > size - spans[i].gpa ||
+            spans[i].len > UINT64_MAX - packed || spans[i].shared > 1 ||
+            spans[i].gpa % host_page_size_cached() ||
+            spans[i].len % host_page_size_cached()) {
+            mach_port_deallocate(mach_task_self(), entry);
+            return NULL;
+        }
+        packed += spans[i].len;
+    }
+    mach_vm_address_t src = 0;
+    mach_vm_size_t src_size = packed ? packed : host_page_size_cached();
     kern_return_t kr =
-        mach_vm_map(mach_task_self(), &addr, size, 0, VM_FLAGS_ANYWHERE, entry,
-                    0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
+        mach_vm_map(mach_task_self(), &src, src_size, 0, VM_FLAGS_ANYWHERE,
+                    entry, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
                     VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
     mach_port_deallocate(mach_task_self(), entry);
     if (kr != KERN_SUCCESS) {
-        log_error("fork-child: mapping the slab snapshot failed: %s",
+        log_error("fork-child: mapping the packed snapshot failed: %s",
                   mach_error_string(kr));
         return NULL;
     }
-    return (void *) (uintptr_t) addr;
+
+    mach_vm_address_t slab = 0;
+    kr = mach_vm_allocate(mach_task_self(), &slab, size, VM_FLAGS_ANYWHERE);
+    if (kr != KERN_SUCCESS) {
+        mach_vm_deallocate(mach_task_self(), src, src_size);
+        return NULL;
+    }
+    for (uint32_t i = 0; i < nspans; i++) {
+        mach_vm_address_t dest = slab + spans[i].gpa;
+        vm_prot_t cur = VM_PROT_NONE, max = VM_PROT_NONE;
+        kr = mach_vm_remap(mach_task_self(), &dest, spans[i].len, 0,
+                           VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                           mach_task_self(), src + spans[i].packed_off,
+                           spans[i].shared ? FALSE : TRUE, &cur, &max,
+                           VM_INHERIT_NONE);
+        if (kr != KERN_SUCCESS) {
+            log_error("fork-child: placing snapshot span 0x%llx failed: %s",
+                      (unsigned long long) spans[i].gpa, mach_error_string(kr));
+            mach_vm_deallocate(mach_task_self(), src, src_size);
+            mach_vm_deallocate(mach_task_self(), slab, size);
+            return NULL;
+        }
+    }
+    mach_vm_deallocate(mach_task_self(), src, src_size);
+    return (void *) (uintptr_t) slab;
+}
+
+int guest_memory_detach_vfork(guest_t *g)
+{
+    if (!g->vfork_shared_vm)
+        return 0;
+    assert(mmap_lock_held());
+    mach_vm_address_t detached = 0;
+    vm_prot_t cur = VM_PROT_NONE, max = VM_PROT_NONE;
+    kern_return_t kr = mach_vm_remap(mach_task_self(), &detached, g->guest_size,
+                                     0, VM_FLAGS_ANYWHERE, mach_task_self(),
+                                     (mach_vm_address_t) g->host_base, TRUE,
+                                     &cur, &max, VM_INHERIT_NONE);
+    if (kr != KERN_SUCCESS)
+        return -LINUX_ENOMEM;
+    vcpu_pool_memory_pause();
+    if (hv_vm_unmap(g->ipa_base, g->guest_size) != HV_SUCCESS) {
+        mach_vm_deallocate(mach_task_self(), detached, g->guest_size);
+        vcpu_pool_memory_resume();
+        return -LINUX_EIO;
+    }
+    if (hv_vm_map((void *) (uintptr_t) detached, g->ipa_base, g->guest_size,
+                  HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC) !=
+        HV_SUCCESS) {
+        if (hv_vm_map(g->host_base, g->ipa_base, g->guest_size,
+                      HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC) !=
+            HV_SUCCESS) {
+            log_fatal("vfork: restoring stage-2 backing failed");
+            exit(128);
+        }
+        mach_vm_deallocate(mach_task_self(), detached, g->guest_size);
+        vcpu_pool_memory_resume();
+        return -LINUX_EIO;
+    }
+    void *old = g->host_base;
+    g->host_base = (void *) (uintptr_t) detached;
+    if (g->kbuf_gpa)
+        g->kbuf_base = (uint8_t *) g->host_base + g->kbuf_gpa;
+    g->vfork_shared_vm = false;
+    guest_pt_gen_bump(g);
+    munmap(old, g->guest_size);
+    vcpu_pool_memory_resume();
+    return 0;
 }
 
 static int guest_memory_reset_range_quiesced(guest_t *g,

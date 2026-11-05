@@ -870,22 +870,40 @@ reaper is currently provided.
 
 ### CoW Fork Path
 
-The primary slab is anonymous private memory. Fork takes one Mach
-copy-on-write memory entry over the whole slab
-(`mach_make_memory_entry_64` with `MAP_MEM_VM_COPY`) while sibling tasks are
-quiesced and `mmap_lock` is held, so the entry matches the header and region
-table sent over IPC. Page tables, shim state, private-file CoW bytes and
-Rosetta/kbuf memory all live in the slab and ride along. On anonymous memory
-the copy is lazy: taking the entry walks the VM map, and whichever side next
-writes a shared page pays for that page.
+The primary slab is anonymous private memory. While sibling tasks are
+quiesced and `mmap_lock` is held, fork collects host-page-aligned runs with
+present or paged-out data. Never-faulted anonymous pages remain zero in the
+child. File-backed and overlay spans are included whole. Page tables, shim
+state and Rosetta/kbuf memory are included in the collected runs.
 
-The entry reaches the helper in its first registered port slot
-(`posix_spawnattr_set_registered_ports_np`), which is why the helper is
-spawned after the snapshot. The child reads it with `mach_ports_lookup`,
-clears its own slots, and maps the entry privately (`mach_vm_map` without
-copy) before creating its HVF VM. Nested fork takes a fresh entry from the
-child's mapping. There is no fallback copy path: a failed entry fails the fork
-with `ENOMEM`.
+`mach_vm_remap` packs those runs into a contiguous private object. Fork takes
+one `MAP_MEM_VM_COPY` memory entry over that object and sends the destination
+offsets and lengths over IPC. Page copying remains lazy; collection and
+snapshot creation still depend on the populated memory and mapping layout.
+
+The helper receives the entry in its first registered port slot
+(`posix_spawnattr_set_registered_ports_np`) and clears the slot after
+`mach_ports_lookup`. It reserves a fresh zero slab and privately maps each
+packed run at its original offset before creating its HVF VM. Nested fork
+collects a fresh snapshot from the child's mappings. Snapshot failure returns
+`ENOMEM`; there is no eager-copy fallback.
+
+`CLONE_VM|CLONE_VFORK` exports live EL0 backing with `MAP_MEM_VM_SHARE`,
+including unfaulted pages and Rosetta kbuf. The full infrastructure reserve
+has a private CoW span. Ordinary `CLONE_VFORK` without `CLONE_VM` retains
+the private fork snapshot. Shared vfork preserves overlay objects and does
+not apply DONTFORK or WIPEONFORK.
+
+Sibling stores are visible before child exit; no page publication or parent
+copyback occurs. Successful exec clones the child slab privately and refreshes
+its HVF stage-2 mapping before notifying the parent or resetting memory.
+Failed exec keeps live backing. Exit, including signal death, retains stores
+already made through that backing.
+
+This helper path supports posix_spawn-shaped callers. It does not synchronize
+independent mapping changes, page-table mutations or futex queues across host
+processes. Full shared-mm clone semantics require a separate implementation.
+
 
 `MAP_SHARED` file overlays are frozen inside the entry like everything else;
 the child reinstalls them from the backing fds that follow over `SCM_RIGHTS`.

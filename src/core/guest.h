@@ -435,6 +435,7 @@ typedef struct {
     uint64_t guest_size; /* Total size (determined by IPA capacity) */
     uint64_t ipa_base;   /* IPA base for hv_vm_map (GUEST_IPA_BASE) */
     guest_memory_mode_t memory_mode; /* Policy for retiring ranges to zero */
+    bool vfork_shared_vm; /* Live parent backing until successful exec. */
 
     uint64_t mmap_limit; /* Max mmap address (computed from guest_size) */
 
@@ -850,10 +851,11 @@ int guest_init(guest_t *g,
                uint32_t ipa_bits,
                guest_memory_mode_t memory_mode);
 
-/* Initialize a fork child's guest around host_base, the parent's slab mapped
- * privately from its copy-on-write entry (guest_memory_map_snapshot). Creates
- * the HVF VM at ipa_bits and maps the slab. Takes ownership of the mapping on
- * every path.
+/* Initialize a fork child's guest around host_base. The caller has already
+ * built that mapping: a zero reservation of the parent's slab size, with each
+ * packed copy-on-write span deposited at its original offset
+ * (guest_memory_map_snapshot). Creates the HVF VM at ipa_bits and maps the
+ * slab. Takes ownership of the mapping on every path.
  *
  * Returns 0 on success, -1 on failure.
  */

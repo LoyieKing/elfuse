@@ -31,9 +31,9 @@ time is not copied as child CPU time.
 The current HVF backend has one VM per host process. src/runtime/forkipc.c
 implements fork using posix_spawn and IPC: another elfuse process creates a
 VM, restores the child registers and resources, and maps a memory snapshot.
-A Mach copy-on-write entry over the slab hands the child an independent
-snapshot of current guest backing. Linux shared mappings require their own
-shared backing and child reattachment.
+Present and paged-out runs are packed into one Mach copy-on-write entry;
+the child maps those runs onto a fresh zero slab. File and overlay spans are
+included whole. Linux shared mappings require child reattachment.
 
 elfuse keeps this execution mechanism and gives the child an independent
 local scheduler. Attribute inheritance remains required, but parent and
@@ -116,11 +116,15 @@ another task's identity.
 ## TODO: vfork without a slab snapshot
 
 `CLONE_VM|CLONE_VFORK` (bionic `vfork`, `posix_spawn`, Java
-`ProcessBuilder`) still takes the full fork path: quiesce, copy-on-write slab
-entry, helper spawn, state IPC. The entry costs about 50 ms per resident GiB,
-and both sides then pay copy-on-write faults, so an Android app process with
-several GiB resident stops all threads for 250-480 ms per `getprop` or `sh -c`.
-The child only runs a few syscalls before `execve`.
+`ProcessBuilder`) shares live EL0 Mach backing with a helper process.
+Infrastructure remains a private CoW span. Successful exec detaches child
+backing before parent notification; failed exec and exit preserve shared
+stores. Siblings remain runnable. There is no dirty-page copyback.
+
+The supported launch path excludes independent mapping mutations and
+cross-process futex synchronization. Live memory sharing alone does not
+provide full shared-mm semantics. Helper spawn, state IPC and backing-object
+export remain; resident-size-independent parent stop time is unverified.
 
 Planned replacement:
 

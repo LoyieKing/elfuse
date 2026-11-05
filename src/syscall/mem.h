@@ -56,23 +56,45 @@ int guest_memory_mapped_resident_pages(const guest_t *g,
                                        uint64_t *vsize_out,
                                        uint64_t *pages_out);
 
-/* Take a copy-on-write Mach memory entry over the whole primary slab for a fork
- * child: page tables, shim state and Rosetta/kbuf memory included. Lazy on the
- * anonymous slab, so a page is copied only when either side next writes it.
- * Caller holds mmap_lock and has quiesced siblings, and owns the send right
- * stored in *entry_out (a mach_port_t; spelled uint32_t so this header stays
- * free of the Mach headers, whose PAGE_SIZE collides with the guest one).
+/* One live piece of the primary slab inside a packed fork snapshot. gpa is the
+ * offset from the parent's host_base; packed_off is where that piece sits in
+ * the single Mach copy entry.
+ */
+#define GUEST_SNAPSHOT_MAX_SPANS 4096u
+typedef struct {
+    uint64_t gpa;
+    uint64_t len;
+    uint64_t packed_off;
+    uint32_t shared;
+} guest_snapshot_span_t;
+
+/* Pack private fork bytes, or share live EL0 storage for CLONE_VM|CLONE_VFORK.
+ * Infrastructure remains private. Caller holds mmap_lock and has quiesced
+ * siblings. Owns the send right in *entry_out. spans_out holds *nspans_out
+ * records, at most GUEST_SNAPSHOT_MAX_SPANS.
  *
  * Returns 0 or a negative Linux errno.
  */
-int guest_memory_snapshot_entry(const guest_t *g, uint32_t *entry_out);
+int guest_memory_snapshot_entry(const guest_t *g,
+                                bool share_vm,
+                                uint32_t *entry_out,
+                                guest_snapshot_span_t *spans_out,
+                                uint32_t *nspans_out);
 
-/* Map a fork child's copy of the parent's slab from the entry that
- * guest_memory_snapshot_entry produced. Consumes the send right.
+/* Build the fork child's slab: a zero reservation of @size, with each span of
+ * the packed entry remapped at its gpa. Consumes the send right.
  *
- * Returns the private mapping, or NULL on failure.
+ * Returns the mapping, or NULL on failure.
  */
-void *guest_memory_map_snapshot(uint32_t entry, uint64_t size);
+void *guest_memory_map_snapshot(uint32_t entry,
+                                uint64_t size,
+                                const guest_snapshot_span_t *spans,
+                                uint32_t nspans);
+
+/* Successful vfork exec takes private backing before notifying the parent.
+ * Caller holds mmap_lock and has stopped all child siblings.
+ */
+int guest_memory_detach_vfork(guest_t *g);
 
 /* Remove private file EOF translations after fork restore or mprotect regrant.
  * Caller holds mmap_lock.

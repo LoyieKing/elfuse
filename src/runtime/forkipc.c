@@ -92,6 +92,14 @@ void fork_notify_vfork_exec(void)
 {
     if (fork_child_vfork_notify_fd < 0)
         return;
+    guest_t *g = vcpu_pool_guest();
+    if (g && g->vfork_shared_vm) {
+        int err = guest_memory_detach_vfork(g);
+        if (err < 0) {
+            log_fatal("execve: vfork backing detach failed: %d", err);
+            exit(128);
+        }
+    }
 
     char byte = 'X';
     ssize_t n;
@@ -101,6 +109,7 @@ void fork_notify_vfork_exec(void)
     close(fork_child_vfork_notify_fd);
     fork_child_vfork_notify_fd = -1;
 }
+
 
 /* Over the function-size limit on purpose.
  *
@@ -199,9 +208,10 @@ int fork_child_main(int ipc_fd,
     }
 
     /* Create guest memory before receiving state so all incoming offsets can be
-     * bounds-checked against the negotiated guest size. The parent's slab
-     * arrives as a copy-on-write memory entry in the first registered port
-     * slot (sys_clone attaches it before posix_spawn).
+     * bounds-checked against the negotiated guest size. The parent's live slab
+     * objects arrive as one packed copy-on-write entry in the first registered
+     * port slot, and the span table that places them follows the header on this
+     * socket.
      */
     guest_t g;
     mach_port_array_t ports = NULL;
@@ -224,7 +234,30 @@ int fork_child_main(int ipc_fd,
      */
     (void) mach_ports_register(mach_task_self(), NULL, 0);
 
-    void *slab = guest_memory_map_snapshot(slab_entry, hdr.guest_size);
+    uint32_t nspans = 0;
+    if (fork_ipc_read_all(ipc_fd, &nspans, sizeof(nspans)) < 0 ||
+        nspans > GUEST_SNAPSHOT_MAX_SPANS) {
+        log_error("fork-child: bad snapshot span count %u", nspans);
+        mach_port_deallocate(mach_task_self(), slab_entry);
+        close(ipc_fd);
+        return 1;
+    }
+    guest_snapshot_span_t *spans = NULL;
+    if (nspans > 0) {
+        spans = calloc(nspans, sizeof(*spans));
+        if (!spans ||
+            fork_ipc_read_all(ipc_fd, spans, nspans * sizeof(*spans)) < 0) {
+            log_error("fork-child: failed to read snapshot spans");
+            free(spans);
+            mach_port_deallocate(mach_task_self(), slab_entry);
+            close(ipc_fd);
+            return 1;
+        }
+    }
+
+    void *slab =
+        guest_memory_map_snapshot(slab_entry, hdr.guest_size, spans, nspans);
+    free(spans);
     if (!slab ||
         guest_init_from_snapshot(&g, slab, hdr.guest_size, hdr.ipa_bits,
                                  (guest_memory_mode_t) hdr.memory_mode) < 0) {
@@ -232,6 +265,7 @@ int fork_child_main(int ipc_fd,
         close(ipc_fd);
         return 1;
     }
+    g.vfork_shared_vm = (hdr.flags & IPC_HDR_VFORK_VM) != 0;
 
     /* Restore allocator/page-table cursors before mmap/brk can run in child.
      * Validate pt_pool_next and ttbr0 against the child's own page-table pool,
@@ -376,9 +410,6 @@ int fork_child_main(int ipc_fd,
      */
     memset(&sig.shared, 0, sizeof(sig.shared));
 
-    /* execve in the child needs the shim bytes after guest_reset clears memory.
-     * Close IPC socket
-     */
     close(ipc_fd);
 
     /* Threads do not survive fork: restart the SIGUSR2/SIGALRM sigwait consumer
@@ -478,9 +509,8 @@ int fork_child_main(int ipc_fd,
      * caches its own TID; without the SETTID write the child keeps the parent's
      * cached TID and modern glibc trips stack-canary / TLS checks ("stack
      * smashing detected"). The write goes through the child's private copy of
-     * guest memory. A faulting ctid_gva is the guest's own bad
-     * pointer: warn and continue, matching how the kernel ignores a
-     * child_tidptr fault.
+     * guest memory. A faulting ctid_gva is the guest's own bad pointer: warn
+     * and continue, matching how the kernel ignores a child_tidptr fault.
      *
      * CLONE_CHILD_CLEARTID is deliberately not honored here. The clear-and-wake
      * on exit only matters to an in-process joiner waiting on the futex (that
@@ -498,9 +528,9 @@ int fork_child_main(int ipc_fd,
     }
 
     /* Re-publish identity into the child's shim-globals cache: the slab copy
-     * inherits the parent's pid/uid values, and the shim's identity fast
-     * path would otherwise return the parent's pid to the child. Identity is
-     * now committed via the same path the bootstrap uses.
+     * inherits the parent's pid/uid values, and the shim's identity fast path
+     * would otherwise return the parent's pid to the child. Identity is now
+     * committed via the same path the bootstrap uses.
      */
     shim_globals_init(&g);
     shim_globals_publish_stats_gate(&g);
@@ -1008,12 +1038,12 @@ int64_t sys_clone(hv_vcpu_t vcpu,
                                 verbose);
     }
 
-    /* Rosetta uses the same independent snapshot, including TTBR1 and kbuf. */
 
     /* elfuse only supports fork-like clone (SIGCHLD) and posix_spawn-like
      * clone (CLONE_VM|CLONE_VFORK|SIGCHLD)
      */
     bool is_vfork = (flags & LINUX_CLONE_VFORK) != 0;
+    bool share_vm = is_vfork && (flags & LINUX_CLONE_VM);
 
     /* CLONE_VM without CLONE_THREAD usually creates an in-process VM-clone
      * child that shares guest memory and is waitable via wait4/ptrace. However
@@ -1177,6 +1207,8 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     mmap_fork_anon_shared_txn_t *anon_shared_txn = NULL;
     guest_region_t *regions_snapshot = NULL;
     mach_port_t slab_entry = MACH_PORT_NULL;
+    guest_snapshot_span_t *snapshot_spans = NULL;
+    uint32_t snapshot_nspans = 0;
     bool mmap_locked = false;
     bool siblings_quiesced = false;
     int64_t fail_rc = -LINUX_ENOMEM;
@@ -1215,15 +1247,19 @@ int64_t sys_clone(hv_vcpu_t vcpu,
      */
     mmap_lock_acquire();
     mmap_locked = true;
-    if (mmap_fork_prepare_anon_shared_locked(g, &anon_shared_txn) < 0)
+    if (!share_vm &&
+        mmap_fork_prepare_anon_shared_locked(g, &anon_shared_txn) < 0)
         goto fail_snapshot;
 
-    /* Copy-on-write view of the whole slab, taken while every sibling is
-     * quiesced and the region table is locked, so it matches the header and
-     * region table sent below. It reaches the child in the first registered
+    /* Pack the live slab objects while every sibling is quiesced and the region
+     * table is locked, so the span table matches the header and region table
+     * sent below. The packed entry reaches the child in the first registered
      * port slot, which is why the helper is spawned only now.
      */
-    if (guest_memory_snapshot_entry(g, &slab_entry) < 0)
+    snapshot_spans = calloc(GUEST_SNAPSHOT_MAX_SPANS, sizeof(*snapshot_spans));
+    if (!snapshot_spans ||
+        guest_memory_snapshot_entry(g, share_vm, &slab_entry, snapshot_spans,
+                                    &snapshot_nspans) < 0)
         goto fail_snapshot;
     if (posix_spawnattr_set_registered_ports_np(&spawn_attr, &slab_entry, 1) !=
         0) {
@@ -1255,8 +1291,8 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         goto fail_snapshot;
     }
 
-    /* The child holds its own send right now; this one only kept the
-     * snapshot alive until the spawn committed.
+    /* The child holds its own send right now; this one only kept the snapshot
+     * alive until the spawn committed.
      */
     mach_port_deallocate(mach_task_self(), slab_entry);
     slab_entry = MACH_PORT_NULL;
@@ -1299,7 +1335,8 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         .gid = proc_get_gid(),
         .egid = proc_get_egid(),
         .sgid = proc_get_sgid(),
-        .flags = soft_newpid ? IPC_HDR_SOFT_NEWPID : 0,
+        .flags = (soft_newpid ? IPC_HDR_SOFT_NEWPID : 0) |
+                 (share_vm ? IPC_HDR_VFORK_VM : 0),
         .absock_namespace_id = absock_get_namespace_id(),
         .sid = proc_get_sid(),
         .pgid = child_pgid,
@@ -1338,6 +1375,16 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         log_error("clone: failed to send header");
         goto fail_snapshot;
     }
+    if (fork_ipc_write_all(ipc_sock, &snapshot_nspans,
+                           sizeof(snapshot_nspans)) < 0 ||
+        (snapshot_nspans > 0 &&
+         fork_ipc_write_all(ipc_sock, snapshot_spans,
+                            snapshot_nspans * sizeof(*snapshot_spans)) < 0)) {
+        log_error("clone: failed to send snapshot spans");
+        goto fail_snapshot;
+    }
+    free(snapshot_spans);
+    snapshot_spans = NULL;
 
     /* Registers: capture current vCPU state */
     ipc_registers_t regs = {0};
@@ -1364,6 +1411,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         log_error("clone: failed to send registers");
         goto fail_snapshot;
     }
+
     /* Snapshot the semantic region array before resuming siblings. Siblings may
      * mmap/munmap/mprotect after resume, so the code needs a stable copy for
      * the IPC send. Heap-allocated because GUEST_MAX_REGIONS *
@@ -1460,12 +1508,11 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     thread_resume_siblings();
     mmap_fork_commit_anon_shared(&anon_shared_txn);
 
-    close(ipc_sock);
-
     log_debug("clone: child pid=%lld (host=%d)", (long long) child_guest_pid,
               child_host_pid);
 
     free(regions_snapshot);
+    close(ipc_sock);
     if (is_vfork) {
         current_thread->vfork_wait_fd_plus1 = vfork_notify_fds[0] + 1;
         current_thread->vfork_child_pid = child_guest_pid;
@@ -1489,6 +1536,7 @@ fail_snapshot:
         sys_close(clone_pidfd);
     proc_cancel_child(child_guest_pid);
     free(regions_snapshot);
+    free(snapshot_spans);
 
     /* Roll back the in-place anon-shared overlay conversion while siblings are
      * still parked. A partial rollback failure (e.g., region drift past the

@@ -549,8 +549,9 @@ int guest_init(guest_t *g,
          * this so an unused 1 TiB reservation costs no physical memory. Do NOT
          * memset because that would touch every page and defeat demand paging.
          * Anonymous private memory is also what lets fork hand the child a
-         * lazy copy-on-write view (guest_memory_snapshot_entry); a shared file
-         * backing would make that copy eager.
+         * lazy copy-on-write view of each live object
+         * (guest_memory_snapshot_entry); a shared file backing would make
+         * that copy eager.
          */
         t0 = startup_trace_now_ns();
         g->host_base = mmap(NULL, try_size, PROT_READ | PROT_WRITE,

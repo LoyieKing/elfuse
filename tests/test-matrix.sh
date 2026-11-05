@@ -1026,6 +1026,8 @@ run_unit_tests()
     test_rc "$runner" "test-mt-fork" 0 "$bindir/test-mt-fork"
     test_rc "$runner" "test-fork-quiesce-memory" 0 "$bindir/test-fork-quiesce-memory"
     test_rc "$runner" "test-vfork-sibling" 0 "$bindir/test-vfork-sibling"
+    test_rc "$runner" "test-spawn-isolation" 0 \
+        "$bindir/test-spawn-isolation"
 
     printf "\nExit-group teardown reachability\n"
     test_rc "$runner" "test-exit-group-teardown-wait" 42 \

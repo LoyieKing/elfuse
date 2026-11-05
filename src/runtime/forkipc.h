@@ -29,6 +29,7 @@ int fork_child_main(int ipc_fd,
 
 void fork_notify_vfork_exec(void);
 
+
 /* Clone syscall: spawn a new host elfuse process with IPC state transfer.
  * Returns child guest PID to parent, or negative Linux errno.
  */

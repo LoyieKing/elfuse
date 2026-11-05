@@ -21,9 +21,10 @@
 /* Fork IPC protocol identity. Bump this whenever the header layout or ordered
  * fork payload changes incompatibly.
  */
-#define FORK_IPC_PROTOCOL_MAGIC 0x454C465AU /* "ELFZ": Mach CoW slab entry */
+#define FORK_IPC_PROTOCOL_MAGIC 0x454C465BU /* Mach entry with span sharing */
 
 #define IPC_HDR_SOFT_NEWPID 0x1u
+#define IPC_HDR_VFORK_VM 0x2u
 
 #define IPC_MAGIC_HEADER FORK_IPC_PROTOCOL_MAGIC
 #define IPC_MAGIC_SENTINEL 0x454C4F4BU /* "ELOK" */
