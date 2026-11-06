@@ -929,13 +929,13 @@ int guest_memory_resident_pages(const guest_t *g,
         mach_vm_address_t address = (mach_vm_address_t) host;
         mach_vm_size_t size = 0;
         natural_t depth = 0;
-        vm_region_submap_short_info_data_64_t short_info;
-        mach_msg_type_number_t count = VM_REGION_SUBMAP_SHORT_INFO_COUNT_64;
+        vm_region_submap_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
         kern_return_t kr = mach_vm_region_recurse(
             mach_task_self(), &address, &size, &depth,
-            (vm_region_recurse_info_t) &short_info, &count);
+            (vm_region_recurse_info_t) &info, &count);
         if (kr != KERN_SUCCESS || address > (mach_vm_address_t) host ||
-            (mach_vm_address_t) host - address >= size || short_info.is_submap)
+            (mach_vm_address_t) host - address >= size || info.is_submap)
             return -LINUX_ENOMEM;
         uint64_t chunk = size - ((mach_vm_address_t) host - address);
         if (chunk > len)
@@ -943,17 +943,11 @@ int guest_memory_resident_pages(const guest_t *g,
 
         /* XNU vm_map_region_walk counts the whole host region. Partial regions
          * need page queries so resident neighbours never enter this VMA's RSS.
+         * The full submap info carries pages_resident, so one query answers
+         * both cases; probing every region first doubles the walk's Mach cost.
          */
         if (address == (mach_vm_address_t) host && chunk == size &&
             chunk % hps == 0) {
-            vm_region_submap_info_data_64_t info;
-            count = VM_REGION_SUBMAP_INFO_COUNT_64;
-            kr = mach_vm_region_recurse(
-                mach_task_self(), &address, &size, &depth,
-                (vm_region_recurse_info_t) &info, &count);
-            if (kr != KERN_SUCCESS || address != (mach_vm_address_t) host ||
-                size != chunk || info.is_submap)
-                return -LINUX_EIO;
             resident +=
                 (uint64_t) info.pages_resident * (hps / GUEST_PAGE_SIZE);
         } else {
