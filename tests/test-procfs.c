@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
 
 #include "test-harness.h"
 #include "test-util.h"
@@ -150,6 +151,132 @@ static int child_write_start_stack(int fd)
     if (write_fd_all(fd, &start_stack, sizeof(start_stack)) < 0)
         return 2;
     return 0;
+}
+
+static bool read_rss(uint64_t *stat_rss, uint64_t *status_rss)
+{
+    char buf[1024];
+    if (!read_stat_field("/proc/self/stat", 24, stat_rss))
+        return false;
+    *stat_rss *= 4096;
+    ssize_t n = raw_read_file_nul("/proc/self/status", buf, sizeof(buf));
+    char *rss = n > 0 ? strstr(buf, "VmRSS:") : NULL;
+    if (!rss)
+        return false;
+    *status_rss = strtoull(rss + 6, NULL, 10) * 1024;
+    return true;
+}
+
+static bool rss_near(uint64_t actual, uint64_t expected)
+{
+    uint64_t difference =
+        actual > expected ? actual - expected : expected - actual;
+
+    /* Linux batches RSS updates; unrelated libc pages can fault between reads.
+     */
+    return difference <= 2 * 1024 * 1024;
+}
+
+static void test_rss_changes(void)
+{
+    TEST("procfs: RSS excludes holes and refreshes after discard and unmap");
+    const size_t span = 32 * 1024 * 1024;
+    unsigned char *base = mmap(NULL, 4 * span, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) {
+        FAIL("mmap");
+        return;
+    }
+    /* Each island covers complete host pages; the tail remains untouched. */
+    bool ok = munmap(base + span, span) == 0;
+    uint64_t before_stat = 0, before_status = 0, stat_rss = 0, status_rss = 0;
+    ok = ok && read_rss(&before_stat, &before_status);
+    for (size_t i = 0; i < span; i += 4096) {
+        base[i] = 1;
+        base[2 * span + i] = 2;
+    }
+    ok = ok && mprotect(base, span, PROT_NONE) == 0 &&
+         read_rss(&stat_rss, &status_rss) &&
+         rss_near(stat_rss, before_stat + 2 * span) &&
+         rss_near(status_rss, before_status + 2 * span);
+    ok = ok && madvise(base, span, MADV_DONTNEED) == 0 &&
+         read_rss(&stat_rss, &status_rss) &&
+         rss_near(stat_rss, before_stat + span) &&
+         rss_near(status_rss, before_status + span);
+    ok = ok && munmap(base + 2 * span, span) == 0 &&
+         read_rss(&stat_rss, &status_rss) && rss_near(stat_rss, before_stat) &&
+         rss_near(status_rss, before_status);
+    if (!ok)
+        printf("RSS before=%llu/%llu final=%llu/%llu errno=%d\n",
+               (unsigned long long) before_stat,
+               (unsigned long long) before_status,
+               (unsigned long long) stat_rss, (unsigned long long) status_rss,
+               errno);
+    EXPECT_TRUE(ok,
+                "RSS included holes or retained discarded/unmapped backing");
+    munmap(base, 4 * span);
+}
+
+static void test_rss_aliases(void)
+{
+    TEST("procfs: RSS counts each shared alias");
+    const size_t span = 16 * 1024 * 1024;
+    FILE *file = tmpfile();
+    if (!file) {
+        FAIL("tmpfile");
+        return;
+    }
+    bool ok = ftruncate(fileno(file), (off_t) span) == 0;
+    uint64_t before_stat = 0, before_status = 0, stat_rss = 0, status_rss = 0;
+    ok = ok && read_rss(&before_stat, &before_status);
+    unsigned char *first =
+        mmap(NULL, span, PROT_READ | PROT_WRITE, MAP_SHARED, fileno(file), 0);
+    unsigned char *second =
+        mmap(NULL, span, PROT_READ | PROT_WRITE, MAP_SHARED, fileno(file), 0);
+    ok = ok && first != MAP_FAILED && second != MAP_FAILED;
+    if (ok) {
+        for (size_t i = 0; i < span; i += 4096) {
+            first[i] = 1;
+            second[i] = 2;
+        }
+        ok = read_rss(&stat_rss, &status_rss) &&
+             rss_near(stat_rss, before_stat + 2 * span) &&
+             rss_near(status_rss, before_status + 2 * span);
+    }
+    EXPECT_TRUE(ok, "RSS lost an aliased VMA contribution");
+    if (first != MAP_FAILED)
+        munmap(first, span);
+    if (second != MAP_FAILED)
+        munmap(second, span);
+    fclose(file);
+}
+
+static void test_rss_subpage_holes(void)
+{
+    TEST("procfs: RSS excludes guest holes within resident host pages");
+    const size_t span = 32 * 1024 * 1024;
+    unsigned char *base = mmap(NULL, span + 16384, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) {
+        FAIL("mmap");
+        return;
+    }
+    unsigned char *p =
+        (unsigned char *) (((uintptr_t) base + 16383) & ~(uintptr_t) 16383);
+    uint64_t before_stat = 0, before_status = 0, stat_rss = 0, status_rss = 0;
+    bool ok = read_rss(&before_stat, &before_status);
+    for (size_t i = 0; i < span; i += 4096)
+        p[i] = 1;
+    /* A 4 KiB guest hole keeps its 16 KiB host backing for live neighbors. */
+    for (size_t i = 0; i < span; i += 16384) {
+        if (munmap(p + i + 8192, 4096) < 0)
+            ok = false;
+    }
+    ok = ok && read_rss(&stat_rss, &status_rss) &&
+         rss_near(stat_rss, before_stat + span * 3 / 4) &&
+         rss_near(status_rss, before_status + span * 3 / 4);
+    EXPECT_TRUE(ok, "RSS counted unmapped slices of resident host regions");
+    munmap(base, span + 16384);
 }
 
 int main(void)
@@ -368,6 +495,10 @@ int main(void)
             EXPECT_TRUE(ok, "fork child startstack mismatch");
         }
     }
+
+    test_rss_changes();
+    test_rss_aliases();
+    test_rss_subpage_holes();
 
     SUMMARY("test-procfs");
     return fails > 0 ? 1 : 0;

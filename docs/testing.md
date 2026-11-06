@@ -888,9 +888,10 @@ bash tests/qemu-runner.sh exec /mnt/host/build/test-memory-mode
 ```
 
 `mincore`, guest `VmRSS` and stat RSS query actual host backing residency.
-`stat` and `status` coalesce consecutive GPA spans before querying residency;
-each open measures current backing without a cache. Aliased VMAs retain their
-separate contributions, and `smaps` measures each VMA individually.
+`stat` and `status` coalesce consecutive GPA spans before querying residency.
+Each open reuses the last host-region query only while holding `mmap_lock`;
+no measurement survives the open. Aliased VMAs retain their separate
+contributions, and `smaps` measures each VMA individually.
 Per-VMA queries obtain host-region bounds without scanning residency first.
 Whole host regions then use the full resident count; partial overlaps use
 `mincore` only on the requested range. Merged process spans retain the single
@@ -899,15 +900,37 @@ protection-split guest VMA without adding a bounds query to `stat` and `status`.
 `test-proc-smap` checks untouched neighbors, a resident `PROT_NONE` slice and
 that slice after `MADV_DONTNEED`.
 
-On Apple M4 Pro, 21 reads of 1,600 split VMAs in a 200 MiB mapping measured
+Process RSS queries reuse host-region bounds across guest holes and skip
+`mincore` on regions with zero resident pages. Partial overlaps in nonempty
+regions still measure only the requested guest range. `test-procfs` checks
+discard, unmap, `PROT_NONE`, shared aliases and 4 KiB holes within resident
+16 KiB host pages; all 16 cases pass under elfuse and Linux.
+
+On M4 Pro, a 32 MiB resident mapping with 2,048 guest holes takes
+37.504/2.291 ms CPU per stat read before/after region reuse. A separate
+2,048-mapping contention probe measures 8.040/7.676 ms CPU (median of three
+runs). Matched ART runs with 800 direct buffers measure stat at
+11.394/9.978 ms and status at 10.691/9.451 ms. The post-GC status measurement
+is 15.253/15.960 ms; `maps` and `smaps` have no demonstrated improvement.
+
+Two 90-second original APK runs remain alive and present 4,362/5,869 frames.
+Steady stat open CPU averages 38.498/37.371 ms across 136/112 sampled opens.
+Different content and window sizes prevent a playback-performance comparison.
+The global mapping lock still covers the scan. The arm64 matrix reports
+331 passes, one `test-file-ops` failure and 10 skips. A standalone rerun and
+five alternating baseline/current pairs pass all 19 file-operation cases;
+the matrix failure remains unexplained.
+
+For the separate per-VMA optimization, 21 reads of 1,600 split VMAs in a
+200 MiB mapping on Apple M4 Pro measured
 median `smaps` reads of 58.867/9.075 ms before/after. Three earlier pairs with
 the same per-VMA query measured a median of 81.831/8.415 ms. Standalone ART
 with 800 direct buffers of 128 KiB showed no speedup: `smaps` measured
-68.026/71.486 ms. `stat`, `status` and `maps` have no measured improvement.
+68.026/71.486 ms. That change has no measured `stat`, `status` or `maps` gain.
 
-The arm64 matrix passes 332 cases with 10 skips. The four smaps checks pass
-under elfuse and Linux after guard pages isolate the layout fixtures from
-neighboring allocations. Changed C files pass commentflow and clang-format;
+The per-VMA change's arm64 matrix passed 332 cases with 10 skips. Its four
+smaps checks pass under elfuse and Linux after guard pages isolate the layout
+fixtures from neighboring allocations. Changed C files pass both formatters;
 the full commentflow gate still finds unrelated existing comment wrapping.
 `make check` stops at the existing `open_trace_lock` omission from the lock
 order document; later lanes are not counted as passing.

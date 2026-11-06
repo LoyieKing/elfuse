@@ -914,10 +914,19 @@ int guest_memory_residency(const guest_t *g,
     return 0;
 }
 
+/* Reused only within one mmap-locked process snapshot. A hole in the guest
+ * layout need not split the host region; query its full residency once.
+ */
+typedef struct {
+    mach_vm_address_t address;
+    mach_vm_size_t size;
+    unsigned int pages;
+} resident_region_t;
+
 static int memory_resident_pages(const guest_t *g,
                                  uint64_t gpa,
                                  uint64_t len,
-                                 bool query_bounds,
+                                 resident_region_t *cached,
                                  uint64_t *pages_out)
 {
     assert(mmap_lock_held());
@@ -932,31 +941,41 @@ static int memory_resident_pages(const guest_t *g,
         natural_t depth = 0;
         vm_region_submap_info_data_64_t info;
         vm_region_submap_short_info_data_64_t bounds;
-        mach_msg_type_number_t count =
-            query_bounds ? VM_REGION_SUBMAP_SHORT_INFO_COUNT_64
-                         : VM_REGION_SUBMAP_INFO_COUNT_64;
-        vm_region_recurse_info_t data = query_bounds
-                                            ? (vm_region_recurse_info_t) &bounds
-                                            : (vm_region_recurse_info_t) &info;
-        kern_return_t kr = mach_vm_region_recurse(mach_task_self(), &address,
-                                                  &size, &depth, data, &count);
-        if (kr != KERN_SUCCESS || address > (mach_vm_address_t) host ||
-            (mach_vm_address_t) host - address >= size ||
-            (query_bounds ? bounds.is_submap : info.is_submap))
-            return -LINUX_ENOMEM;
+        bool known = cached && (mach_vm_address_t) host >= cached->address &&
+                     (mach_vm_address_t) host - cached->address < cached->size;
+        if (known) {
+            address = cached->address;
+            size = cached->size;
+            info.pages_resident = cached->pages;
+        } else {
+            mach_msg_type_number_t count =
+                cached ? VM_REGION_SUBMAP_INFO_COUNT_64
+                       : VM_REGION_SUBMAP_SHORT_INFO_COUNT_64;
+            vm_region_recurse_info_t data =
+                cached ? (vm_region_recurse_info_t) &info
+                       : (vm_region_recurse_info_t) &bounds;
+            kern_return_t kr = mach_vm_region_recurse(
+                mach_task_self(), &address, &size, &depth, data, &count);
+            if (kr != KERN_SUCCESS || address > (mach_vm_address_t) host ||
+                (mach_vm_address_t) host - address >= size ||
+                (cached ? info.is_submap : bounds.is_submap))
+                return -LINUX_ENOMEM;
+            if (cached)
+                *cached =
+                    (resident_region_t) {address, size, info.pages_resident};
+        }
         uint64_t chunk = size - ((mach_vm_address_t) host - address);
         if (chunk > len)
             chunk = len;
 
-        /* XNU vm_map_region_walk scans the whole host region. A single guest
-         * VMA often covers only a small slice; merged process spans usually
-         * cover whole host regions and skip the extra bounds query.
+        /* A nonempty host region can contain untouched guest slices. Only exact
+         * overlaps use its total; partial overlaps still use mincore.
          */
         if (address == (mach_vm_address_t) host && chunk == size &&
             chunk % hps == 0) {
-            if (query_bounds) {
-                count = VM_REGION_SUBMAP_INFO_COUNT_64;
-                kr = mach_vm_region_recurse(
+            if (!cached) {
+                mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+                kern_return_t kr = mach_vm_region_recurse(
                     mach_task_self(), &address, &size, &depth,
                     (vm_region_recurse_info_t) &info, &count);
                 if (kr != KERN_SUCCESS || address != (mach_vm_address_t) host ||
@@ -965,7 +984,7 @@ static int memory_resident_pages(const guest_t *g,
             }
             resident +=
                 (uint64_t) info.pages_resident * (hps / GUEST_PAGE_SIZE);
-        } else {
+        } else if (!cached || info.pages_resident) {
             char vec[8192];
             uint64_t scanned = 0;
             while (scanned < chunk) {
@@ -1002,7 +1021,7 @@ int guest_memory_resident_pages(const guest_t *g,
                                 uint64_t len,
                                 uint64_t *pages_out)
 {
-    return memory_resident_pages(g, gpa, len, true, pages_out);
+    return memory_resident_pages(g, gpa, len, NULL, pages_out);
 }
 
 /* Resident guest pages across every tracked process VMA, plus the byte size of
@@ -1024,6 +1043,7 @@ int guest_memory_mapped_resident_pages(const guest_t *g,
     uint64_t resident = 0;
     uint64_t span_gpa = 0;
     uint64_t span_end = 0;
+    resident_region_t cached = {0};
     for (int i = 0; i < g->nregions; i++) {
         const guest_region_t *r = &g->regions[i];
         bool infra = guest_range_hits_infra(g, r->start, r->end);
@@ -1037,7 +1057,7 @@ int guest_memory_mapped_resident_pages(const guest_t *g,
         if (span_end > span_gpa) {
             uint64_t pages = 0;
             int rc = memory_resident_pages(g, span_gpa, span_end - span_gpa,
-                                           false, &pages);
+                                           &cached, &pages);
             if (rc < 0)
                 return rc;
             resident += pages;
@@ -1052,8 +1072,8 @@ int guest_memory_mapped_resident_pages(const guest_t *g,
     }
     if (span_end > span_gpa) {
         uint64_t pages = 0;
-        int rc = memory_resident_pages(g, span_gpa, span_end - span_gpa, false,
-                                       &pages);
+        int rc = memory_resident_pages(g, span_gpa, span_end - span_gpa,
+                                       &cached, &pages);
         if (rc < 0)
             return rc;
         resident += pages;
@@ -1062,7 +1082,6 @@ int guest_memory_mapped_resident_pages(const guest_t *g,
     *pages_out = resident;
     return 0;
 }
-
 
 /* Host-page span of one live piece of the primary slab. gpa is the offset from
  * host_base; the Mach copy packs these back to back.
