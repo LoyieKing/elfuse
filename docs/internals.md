@@ -1881,6 +1881,12 @@ An entry point that re-derives the decision is how four regressions arrived,
 each one a shadow: the layer claiming a name it does not serve and reporting
 `ENOENT` for a file the sysroot really has.
 
+Unrelated `/sys` suffixes return to the backing before USB enumeration or
+scratch-tree allocation. `/sys`, `/sys/bus`, and `/sys/bus/usb` retain the
+synthetic path. Raw walks beginning with `bus` also retain it: a `subsystem`
+symlink can change where a later `..` lands, so lexical folding alone cannot
+disown those walks.
+
 The classes and who answers them:
 
 | Class | Path | Answered by |

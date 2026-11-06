@@ -1219,6 +1219,34 @@ exits. Its parent and two helper files each contain a final snapshot. The
 exporter starts after preemption signals are blocked; starting it earlier
 allows Darwin SIGUSR2 to terminate the host instead of reaching sigwait.
 
+## Deferred USB Enumeration During Startup
+
+An absent /sys/kernel/mm/pgsize_migration/enabled lookup preserves ENOENT
+without building the unrelated USB tree. On the arm64 workstation, five
+alternating baseline/current runs have host CPU medians 74.783/0.019 ms
+and wall medians 211.680/0.019 ms. The unmodified Douyin APK baseline spends
+123.738, 78.942 and 72.273 ms CPU on this probe; the optimized path no longer
+appears among the twelve most expensive opens. These path measurements do
+not establish an end-to-end startup speedup.
+
+USB/sysfs suites pass 176, 15, 349 and 5 checks. The check driver passes all
+112 entries. Full make check stops on the baseline's undocumented
+open_trace_lock; skipping that scanner reaches the baseline's 88-column
+usage synopsis failure. Remaining named runtime lanes pass, with the GVA
+contract lane skipped in the non-contract build. The arm64 matrix reports
+331 passes, one PI futex throughput failure and ten skips; baseline/current
+PI futex reruns each pass all seven checks. The matrix remains failed.
+The guardrail's static retry passes, but the dynamic-glibc arm times out;
+the guardrail is not passed. clang-format 22.1.8 passes; commentflow is
+unavailable.
+
+Three same-state original-APK A/B pairs include one optimized attach-time
+EL0 null-pointer SIGSEGV at PC 0x4e2feee3c. Its cause remains unknown and the
+failed run is retained. A separate optimized smoke reaches MainActivity and
+the original video page is visible through OCU. APK and original account
+data hashes are unchanged. Logs and alternating-run data are retained under
+/private/tmp/umaru-startup-20261106/.
+
 ## OCI Images
 
 `python3 scripts/test-elfuse-oci.py` runs table cases over the parts of the OCI

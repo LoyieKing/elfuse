@@ -1558,6 +1558,12 @@ static usb_path_kind_t classify_and_normalize(const char *path,
     }
     if (rc == 0)
         return USB_PATH_NONE; /* climbed above /sys; not ours */
+    /* Only bus exists in the scratch root. Keep raw bus walks because a
+     * subsystem symlink can change where '..' lands before normalization.
+     */
+    if (norm[0] && strcmp(norm, "bus") && strcmp(norm, "bus/") &&
+        !usb_sys_suffix_owned(norm) && !path_prefix_match(*sfx_out, "bus", 3))
+        return USB_PATH_NONE;
     return USB_PATH_SYS;
 }
 
