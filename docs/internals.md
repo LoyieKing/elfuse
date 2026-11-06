@@ -1771,17 +1771,19 @@ Whole host regions use Mach resident counts. Partial regions use bounded
 `mincore` batches and charge only the guest pages inside the requested range.
 
 Synthetic proc directories have explicit snapshot boundaries. The backing
-trees reached by opening `/proc` or `/proc/self` are materialized once, on the
-first access, and their initial `stat`, `status`, `cmdline`, `maps`, and `smaps`
-files remain fixed for the process lifetime. An absolute open of one of those
-proc paths is intercepted directly and generates fresh content; opening the
-same name through an already-open synthetic directory reads that directory's
-snapshot. `/proc/self/fd` and `/proc/self/fdinfo` are rebuilt into an
-independent scratch directory on every open, so each directory fd sees the
-guest-fd table as it existed at that open and concurrent enumerations cannot
-mutate one another. `/proc/self/task` is repopulated from the current thread
-set whenever the directory is opened. These boundaries are intentional: a
-directory stream is stable while it is being read, while dynamic task and fd
+trees reached by opening `/proc`, `/proc/self`, or `/proc/<pid>` are
+materialized once, on the first access, and hold empty entries named `stat`,
+`status`, `cmdline`, `maps`, and `smaps`. The names exist because `getdents`
+and `stat` walk that tree; content is never read from it, since an absolute
+open of one of those proc paths is intercepted and generated fresh. Filling
+those files in was measured at one full residency and mapping walk per entry:
+226 ms for the first `/proc` open on the Douyin startup, against 1.6 ms when
+only the names are created. `/proc/self/fd` and `/proc/self/fdinfo` are rebuilt
+into an independent scratch directory on every open, so each directory fd sees
+the guest-fd table as it existed at that open and concurrent enumerations
+cannot mutate one another. `/proc/self/task` is repopulated from the current
+thread set whenever the directory is opened. These boundaries are intentional:
+a directory stream is stable while it is being read, while dynamic task and fd
 listings refresh only when a new directory is opened. The synthetic
 `/sys/devices/system/cpu` tree follows the one-shot rule: its CPU count,
 cpumask files, and `cpuN` directories are captured on first access and then

@@ -1314,62 +1314,6 @@ static int proc_open_numbered_dir(const char *dir, int64_t id, int linux_flags)
     return proc_open_dir_fd(path, linux_flags);
 }
 
-static int copy_fd_to_path(int src_fd, const char *path)
-{
-    int out = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0444);
-    if (out < 0)
-        return -1;
-
-    if (lseek(src_fd, 0, SEEK_SET) < 0) {
-        close(out);
-        return -1;
-    }
-
-    char buf[4096];
-    for (;;) {
-        ssize_t n = read(src_fd, buf, sizeof(buf));
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            close(out);
-            return -1;
-        }
-        if (n == 0)
-            break;
-        ssize_t off = 0;
-        while (off < n) {
-            ssize_t w = write(out, buf + off, (size_t) (n - off));
-            if (w < 0) {
-                if (errno == EINTR)
-                    continue;
-                close(out);
-                return -1;
-            }
-            off += w;
-        }
-    }
-
-    close(out);
-    lseek(src_fd, 0, SEEK_SET);
-    return 0;
-}
-
-static void populate_proc_snapshot(const guest_t *g,
-                                   const char *dir,
-                                   const char *name,
-                                   const char *proc_path)
-{
-    char path[LINUX_PATH_MAX];
-    if (snprintf(path, sizeof(path), "%s/%s", dir, name) >= (int) sizeof(path))
-        return;
-
-    int fd = proc_intercept_open(g, proc_path, 0, 0);
-    if (fd < 0)
-        return;
-    copy_fd_to_path(fd, path);
-    close(fd);
-}
-
 static void populate_proc_placeholder(const char *dir, const char *name)
 {
     char path[LINUX_PATH_MAX];
@@ -1433,11 +1377,11 @@ static const char *ensure_proc_tmpdir(const guest_t *g)
 
     char piddir[128];
     str_copy_trunc(piddir, pidbuf, sizeof(piddir));
-    populate_proc_snapshot(g, piddir, "stat", "/proc/self/stat");
-    populate_proc_snapshot(g, piddir, "status", "/proc/self/status");
-    populate_proc_snapshot(g, piddir, "cmdline", "/proc/self/cmdline");
-    populate_proc_snapshot(g, piddir, "maps", "/proc/self/maps");
-    populate_proc_snapshot(g, piddir, "smaps", "/proc/self/smaps");
+    populate_proc_placeholder(piddir, "stat");
+    populate_proc_placeholder(piddir, "status");
+    populate_proc_placeholder(piddir, "cmdline");
+    populate_proc_placeholder(piddir, "maps");
+    populate_proc_placeholder(piddir, "smaps");
 
     /* Create task subdirectory for /proc/self/task enumeration */
     char taskdir[128];

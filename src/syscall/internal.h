@@ -168,7 +168,7 @@
  *   overlay_lock (chown-overlay.c)   shm_dir_lock (procemu.c)
  *   proc_scratch_lock (procemu.c)    shm_lock (sysvipc.c)
  *   removed_overlay_lock (fs.c)      syscpu_dir_lock (procemu.c)
- *                                    sysinfo_lock (sys.c)
+ *   open_trace_lock (fs.c)           sysinfo_lock (sys.c)
  *                                    sysroot_lock (proc-state.c)
  *                                    usb_lock (runtime/usb-sysfs.c)
  *                                    usbdev_loop_lock (usbdev.c)
