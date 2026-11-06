@@ -458,6 +458,10 @@ Off by default, and useful when a guest misbehaves rather than in normal use:
 - `ELFUSE_DISABLE_TLBI_RANGE=1`: refuse `FEAT_TLBIRANGE` and fall back to
   per-page and broadcast invalidation, which separates a stale-TLB bug from
   the range-encoding path.
+- `ELFUSE_OPEN_TRACE=1`: rank `openat` paths by the host CPU time each call
+  consumes and print the twelve most expensive paths every 2000 opens, with
+  call count, total milliseconds and average microseconds. The counters live in
+  a fixed in-process table; nothing is allocated or written to disk per open.
 
 ## Runtime Profile
 

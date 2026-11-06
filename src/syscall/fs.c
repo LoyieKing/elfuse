@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <sys/mount.h>
 #include <pthread.h>
 
@@ -1071,6 +1072,90 @@ int64_t sys_openat_path(guest_t *g,
     return guest_fd;
 }
 
+/*
+ * ELFUSE_OPEN_TRACE=1 ranks openat paths by the host CPU time each call
+ * consumes and prints the most expensive ones every 2000 opens. The counters
+ * live in a fixed probe table so tracing never allocates on the open path.
+ */
+#define OPEN_TRACE_SLOTS 4096u
+#define OPEN_TRACE_PROBES 4u
+#define OPEN_TRACE_DUMP_EVERY 2000u
+#define OPEN_TRACE_PATH 160u
+#define OPEN_TRACE_TOP 12u
+typedef struct {
+    char path[OPEN_TRACE_PATH];
+    uint64_t count;
+    uint64_t cpu_ns;
+} open_trace_slot_t;
+static open_trace_slot_t open_trace_slots[OPEN_TRACE_SLOTS + 1];
+static pthread_mutex_t open_trace_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int open_trace_state = -1;
+static uint64_t open_trace_calls;
+
+static uint64_t open_trace_cpu_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000ull + (uint64_t) ts.tv_nsec;
+}
+
+static void open_trace_add(const char *path, uint64_t cpu_ns)
+{
+    uint64_t hash = 1469598103934665603ull;
+    for (const char *p = path; *p; p++) {
+        hash = (hash ^ (unsigned char) *p) * 1099511628211ull;
+    }
+    pthread_mutex_lock(&open_trace_lock);
+    open_trace_slot_t *slot = &open_trace_slots[OPEN_TRACE_SLOTS];
+    for (unsigned probe = 0; probe < OPEN_TRACE_PROBES; probe++) {
+        open_trace_slot_t *candidate =
+            &open_trace_slots[(hash + probe) % OPEN_TRACE_SLOTS];
+        if (candidate->path[0] == 0) {
+            snprintf(candidate->path, sizeof(candidate->path), "%s", path);
+            slot = candidate;
+            break;
+        }
+        if (!strcmp(candidate->path, path)) {
+            slot = candidate;
+            break;
+        }
+    }
+    if (slot->path[0] == 0) {
+        snprintf(slot->path, sizeof(slot->path), "<probe overflow>");
+    }
+    ++slot->count;
+    slot->cpu_ns += cpu_ns;
+    const uint64_t calls = ++open_trace_calls;
+    if (calls % OPEN_TRACE_DUMP_EVERY != 0) {
+        pthread_mutex_unlock(&open_trace_lock);
+        return;
+    }
+    for (unsigned rank = 0; rank < OPEN_TRACE_TOP; rank++) {
+        open_trace_slot_t *best = NULL;
+        for (unsigned i = 0; i <= OPEN_TRACE_SLOTS; i++) {
+            open_trace_slot_t *candidate = &open_trace_slots[i];
+            if (candidate->path[0] && candidate->cpu_ns != 0 &&
+                (best == NULL || candidate->cpu_ns > best->cpu_ns)) {
+                best = candidate;
+            }
+        }
+        if (best == NULL) {
+            break;
+        }
+        fprintf(stderr,
+                "OPEN_TRACE calls=%llu rank=%u count=%llu cpu_ms=%llu "
+                "avg_us=%llu path=%s\n",
+                (unsigned long long) calls, rank,
+                (unsigned long long) best->count,
+                (unsigned long long) (best->cpu_ns / 1000000ull),
+                (unsigned long long) (best->cpu_ns / best->count / 1000ull),
+                best->path);
+        best->count = 0;
+        best->cpu_ns = 0;
+    }
+    pthread_mutex_unlock(&open_trace_lock);
+}
+
 int64_t sys_openat(guest_t *g,
                    int dirfd,
                    uint64_t path_gva,
@@ -1083,7 +1168,16 @@ int64_t sys_openat(guest_t *g,
     if (guest_read_path(g, path_gva, short_path, sizeof(short_path), path,
                         sizeof(path), &pathp) < 0)
         return -LINUX_EFAULT;
-    return sys_openat_path(g, dirfd, pathp, linux_flags, mode);
+    if (open_trace_state < 0) {
+        open_trace_state = getenv("ELFUSE_OPEN_TRACE") != NULL;
+    }
+    if (!open_trace_state) {
+        return sys_openat_path(g, dirfd, pathp, linux_flags, mode);
+    }
+    const uint64_t open_start = open_trace_cpu_ns();
+    const int64_t open_result = sys_openat_path(g, dirfd, pathp, linux_flags, mode);
+    open_trace_add(pathp, open_trace_cpu_ns() - open_start);
+    return open_result;
 }
 
 static bool stat_identity_has_open_fd(const struct stat *target)
