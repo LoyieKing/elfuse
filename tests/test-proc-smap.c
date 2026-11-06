@@ -589,6 +589,52 @@ static int child_probe(uintptr_t target,
     return 0;
 }
 
+static void test_split_residency(void)
+{
+    TEST("smaps excludes resident neighbors across protection splits");
+    const size_t span = 65536;
+    const size_t total = 6 * span;
+    unsigned char *base =
+        mmap(NULL, total, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) {
+        FAIL("mmap");
+        return;
+    }
+
+    /* Keep each slice on a host-page boundary, with untouched guards outside
+     * the three VMAs so adjacent mappings cannot contribute to their RSS.
+     */
+    uintptr_t start = ((uintptr_t) base + 2 * span - 1) & ~(span - 1);
+    unsigned char *middle = (unsigned char *) (start + span);
+    bool ok = mprotect((void *) start, span, PROT_READ) == 0 &&
+              mprotect(middle, span, PROT_READ | PROT_WRITE) == 0 &&
+              mprotect(middle + span, span, PROT_READ | PROT_WRITE) == 0;
+    if (ok) {
+        memset(middle, 0x5a, span);
+        ok = mprotect(middle, span, PROT_NONE) == 0;
+    }
+    for (int pass = 0; ok && pass < 2; pass++) {
+        smaps_info_t info;
+        ok = load_smaps("/proc/self/smaps", &info);
+        if (!ok)
+            break;
+        for (size_t i = 0; i < 3; i++) {
+            const smaps_vma_t *vma = find_vma(&info, start + i * span);
+            unsigned long long expected =
+                (i == 1 && pass == 0) ? span / 1024 : 0;
+            if (!vma || vma->start != start + i * span ||
+                vma->end != start + (i + 1) * span || vma->rss_kb != expected)
+                ok = false;
+        }
+        free_smaps(&info);
+        if (ok && pass == 0)
+            ok = madvise(middle, span, MADV_DONTNEED) == 0;
+    }
+    EXPECT_TRUE(ok,
+                "split VMA RSS included neighbors or retained discarded pages");
+    munmap(base, total);
+}
+
 int main(void)
 {
     long page_size_long = sysconf(_SC_PAGESIZE);
@@ -602,25 +648,34 @@ int main(void)
     size_t page_size = (size_t) page_size_long;
 
     size_t target_size = 3 * page_size;
-    char *target = mmap(NULL, target_size, PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    size_t target_reserve_size = target_size + 2 * page_size;
+    char *target_reserve = mmap(NULL, target_reserve_size, PROT_NONE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *target =
+        target_reserve == MAP_FAILED ? MAP_FAILED : target_reserve + page_size;
     size_t stress_pages = 320;
     size_t stress_size = stress_pages * page_size;
+    size_t stress_reserve_size = stress_size + 2 * page_size;
+    char *stress_reserve = MAP_FAILED;
     char *stress = MAP_FAILED;
-    bool fixture_ok = target != MAP_FAILED;
-    if (fixture_ok)
-        stress = mmap(NULL, stress_size, PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    fixture_ok = fixture_ok && stress != MAP_FAILED;
+    bool fixture_ok =
+        target != MAP_FAILED &&
+        mprotect(target, target_size, PROT_READ | PROT_WRITE) == 0;
+    if (fixture_ok) {
+        stress_reserve = mmap(NULL, stress_reserve_size, PROT_NONE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (stress_reserve != MAP_FAILED)
+            stress = stress_reserve + page_size;
+    }
+    fixture_ok = fixture_ok && stress != MAP_FAILED &&
+                 mprotect(stress, stress_size, PROT_READ | PROT_WRITE) == 0;
     if (fixture_ok) {
         *(volatile unsigned char *) target = 0x5a; /* make one page dirty */
         fixture_ok = mprotect(target + page_size, page_size, PROT_READ) == 0;
     }
     if (fixture_ok) {
-        /* Start with a read-only page so an allocator placing this mapping
-         * immediately after target cannot merge target's final rw page into the
-         * stress range. Alternating permissions keeps every stress page as a
-         * distinct VMA while preserving the >256 completeness probe.
+        /* Guard pages keep these permission-split VMAs separate from unrelated
+         * anonymous allocations on Linux.
          */
         for (size_t i = 0; i < stress_pages; i += 2) {
             if (mprotect(stress + i * page_size, page_size, PROT_READ) < 0) {
@@ -697,10 +752,12 @@ int main(void)
         }
     }
 
-    if (stress != MAP_FAILED)
-        munmap(stress, stress_size);
-    if (target != MAP_FAILED)
-        munmap(target, target_size);
+    test_split_residency();
+
+    if (stress_reserve != MAP_FAILED)
+        munmap(stress_reserve, stress_reserve_size);
+    if (target_reserve != MAP_FAILED)
+        munmap(target_reserve, target_reserve_size);
     SUMMARY("test-proc-smap");
     return fails == 0 ? 0 : 1;
 }

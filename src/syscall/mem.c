@@ -914,10 +914,11 @@ int guest_memory_residency(const guest_t *g,
     return 0;
 }
 
-int guest_memory_resident_pages(const guest_t *g,
-                                uint64_t gpa,
-                                uint64_t len,
-                                uint64_t *pages_out)
+static int memory_resident_pages(const guest_t *g,
+                                 uint64_t gpa,
+                                 uint64_t len,
+                                 bool query_bounds,
+                                 uint64_t *pages_out)
 {
     assert(mmap_lock_held());
     size_t hps = host_page_size_cached();
@@ -930,24 +931,38 @@ int guest_memory_resident_pages(const guest_t *g,
         mach_vm_size_t size = 0;
         natural_t depth = 0;
         vm_region_submap_info_data_64_t info;
-        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
-        kern_return_t kr =
-            mach_vm_region_recurse(mach_task_self(), &address, &size, &depth,
-                                   (vm_region_recurse_info_t) &info, &count);
+        vm_region_submap_short_info_data_64_t bounds;
+        mach_msg_type_number_t count =
+            query_bounds ? VM_REGION_SUBMAP_SHORT_INFO_COUNT_64
+                         : VM_REGION_SUBMAP_INFO_COUNT_64;
+        vm_region_recurse_info_t data = query_bounds
+                                            ? (vm_region_recurse_info_t) &bounds
+                                            : (vm_region_recurse_info_t) &info;
+        kern_return_t kr = mach_vm_region_recurse(mach_task_self(), &address,
+                                                  &size, &depth, data, &count);
         if (kr != KERN_SUCCESS || address > (mach_vm_address_t) host ||
-            (mach_vm_address_t) host - address >= size || info.is_submap)
+            (mach_vm_address_t) host - address >= size ||
+            (query_bounds ? bounds.is_submap : info.is_submap))
             return -LINUX_ENOMEM;
         uint64_t chunk = size - ((mach_vm_address_t) host - address);
         if (chunk > len)
             chunk = len;
 
-        /* XNU vm_map_region_walk counts the whole host region. Partial regions
-         * need page queries so resident neighbours never enter this VMA's RSS.
-         * The full submap info carries pages_resident, so one query answers
-         * both cases; probing every region first doubles the walk's Mach cost.
+        /* XNU vm_map_region_walk scans the whole host region. A single guest
+         * VMA often covers only a small slice; merged process spans usually
+         * cover whole host regions and skip the extra bounds query.
          */
         if (address == (mach_vm_address_t) host && chunk == size &&
             chunk % hps == 0) {
+            if (query_bounds) {
+                count = VM_REGION_SUBMAP_INFO_COUNT_64;
+                kr = mach_vm_region_recurse(
+                    mach_task_self(), &address, &size, &depth,
+                    (vm_region_recurse_info_t) &info, &count);
+                if (kr != KERN_SUCCESS || address != (mach_vm_address_t) host ||
+                    size != chunk || info.is_submap)
+                    return -LINUX_ENOMEM;
+            }
             resident +=
                 (uint64_t) info.pages_resident * (hps / GUEST_PAGE_SIZE);
         } else {
@@ -982,6 +997,14 @@ int guest_memory_resident_pages(const guest_t *g,
     return 0;
 }
 
+int guest_memory_resident_pages(const guest_t *g,
+                                uint64_t gpa,
+                                uint64_t len,
+                                uint64_t *pages_out)
+{
+    return memory_resident_pages(g, gpa, len, true, pages_out);
+}
+
 /* Resident guest pages across every tracked process VMA, plus the byte size of
  * those VMAs. Caller holds mmap_lock.
  *
@@ -1013,8 +1036,8 @@ int guest_memory_mapped_resident_pages(const guest_t *g,
         }
         if (span_end > span_gpa) {
             uint64_t pages = 0;
-            int rc = guest_memory_resident_pages(g, span_gpa,
-                                                 span_end - span_gpa, &pages);
+            int rc = memory_resident_pages(g, span_gpa, span_end - span_gpa,
+                                           false, &pages);
             if (rc < 0)
                 return rc;
             resident += pages;
@@ -1029,8 +1052,8 @@ int guest_memory_mapped_resident_pages(const guest_t *g,
     }
     if (span_end > span_gpa) {
         uint64_t pages = 0;
-        int rc = guest_memory_resident_pages(g, span_gpa, span_end - span_gpa,
-                                             &pages);
+        int rc = memory_resident_pages(g, span_gpa, span_end - span_gpa, false,
+                                       &pages);
         if (rc < 0)
             return rc;
         resident += pages;

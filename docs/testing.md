@@ -891,6 +891,31 @@ bash tests/qemu-runner.sh exec /mnt/host/build/test-memory-mode
 `stat` and `status` coalesce consecutive GPA spans before querying residency;
 each open measures current backing without a cache. Aliased VMAs retain their
 separate contributions, and `smaps` measures each VMA individually.
+Per-VMA queries obtain host-region bounds without scanning residency first.
+Whole host regions then use the full resident count; partial overlaps use
+`mincore` only on the requested range. Merged process spans retain the single
+full query. This avoids repeatedly scanning a large host region for every
+protection-split guest VMA without adding a bounds query to `stat` and `status`.
+`test-proc-smap` checks untouched neighbors, a resident `PROT_NONE` slice and
+that slice after `MADV_DONTNEED`.
+
+On Apple M4 Pro, 21 reads of 1,600 split VMAs in a 200 MiB mapping measured
+median `smaps` reads of 58.867/9.075 ms before/after. Three earlier pairs with
+the same per-VMA query measured a median of 81.831/8.415 ms. Standalone ART
+with 800 direct buffers of 128 KiB showed no speedup: `smaps` measured
+68.026/71.486 ms. `stat`, `status` and `maps` have no measured improvement.
+
+The arm64 matrix passes 332 cases with 10 skips. The four smaps checks pass
+under elfuse and Linux after guard pages isolate the layout fixtures from
+neighboring allocations. Changed C files pass commentflow and clang-format;
+the full commentflow gate still finds unrelated existing comment wrapping.
+`make check` stops at the existing `open_trace_lock` omission from the lock
+order document; later lanes are not counted as passing.
+The original arm64 APK remains alive for a bounded 90-second run and presents
+1,936 frames. Its sampled `smaps` open costs 159.021 ms; process RSS opens
+still cost about 40 ms while holding `mmap_lock`. Different feed content and
+window visibility prevent an application-wide performance comparison.
+
 The reporting granule is still the host page: four 4 KiB guest pages can share
 one resident 16 KiB host page. Host process RSS also includes elfuse/HVF and
 shared cached files; Darwin `phys_footprint` excludes much of the shared slab.
