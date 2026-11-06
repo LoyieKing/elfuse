@@ -445,8 +445,8 @@ static void proc_scratch_register_atexit(void)
 
 /* Record a scratch directory for removal at its last close or at exit, arming
  * the atexit hook on first use. The registry is private to this file;
- * procemu-pty.c reaches it through here rather than through the statics
- * behind it.
+ * procemu-pty.c reaches it through here rather than through the statics behind
+ * it.
  */
 void proc_scratch_register(const char *dir)
 {
@@ -1782,8 +1782,8 @@ static int proc_region_resident_pages(const guest_t *g,
                                        end - start, pages_out);
 }
 
-/* The guest path of the linked file behind a region's backing descriptor, or
- * an empty string when it has none to report.
+/* The guest path of the linked file behind a region's backing descriptor, or an
+ * empty string when it has none to report.
  */
 static void proc_region_backing_name(int host_fd, char *out, size_t outsz)
 {
@@ -1832,14 +1832,12 @@ static int proc_build_maps_entries(const guest_t *g,
         nregions = 0;
     if (nregions > GUEST_MAX_REGIONS)
         nregions = GUEST_MAX_REGIONS;
-    /* A file mapping names its file, as Linux does. The region tracker keeps
-     * the host descriptor rather than a path, so the guest spelling is asked of
-     * it here, once per run of regions on one descriptor, instead of on every
-     * mmap. Unlinked backings (memfd, the fork-time anon-shared promotion, a
-     * file the guest removed) stay nameless: their Linux names come from
-     * kernel state the descriptor does not carry.
+
+    /* Splits duplicate backing descriptors but retain vma_id. Reuse the name
+     * across their pieces; later snapshots still observe file renames. Unlinked
+     * files stay nameless because the host fd has no Linux name.
      */
-    int named_fd = -1;
+    uint64_t named_vma = 0;
     char named_path[LINUX_PATH_MAX];
     named_path[0] = '\0';
     for (int i = 0; i < nregions; i++) {
@@ -1850,9 +1848,9 @@ static int proc_build_maps_entries(const guest_t *g,
         const char *name = r->name;
         if (!name[0] && r->backing_fd >= 0 &&
             !(r->flags & LINUX_MAP_ANONYMOUS)) {
-            if (r->backing_fd != named_fd) {
-                named_fd = r->backing_fd;
-                proc_region_backing_name(named_fd, named_path,
+            if (!r->vma_id || r->vma_id != named_vma) {
+                named_vma = r->vma_id;
+                proc_region_backing_name(r->backing_fd, named_path,
                                          sizeof(named_path));
             }
             name = named_path;

@@ -921,6 +921,21 @@ The global mapping lock still covers the scan. The arm64 matrix reports
 five alternating baseline/current pairs pass all 19 file-operation cases;
 the matrix failure remains unexplained.
 
+Maps and smaps reuse file names across consecutive pieces of one logical VMA.
+Protection splits duplicate descriptors but preserve the VMA ID; each new
+snapshot resolves again so rename and fixed replacement stay visible.
+`test-procfs` checks three pieces before and after rename, then replaces the
+middle with another file. All 17 cases pass under elfuse and Linux; the four
+smaps cases also pass under elfuse.
+
+On M4 Pro, 2,048 file-backed protection splits measure 1.910/0.765 ms CPU per
+maps read. The ART probe measures 2.673/3.037 ms wall time and shows no gain.
+With RSS and pathname reuse together, the original APK runs for 90.081 seconds;
+guest and renderer remain alive until the harness stops them. The video page
+is visible in the captured UI; the renderer records 4,172 presented frames,
+3,935 distinct contents and two skipped presentations. Steady stat opens still
+cost about 39 ms CPU, so the global-lock performance item remains open.
+
 For the separate per-VMA optimization, 21 reads of 1,600 split VMAs in a
 200 MiB mapping on Apple M4 Pro measured
 median `smaps` reads of 58.867/9.075 ms before/after. Three earlier pairs with

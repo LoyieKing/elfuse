@@ -279,6 +279,67 @@ static void test_rss_subpage_holes(void)
     munmap(base, span + 16384);
 }
 
+static bool maps_name_at(const void *address, const char *name)
+{
+    char buf[65536];
+    if (raw_read_file_nul("/proc/self/maps", buf, sizeof(buf)) <= 0)
+        return false;
+    for (char *line = buf; *line;) {
+        char *next = strchr(line, '\n');
+        if (next)
+            *next = '\0';
+        unsigned long long lo, hi;
+        if (sscanf(line, "%llx-%llx", &lo, &hi) == 2 &&
+            (uintptr_t) address >= lo && (uintptr_t) address < hi)
+            return strstr(line, name) != NULL;
+        if (!next)
+            break;
+        line = next + 1;
+    }
+    return false;
+}
+
+static void test_maps_split_names(void)
+{
+    TEST("procfs: split file names follow rename and fixed replacement");
+    const size_t span = 65536;
+    char first[] = "/tmp/elfuse-maps-first-XXXXXX";
+    char second[] = "/tmp/elfuse-maps-second-XXXXXX";
+    char renamed[sizeof(first) + 8];
+    int fd = mkstemp(first), other = mkstemp(second);
+    unsigned char *p = MAP_FAILED;
+    bool ok = fd >= 0 && other >= 0 && ftruncate(fd, (off_t) (3 * span)) == 0 &&
+              ftruncate(other, (off_t) span) == 0;
+    snprintf(renamed, sizeof(renamed), "%s-moved", first);
+    if (ok)
+        p = mmap(NULL, 3 * span, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    ok = ok && p != MAP_FAILED && mprotect(p + span, span, PROT_READ) == 0;
+    if (fd >= 0)
+        close(fd);
+    const char *first_name = strrchr(first, '/') + 1;
+    const char *moved_name = strrchr(renamed, '/') + 1;
+    const char *other_name = strrchr(second, '/') + 1;
+    ok = ok && maps_name_at(p, first_name) &&
+         maps_name_at(p + span, first_name) &&
+         maps_name_at(p + 2 * span, first_name) &&
+         rename(first, renamed) == 0 && maps_name_at(p, moved_name) &&
+         maps_name_at(p + span, moved_name) &&
+         maps_name_at(p + 2 * span, moved_name);
+    ok = ok &&
+         mmap(p + span, span, PROT_READ, MAP_PRIVATE | MAP_FIXED, other, 0) ==
+             p + span &&
+         maps_name_at(p, moved_name) && maps_name_at(p + span, other_name) &&
+         maps_name_at(p + 2 * span, moved_name);
+    EXPECT_TRUE(ok, "maps retained a stale name or confused neighboring files");
+    if (p != MAP_FAILED)
+        munmap(p, 3 * span);
+    if (other >= 0)
+        close(other);
+    unlink(first);
+    unlink(renamed);
+    unlink(second);
+}
+
 int main(void)
 {
     char buf[4096] __attribute__((aligned(8)));
@@ -499,6 +560,7 @@ int main(void)
     test_rss_changes();
     test_rss_aliases();
     test_rss_subpage_holes();
+    test_maps_split_names();
 
     SUMMARY("test-procfs");
     return fails > 0 ? 1 : 0;
