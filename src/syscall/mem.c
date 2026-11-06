@@ -914,9 +914,33 @@ int guest_memory_residency(const guest_t *g,
     return 0;
 }
 
-/* Reused only within one mmap-locked process snapshot. A hole in the guest
- * layout need not split the host region; query its full residency once.
+/* Host resident bytes this process carries besides the guest's own pages, and
+ * whether a reading has been taken. GUEST_RSS_APPROX subtracts it from the host
+ * task residency; measured over a 512 MiB allocation the difference stayed a
+ * constant 17.5 MiB while guest RSS moved from 0.5 MiB to 525 MiB, so what
+ * remains tracks guest pages. The baseline is read once, before the guest maps
+ * any of its own memory, so elfuse's code, its shim, and the Mach slabs are all
+ * that it contains.
+ *
+ * Reached only with mmap_lock held, which is what makes the single baseline
+ * safe without another lock.
  */
+static uint64_t rss_host_baseline_bytes;
+static bool rss_host_baseline_valid;
+
+/* Resident bytes of the whole host task. One task_info call, independent of how
+ * many regions the guest has mapped.
+ */
+static uint64_t rss_host_resident_bytes(void)
+{
+    struct mach_task_basic_info info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t) &info,
+                  &count) != KERN_SUCCESS)
+        return 0;
+    return (uint64_t) info.resident_size;
+}
+
 typedef struct {
     mach_vm_address_t address;
     mach_vm_size_t size;
@@ -1024,8 +1048,45 @@ int guest_memory_resident_pages(const guest_t *g,
     return memory_resident_pages(g, gpa, len, NULL, pages_out);
 }
 
-/* Resident guest pages across every tracked process VMA, plus the byte size of
- * those VMAs. Caller holds mmap_lock.
+/* Bytes of guest VMA space, without any residency query: the same sum the exact
+ * walk accumulates, so the approximate path still reports an exact VmSize.
+ */
+static uint64_t mapped_vsize_bytes(const guest_t *g)
+{
+    uint64_t vsize = 0;
+    for (int i = 0; i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (!guest_range_hits_infra(g, r->start, r->end))
+            vsize += r->end - r->start;
+    }
+    return vsize;
+}
+
+void guest_memory_rss_baseline_capture(void)
+{
+    rss_host_baseline_bytes = rss_host_resident_bytes();
+    rss_host_baseline_valid = true;
+}
+
+/* Guest residency from the host task's resident size minus the baseline taken
+ * before the guest mapped anything. The result is a gauge rather than an
+ * accounting ledger: it includes whatever elfuse itself touched since the
+ * baseline, and it cannot separate a guest hole from the rest of a resident
+ * host page. Linux keeps exact per-mm counters because it handles the faults;
+ * elfuse sees none, so the exact walk is the only way to reach that precision.
+ */
+static uint64_t guest_mapped_resident_pages_approx(const guest_t *g)
+{
+    uint64_t host = rss_host_resident_bytes();
+    uint64_t guest_bytes =
+        host > rss_host_baseline_bytes ? host - rss_host_baseline_bytes : 0;
+    uint64_t pages = guest_bytes / GUEST_PAGE_SIZE;
+    uint64_t limit = mapped_vsize_bytes(g) / GUEST_PAGE_SIZE;
+    return pages < limit ? pages : limit;
+}
+
+/* Exact resident guest pages across every tracked process VMA, plus the byte
+ * size of those VMAs. Caller holds mmap_lock.
  *
  * regions[] is sorted by guest address and an mprotect split leaves adjacent
  * records with contiguous backing. One query covers each such run. A hole, an
@@ -1034,11 +1095,10 @@ int guest_memory_resident_pages(const guest_t *g,
  *
  * Returns 0 or a negative Linux errno. On failure neither output is written.
  */
-int guest_memory_mapped_resident_pages(const guest_t *g,
+static int mapped_resident_pages_exact(const guest_t *g,
                                        uint64_t *vsize_out,
                                        uint64_t *pages_out)
 {
-    assert(mmap_lock_held());
     uint64_t vsize = 0;
     uint64_t resident = 0;
     uint64_t span_gpa = 0;
@@ -1081,6 +1141,19 @@ int guest_memory_mapped_resident_pages(const guest_t *g,
     *vsize_out = vsize;
     *pages_out = resident;
     return 0;
+}
+
+int guest_memory_mapped_resident_pages(const guest_t *g,
+                                       uint64_t *vsize_out,
+                                       uint64_t *pages_out)
+{
+    assert(mmap_lock_held());
+    if (g->rss_mode == GUEST_RSS_APPROX) {
+        *vsize_out = mapped_vsize_bytes(g);
+        *pages_out = guest_mapped_resident_pages_approx(g);
+        return 0;
+    }
+    return mapped_resident_pages_exact(g, vsize_out, pages_out);
 }
 
 /* Host-page span of one live piece of the primary slab. gpa is the offset from

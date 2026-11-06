@@ -80,6 +80,11 @@ typedef struct {
      */
     uint32_t memory_mode;
 
+    /* guest_rss_mode_t the child passes to guest_init_from_snapshot, so a
+     * forked child reports residency the same way its parent does.
+     */
+    uint32_t rss_mode;
+
     /* Guest rlimit table (sys.h), indexed by Linux resource number. The child
      * restores it after installing inherited FDs so descriptors above a lowered
      * NOFILE soft limit survive fork.

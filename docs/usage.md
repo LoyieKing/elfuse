@@ -19,6 +19,7 @@ Supported user-facing options:
 | `-t`, `--timeout N` | Guest execution watchdog, in seconds (default `10`, `0` disables) |
 | `--cpus N` | Guest logical CPUs, from `1` to the host online CPU count (also `ELFUSE_CPUS=N`; the flag wins) |
 | `--memory-mode=lazy\|eager` | Private anonymous backing policy (default `lazy`); `--memory-mode MODE` also works |
+| `--rss=approx\|exact` | How `/proc` reports resident pages (default `approx`); `--rss MODE` also works |
 | `--sysroot PATH` | Resolve guest absolute paths under `PATH`, falling back to the host for paths it does not hold |
 | `--create-sysroot PATH` | Provision a case-sensitive APFS sparsebundle mounted at `PATH`, then use it as the sysroot |
 | `--no-rosetta` | Disable the x86_64-via-Rosetta translator (also `ELFUSE_NO_ROSETTA=1`) |
@@ -67,6 +68,24 @@ Lazy mode releases anonymous backing and retains zero-fill semantics. Aligned
 private file mappings use host CoW demand paging; unaligned host-page edges
 use a byte snapshot. `mincore` and guest RSS query backing residency at host
 page granularity. Shared-file coherence keeps its existing behavior.
+
+`--rss=approx`, the default, reports `VmRSS` and the stat `rss` field from the
+host task's resident size minus the amount elfuse itself held at bring-up. One
+`task_info` call serves every read regardless of address-space size; on a guest
+with 4,096 fragmented mappings a read measured 0.23 ms against 5.8 ms for the
+exact walk. It is a gauge, not an accounting ledger: the value follows guest
+allocations, discards and unmaps, and it can sit a few megabytes above the
+exact figure because it also counts whatever elfuse touched after bring-up. It
+cannot separate a guest hole from the rest of a resident host page, so it
+reports host granularity rather than guest-page granularity.
+
+`--rss=exact` walks the backing store per host region, which classifies every
+guest page, matches Linux's per-process counters, and keeps `VmRSS` exact
+through `PROT_NONE`, sub-page holes and shared aliases. Its cost grows with the
+guest's address space: 35 ms per read on Douyin's 2,758 host regions. Tests that
+assert exact residency run with `--rss exact`; the default keeps the cheap
+reading for application workloads that sample `/proc` about once a second.
+Fork inherits the mode and exec preserves it.
 
 ## Guest Identity, Working Directory, And Environment
 

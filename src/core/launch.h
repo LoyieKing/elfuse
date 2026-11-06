@@ -89,6 +89,11 @@ typedef struct {
      * (GUEST_MEMORY_LAZY) is the default.
      */
     guest_memory_mode_t memory_mode;
+
+    /* How /proc reports resident pages. Zero (GUEST_RSS_APPROX) is the default;
+     * the exact walk is what the RSS conformance tests assert.
+     */
+    guest_rss_mode_t rss_mode;
 } launch_args_t;
 
 /* Diagnostic for rejecting --gdb on an x86_64 (Rosetta) guest, shared by

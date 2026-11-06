@@ -102,6 +102,24 @@ static int parse_memory_mode_arg(const char *s, guest_memory_mode_t *out)
     return -1;
 }
 
+/* --rss takes exact or approx, selecting how /proc reports resident pages.
+ * Approximate is the default: it reads the host task's residency in one trap,
+ * where the exact walk costs one Mach region query per host region and grows
+ * with the guest's address space.
+ */
+static int parse_rss_mode_arg(const char *s, guest_rss_mode_t *out)
+{
+    if (!strcmp(s, "exact")) {
+        *out = GUEST_RSS_EXACT;
+        return 0;
+    }
+    if (!strcmp(s, "approx")) {
+        *out = GUEST_RSS_APPROX;
+        return 0;
+    }
+    return -1;
+}
+
 static int resolve_guest_elf_host_path(const char *elf_guest_path,
                                        char *elf_host_path,
                                        size_t elf_host_path_sz,
@@ -230,12 +248,13 @@ static int host_dc_zva_assert(void)
  * 80 columns. Sharing one body keeps the flag list from drifting between them
  * (one copy had already lost the --gdb flags).
  */
-#define ELFUSE_USAGE_BODY(sep)                                                 \
-    "usage: elfuse [--verbose] [--timeout N] [--cpus N] [--memory-mode MODE] " \
-    "[--sysroot PATH]" sep                                                     \
-    "[--create-sysroot PATH] [--no-rosetta] [--fakeroot] [--gdb PORT]" sep     \
-    "[--gdb-stop-on-entry] [--user UID[:GID]] [--workdir DIR]" sep             \
-    "[--env KEY=VALUE] [--clear-env] <elf-path> [args...]"
+#define ELFUSE_USAGE_BODY(sep)                                    \
+    "usage: elfuse [--verbose] [--timeout N] [--cpus N]" sep      \
+    "[--memory-mode MODE] [--rss MODE]" sep                       \
+    "[--sysroot PATH] [--create-sysroot PATH] [--no-rosetta]" sep \
+    "[--fakeroot] [--gdb PORT] [--gdb-stop-on-entry]" sep         \
+    "[--user UID[:GID]] [--workdir DIR] [--env KEY=VALUE]" sep    \
+    "[--clear-env] <elf-path> [args...]"
 
 #define ELFUSE_USAGE ELFUSE_USAGE_BODY(" ")
 #define ELFUSE_USAGE_WRAPPED ELFUSE_USAGE_BODY("\n              ")
@@ -259,6 +278,7 @@ int main(int argc, char **argv)
 
     bool verbose = false;
     guest_memory_mode_t memory_mode = GUEST_MEMORY_LAZY;
+    guest_rss_mode_t rss_mode = GUEST_RSS_APPROX;
 
     /* x86_64-via-Rosetta is on by default; --no-rosetta or ELFUSE_NO_ROSETTA=1
      * disables it. Architecture is auto-detected from the ELF header in
@@ -340,6 +360,8 @@ int main(int argc, char **argv)
                 "at least 1, at most 4)\n"
                 "  --memory-mode MODE      Guest memory reset: lazy discards "
                 "pages, eager zeroes\n"
+                "  --rss MODE              /proc residency: approx reads the "
+                "host task, exact walks the backing\n"
                 "  --sysroot PATH          Resolve absolute guest paths under "
                 "PATH first\n"
                 "  --create-sysroot PATH   Provision and use a case-sensitive "
@@ -420,6 +442,25 @@ int main(int argc, char **argv)
                 log_error(
                     "invalid --memory-mode value: '%s' (want lazy or eager)",
                     value);
+                goto cleanup;
+            }
+            arg_start += inline_value ? 1 : 2;
+        } else if (!strcmp(argv[arg_start], "--rss") ||
+                   !strncmp(argv[arg_start], "--rss=", 6)) {
+            bool inline_value = argv[arg_start][5] == '=';
+            const char *value = NULL;
+            if (inline_value)
+                value = argv[arg_start] + 6;
+            else if (arg_start + 1 < argc)
+                value = argv[arg_start + 1];
+            if (!value) {
+                log_error(
+                    "invalid --rss: missing value (want exact or approx)");
+                goto cleanup;
+            }
+            if (parse_rss_mode_arg(value, &rss_mode) < 0) {
+                log_error("invalid --rss value: '%s' (want exact or approx)",
+                          value);
                 goto cleanup;
             }
             arg_start += inline_value ? 1 : 2;
@@ -852,6 +893,7 @@ int main(int argc, char **argv)
         .timeout_sec = timeout_sec,
         .verbose = verbose,
         .memory_mode = memory_mode,
+        .rss_mode = rss_mode,
     };
 
     /* Ownership of the temp unlink transfers here (contract in launch.h); drop

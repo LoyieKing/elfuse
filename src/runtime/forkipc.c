@@ -207,6 +207,15 @@ int fork_child_main(int ipc_fd,
         return 1;
     }
 
+    /* Same reasoning: the child reports /proc residency the way its parent was
+     * configured to.
+     */
+    if (hdr.rss_mode > GUEST_RSS_EXACT) {
+        log_error("fork-child: invalid rss_mode %u", (unsigned) hdr.rss_mode);
+        close(ipc_fd);
+        return 1;
+    }
+
     /* Create guest memory before receiving state so all incoming offsets can be
      * bounds-checked against the negotiated guest size. The parent's live slab
      * objects arrive as one packed copy-on-write entry in the first registered
@@ -260,7 +269,8 @@ int fork_child_main(int ipc_fd,
     free(spans);
     if (!slab ||
         guest_init_from_snapshot(&g, slab, hdr.guest_size, hdr.ipa_bits,
-                                 (guest_memory_mode_t) hdr.memory_mode) < 0) {
+                                 (guest_memory_mode_t) hdr.memory_mode,
+                                 (guest_rss_mode_t) hdr.rss_mode) < 0) {
         log_error("fork-child: cannot map the parent's slab");
         close(ipc_fd);
         return 1;
@@ -1351,6 +1361,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
             flags & (LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID),
         .ctid_gva = ctid_gva,
         .memory_mode = (uint32_t) g->memory_mode,
+        .rss_mode = (uint32_t) g->rss_mode,
     };
     sched_task_get_attr(current_thread, &hdr.sched_attr);
     (void) sched_task_get_affinity(current_thread, hdr.cpu_affinity,

@@ -32,6 +32,7 @@
 #include "syscall/linux-wire.h"
 #include "syscall/fuse.h"
 #include "syscall/internal.h"
+#include "syscall/mem.h"
 #include "syscall/path.h"
 #include "syscall/proc.h"
 #include "syscall/signal.h"
@@ -372,6 +373,7 @@ int guest_bootstrap_prepare(guest_t *g,
                             size_t shim_bin_len,
                             bool verbose,
                             guest_memory_mode_t memory_mode,
+                            guest_rss_mode_t rss_mode,
                             bool *guest_initialized,
                             guest_bootstrap_t *boot)
 {
@@ -419,7 +421,7 @@ int guest_bootstrap_prepare(guest_t *g,
      */
     uint32_t req_ipa = want_rosetta ? 48 : 0;
     t0 = startup_trace_now_ns();
-    if (guest_init(g, 0, req_ipa, memory_mode) < 0) {
+    if (guest_init(g, 0, req_ipa, memory_mode, rss_mode) < 0) {
         log_error("failed to initialize guest");
         return -1;
     }
@@ -815,6 +817,16 @@ int guest_bootstrap_create_vcpu(guest_t *g,
      * does not redundantly broadcast on top of that.
      */
     tlbi_request_clear();
+
+    /* GUEST_RSS_APPROX reports host residency minus the amount elfuse itself
+     * holds. Capture that here: the VM, the slab, the page tables, and the
+     * loaded image all exist, and no guest instruction has run, so everything
+     * resident now is elfuse's rather than the guest's. Capturing earlier would
+     * count the image as guest memory forever; capturing later would count
+     * whatever the guest touched in between as baseline and lose it.
+     */
+    if (g->rss_mode == GUEST_RSS_APPROX)
+        guest_memory_rss_baseline_capture();
 
     return 0;
 }

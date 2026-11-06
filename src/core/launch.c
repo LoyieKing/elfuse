@@ -119,7 +119,7 @@ int elfuse_launch(const launch_args_t *args)
                                 elf_guest_path, args->sysroot, args->guest_argc,
                                 args->guest_argv, envp_use, shim_bin,
                                 shim_bin_len, args->verbose, args->memory_mode,
-                                &guest_initialized, &boot) < 0)
+                                args->rss_mode, &guest_initialized, &boot) < 0)
         goto fail;
 
     /* A FUSE-materialized temp has been loaded; drop it once the guest has its

@@ -439,7 +439,8 @@ static void tlbi_range_probe_run(void)
 int guest_init(guest_t *g,
                uint64_t size,
                uint32_t ipa_bits,
-               guest_memory_mode_t memory_mode)
+               guest_memory_mode_t memory_mode,
+               guest_rss_mode_t rss_mode)
 {
     uint64_t t0;
 
@@ -447,6 +448,7 @@ int guest_init(guest_t *g,
 
     memset(g, 0, sizeof(*g));
     g->memory_mode = memory_mode;
+    g->rss_mode = rss_mode;
     g->ipa_base = GUEST_IPA_BASE;
     g->elf_load_min = ELF_DEFAULT_BASE;
     g->brk_base = BRK_BASE_DEFAULT;
@@ -548,10 +550,9 @@ int guest_init(guest_t *g,
         /* Reserve primary address space via mmap(MAP_ANON). macOS demand-pages
          * this so an unused 1 TiB reservation costs no physical memory. Do NOT
          * memset because that would touch every page and defeat demand paging.
-         * Anonymous private memory is also what lets fork hand the child a
-         * lazy copy-on-write view of each live object
-         * (guest_memory_snapshot_entry); a shared file backing would make
-         * that copy eager.
+         * Anonymous private memory is also what lets fork hand the child a lazy
+         * copy-on-write view of each live object (guest_memory_snapshot_entry);
+         * a shared file backing would make that copy eager.
          */
         t0 = startup_trace_now_ns();
         g->host_base = mmap(NULL, try_size, PROT_READ | PROT_WRITE,
@@ -595,12 +596,14 @@ int guest_init_from_snapshot(guest_t *g,
                              void *host_base,
                              uint64_t size,
                              uint32_t ipa_bits,
-                             guest_memory_mode_t memory_mode)
+                             guest_memory_mode_t memory_mode,
+                             guest_rss_mode_t rss_mode)
 {
     uint64_t t0;
 
     memset(g, 0, sizeof(*g));
     g->memory_mode = memory_mode;
+    g->rss_mode = rss_mode;
     g->ipa_base = GUEST_IPA_BASE;
     g->elf_load_min = ELF_DEFAULT_BASE;
     g->brk_base = BRK_BASE_DEFAULT;

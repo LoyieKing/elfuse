@@ -853,13 +853,21 @@ run_unit_tests()
     test_check "$runner" "test-proc" "0 failed" "$bindir/test-proc"
     test_check "$runner" "test-sysfs-cpu" "0 failed" "$bindir/test-sysfs-cpu"
     test_check "$runner" "test-path-fold" "0 failed" "$bindir/test-path-fold"
-    test_rc "$runner" "test-procfs" 0 "$bindir/test-procfs"
+    # The RSS conformance assertions separate guest holes from resident host
+    # pages, which only the exact walk can do. --rss is an elfuse option; the
+    # qemu lane runs a real kernel, where this is exact by construction.
+    if [ "$runner" = "run_elfuse" ]; then
+        test_rc "$runner" "test-procfs" 0 --rss exact "$bindir/test-procfs"
+    else
+        test_rc "$runner" "test-procfs" 0 "$bindir/test-procfs"
+    fi
     test_rc "$runner" "test-procfs-exec" 0 "$bindir/test-procfs-exec"
     test_rc "$runner" "test-proc-limits" 0 "$bindir/test-proc-limits"
     test_rc "$runner" "test-proc-limits-fakeroot" 0 --fakeroot \
         "$bindir/test-proc-limits"
     test_rc "$runner" "test-proc-fidelity" 0 "$bindir/test-proc-fidelity"
     test_rc "$runner" "test-proc-smap" 0 "$bindir/test-proc-smap"
+    test_rc "$runner" "test-rss-mode" 0 "$bindir/test-rss-mode"
 
     printf "\nNetwork\n"
     test_check "$runner" "test-net" "0 failed" "$bindir/test-net"

@@ -58,17 +58,17 @@ check()
     report_pass "$desc"
 }
 
-# check_missing_value <desc> <flag>
+# check_missing_value <desc> <flag> [expected fragment]
 #   check appends the guest path, which a bare value-taking flag would consume.
 #   This lane invokes elfuse with nothing after the flag so the parser's
 #   missing-value arm is the one under test.
 check_missing_value()
 {
-    local desc="$1" flag="$2"
+    local desc="$1" flag="$2" expect="${3:-invalid --memory-mode}"
     local out status=0
     out="$("$ELFUSE" "$flag" 2>&1)" || status=$?
     if [ "$status" -eq 0 ] \
-        || ! printf '%s' "$out" | grep -qF "invalid --memory-mode"; then
+        || ! printf '%s' "$out" | grep -qF "$expect"; then
         report_fail "$desc (exit $status, want a rejection naming the flag)"
         printf '%s\n' "$out" >&2
         return
@@ -120,6 +120,18 @@ check reject "--memory-mode space-separated unknown value" \
     "invalid --memory-mode" --memory-mode bogus
 check reject "--memory-mode uppercase value" "invalid --memory-mode" \
     --memory-mode=LAZY
+
+# --rss selects how /proc reports residency. Both spellings must parse in both
+# modes and every other value must be refused before the guest runs; which value
+# each mode actually reports is tests/test-rss-mode.c's job.
+check accept "--rss=exact" '' --rss=exact
+check accept "--rss=approx" '' --rss=approx
+check accept "--rss exact" '' --rss exact
+check accept "--rss approx" '' --rss approx
+check_missing_value "--rss without a value" --rss "invalid --rss"
+check reject "--rss empty value" "invalid --rss" --rss=
+check reject "--rss unknown value" "invalid --rss" --rss=bogus
+check reject "--rss uppercase value" "invalid --rss" --rss=EXACT
 
 check reject "--env with an empty variable name" "empty variable name" \
     --env =VAL

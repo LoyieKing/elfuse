@@ -1770,6 +1770,15 @@ dirty counters remain estimates. `smaps_rollup` is not implemented.
 Whole host regions use Mach resident counts. Partial regions use bounded
 `mincore` batches and charge only the guest pages inside the requested range.
 
+That is the `--rss exact` path, and it is the only one that separates a guest
+hole from the rest of a resident host page. The default `--rss approx` reads the
+host task's resident size once and subtracts the amount elfuse held when
+bring-up finished, before any guest instruction ran. Both the aggregate and the
+per-region counters still come from the exact walk: a reading that has no host
+task to measure, such as one region of another process, is not derived from the
+approximate total. Fork carries the mode in the IPC header and exec preserves
+it, so a hierarchy reports residency one way.
+
 Synthetic proc directories have explicit snapshot boundaries. The backing
 trees reached by opening `/proc`, `/proc/self`, or `/proc/<pid>` are
 materialized once, on the first access, and hold empty entries named `stat`,

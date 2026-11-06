@@ -41,6 +41,7 @@ int guest_bootstrap_prepare(guest_t *g,
                             size_t shim_bin_len,
                             bool verbose,
                             guest_memory_mode_t memory_mode,
+                            guest_rss_mode_t rss_mode,
                             bool *guest_initialized,
                             guest_bootstrap_t *boot);
 

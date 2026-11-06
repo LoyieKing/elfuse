@@ -429,12 +429,27 @@ typedef enum {
     GUEST_MEMORY_EAGER = 1,
 } guest_memory_mode_t;
 
+/* How /proc reports resident pages. EXACT walks the backing store per host
+ * region, which is what Linux's per-mm counters amount to from outside: every
+ * guest page is classified, including holes inside a resident host page. APPROX
+ * reads the host task's resident size instead, which costs one trap regardless
+ * of address-space size but counts elfuse's own pages and cannot separate guest
+ * holes from resident host pages. APPROX is the default because guests read RSS
+ * about once a second and the walk measured 35 ms against a 19.6 GiB address
+ * space; EXACT is what the RSS conformance tests assert.
+ */
+typedef enum {
+    GUEST_RSS_APPROX = 0,
+    GUEST_RSS_EXACT = 1,
+} guest_rss_mode_t;
+
 /* Guest state. */
 typedef struct {
     void *host_base;     /* Host pointer to allocated guest memory */
     uint64_t guest_size; /* Total size (determined by IPA capacity) */
     uint64_t ipa_base;   /* IPA base for hv_vm_map (GUEST_IPA_BASE) */
     guest_memory_mode_t memory_mode; /* Policy for retiring ranges to zero */
+    guest_rss_mode_t rss_mode;       /* How /proc reports resident pages */
     bool vfork_shared_vm; /* Live parent backing until successful exec. */
 
     uint64_t mmap_limit; /* Max mmap address (computed from guest_size) */
@@ -843,13 +858,14 @@ static inline bool guest_addr_in_infra(const guest_t *g, uint64_t addr)
 /* Allocate guest memory, create VM, map to hypervisor. size: primary buffer
  * size (0 = auto-detect from IPA capacity). ipa_bits: IPA width for HVF VM (0 =
  * auto-detect). memory_mode: policy stored in g->memory_mode for every range
- * retired to zero.
+ * retired to zero. rss_mode: how /proc reports resident pages.
  * Returns 0 on success, -1 on failure.
  */
 int guest_init(guest_t *g,
                uint64_t size,
                uint32_t ipa_bits,
-               guest_memory_mode_t memory_mode);
+               guest_memory_mode_t memory_mode,
+               guest_rss_mode_t rss_mode);
 
 /* Initialize a fork child's guest around host_base. The caller has already
  * built that mapping: a zero reservation of the parent's slab size, with each
@@ -863,7 +879,8 @@ int guest_init_from_snapshot(guest_t *g,
                              void *host_base,
                              uint64_t size,
                              uint32_t ipa_bits,
-                             guest_memory_mode_t memory_mode);
+                             guest_memory_mode_t memory_mode,
+                             guest_rss_mode_t rss_mode);
 
 /* Tear down VM and free guest memory. The caller has already destroyed every
  * vCPU, which is what launch_destroy_guest in core/launch.h does before calling

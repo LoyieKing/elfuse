@@ -47,6 +47,15 @@ int guest_memory_resident_pages(const guest_t *g,
                                 uint64_t len,
                                 uint64_t *pages_out);
 
+/* Record the host task's current resident bytes as the amount GUEST_RSS_APPROX
+ * subtracts, so later readings describe guest pages rather than the whole
+ * elfuse process. Called once during bring-up, before the guest maps its own
+ * memory: taking it later would count guest pages as part of the baseline and
+ * drive the reported value toward zero. Without a successful call the
+ * approximate mode reports no resident pages rather than a fabricated figure.
+ */
+void guest_memory_rss_baseline_capture(void);
+
 /* Count resident guest pages over every process VMA, coalescing only contiguous
  * backing. Also returns that VMA byte size. Caller holds mmap_lock.
  *
