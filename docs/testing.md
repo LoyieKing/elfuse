@@ -873,7 +873,10 @@ Wait, stopped-tracee and fork-barrier cases retain exit status 42.
 `make test-memory-mode` runs private zero fill, fixed replacement, discard,
 fork isolation and concurrent reset under both policies. `make
 test-memory-residency` checks untouched, written, discarded and `PROT_NONE`
-backing through `mincore`. `make test-mmap-private` checks private file writes,
+backing through `mincore`; its elfuse target additionally requires immediate
+`MADV_FREE` reclamation. The portable invocation accepts retained or zeroed
+bytes and checks neighboring pages and subsequent writes. `make test-mmap-private`
+checks private file writes,
 host-page edges, fork (including mappings beyond EOF), initial `PROT_NONE`, EOF
 tails, ELF segment replacement across EOF and mremap under both policies. It
 also checks retained EOF-page SIGBUS delivery after replacement, fork and

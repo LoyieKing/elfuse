@@ -261,6 +261,11 @@ Shared anonymous mappings retain their object contents on `MADV_DONTNEED`;
 overlay teardown precedes any private slab reset. Fork clones inherit the
 policy and reset their own backing. Exec resets tracked `PROT_NONE` ranges too,
 since permission revocation does not imply that the pages were never written.
+`MADV_FREE` validates private anonymous mappings, then uses the same reset as
+`MADV_DONTNEED`. Immediate reclamation is permitted: a subsequent read may
+return zero, and a subsequent write must persist. Lazy mode releases fully
+covered host pages; partial host-page edges are zeroed without disturbing
+neighboring guest pages.
 
 Writable file-backed `MAP_SHARED` overlays occupy whole host pages. Non-fixed
 placement checks that rounded extent, including a strong address hint, before

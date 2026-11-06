@@ -151,6 +151,49 @@ static void test_fresh_fill_discard(void)
     munmap(p, WINDOW_LEN);
 }
 
+static void test_free_reclaim(bool require_reclaim)
+{
+    unsigned char *p = aligned_window();
+
+    TEST("MADV_FREE preserves neighboring guest pages");
+    if (!p) {
+        FAIL("mmap");
+        return;
+    }
+    touch_pages(p, WINDOW_LEN);
+    if (madvise(p + page_size, WINDOW_LEN - 2 * page_size, MADV_FREE) != 0) {
+        FAIL("MADV_FREE");
+        munmap(p, WINDOW_LEN);
+        return;
+    }
+    if (require_reclaim) {
+        unsigned char vec[WINDOW_PAGES];
+        bool released = mincore(p, WINDOW_LEN, vec) == 0;
+        for (size_t i = HOST_BLOCK / page_size;
+             released && i < (WINDOW_LEN - HOST_BLOCK) / page_size; i++) {
+            if (vec[i] & 1)
+                released = false;
+        }
+        EXPECT_TRUE(released, "MADV_FREE retained complete host pages");
+        TEST("MADV_FREE keeps partial host-page neighbors");
+    }
+    bool intact = true;
+    for (size_t i = 0; i < WINDOW_LEN; i++) {
+        unsigned char old = (unsigned char) (0x40 + (i & 0x3f));
+        bool discarded = i >= page_size && i < WINDOW_LEN - page_size;
+        if (p[i] != old && !(discarded && p[i] == 0)) {
+            intact = false;
+            break;
+        }
+    }
+    EXPECT_TRUE(intact, "MADV_FREE corrupted retained or discarded bytes");
+
+    TEST("writes after full-page MADV_FREE persist");
+    touch_pages(p, WINDOW_LEN);
+    EXPECT_TRUE(touch_matches(p, WINDOW_LEN), "write after discard was lost");
+    munmap(p, WINDOW_LEN);
+}
+
 /* Revoking permission does not discard the backing. The guest still owns the
  * bytes, and mincore keeps reporting them until a reset runs.
  */
@@ -248,7 +291,7 @@ static void test_invalid_vec_reports_efault(void)
     munmap(p, WINDOW_LEN);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     long host_page = sysconf(_SC_PAGESIZE);
 
@@ -265,6 +308,7 @@ int main(void)
 
     printf("test-memory-residency: mincore over a 16 KiB aligned window\n");
     test_fresh_fill_discard();
+    test_free_reclaim(argc == 2 && !strcmp(argv[1], "--free-reclaim"));
     test_prot_none_keeps_pages();
     test_hole_reports_enomem();
     test_invalid_vec_reports_efault();

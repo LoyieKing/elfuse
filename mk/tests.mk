@@ -1276,7 +1276,7 @@ test-memory-mode: $(ELFUSE_BIN) $(TEST_DIR)/test-memory-mode
 	@$(ELFUSE_BIN) --memory-mode=eager $(TEST_DIR)/test-memory-mode
 
 test-memory-residency: $(ELFUSE_BIN) $(TEST_DIR)/test-memory-residency
-	@$(ELFUSE_BIN) --memory-mode=lazy $(TEST_DIR)/test-memory-residency
+	@$(ELFUSE_BIN) --memory-mode=lazy $(TEST_DIR)/test-memory-residency --free-reclaim
 
 test-mmap-private: $(ELFUSE_BIN) $(TEST_DIR)/test-mmap-private
 	@$(ELFUSE_BIN) --memory-mode=lazy $(TEST_DIR)/test-mmap-private

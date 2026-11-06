@@ -931,9 +931,9 @@ int guest_memory_resident_pages(const guest_t *g,
         natural_t depth = 0;
         vm_region_submap_info_data_64_t info;
         mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
-        kern_return_t kr = mach_vm_region_recurse(
-            mach_task_self(), &address, &size, &depth,
-            (vm_region_recurse_info_t) &info, &count);
+        kern_return_t kr =
+            mach_vm_region_recurse(mach_task_self(), &address, &size, &depth,
+                                   (vm_region_recurse_info_t) &info, &count);
         if (kr != KERN_SUCCESS || address > (mach_vm_address_t) host ||
             (mach_vm_address_t) host - address >= size || info.is_submap)
             return -LINUX_ENOMEM;
@@ -5120,22 +5120,22 @@ int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
         return covered ? 0 : -LINUX_ENOMEM;
     }
 
+    case LINUX_MADV_FREE:
     case LINUX_MADV_DONTNEED: {
-        /* MADV_DONTNEED: zero anon pages so next access sees zero-fill, restore
-         * file-backed pages from the current backing file contents. Linux
-         * returns -ENOMEM if any part of the range is unmapped.
-         *
-         * Writable MAP_SHARED file-backed regions are preserved so elfuse does
-         * not overwrite unsynced in-memory writes with backing-file contents.
-         * Read-only MAP_SHARED mappings can be invalidated safely and should
-         * refault from the current file image.
-         *
-         * PROT_NONE anonymous regions still get zeroed so the guest's next
-         * mprotect-and-read sees zero-fill (Linux semantics: pages are
-         * detached, faulted in lazily as zero on re-grant).
+        /* Private anonymous pages may be reclaimed immediately by MADV_FREE.
+         * Both advices release whole host pages and preserve live edge bytes.
          */
         if (!madvise_range_mapped(g, off, length))
             return -LINUX_ENOMEM;
+        if (advice == LINUX_MADV_FREE) {
+            uint64_t end = off + length;
+            for (int i = guest_region_first_end_above(g, off);
+                 i < g->nregions && g->regions[i].start < end; i++) {
+                const guest_region_t *r = &g->regions[i];
+                if (!(r->flags & LINUX_MAP_ANONYMOUS) || r->shared)
+                    return -LINUX_EINVAL;
+            }
+        }
 
         uint64_t end = off + length;
         for (int i = guest_region_first_end_above(g, off); i < g->nregions;
@@ -5203,31 +5203,6 @@ int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
                 if (err < 0)
                     return err;
             }
-        }
-        return 0;
-    }
-
-    case LINUX_MADV_FREE: {
-        /* MADV_FREE: only valid for private anonymous mappings. Linux returns
-         * -EINVAL for any non-anonymous vma (vma_is_anonymous check), even if
-         * the region is tracked without a live backing fd. Subsequent reads may
-         * legally return either old data or zero, so a no-op satisfies the spec
-         * for the anon case.
-         */
-        if (!madvise_range_mapped(g, off, length))
-            return -LINUX_ENOMEM;
-
-        uint64_t end = off + length;
-        for (int i = guest_region_first_end_above(g, off); i < g->nregions;
-             i++) {
-            const guest_region_t *r = &g->regions[i];
-            if (r->start >= end)
-                break;
-            if (r->end <= off)
-                continue;
-            if (!(r->flags & LINUX_MAP_ANONYMOUS) ||
-                (r->flags & LINUX_MAP_SHARED))
-                return -LINUX_EINVAL;
         }
         return 0;
     }
