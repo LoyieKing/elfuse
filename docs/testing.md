@@ -916,10 +916,22 @@ is 15.253/15.960 ms; `maps` and `smaps` have no demonstrated improvement.
 Two 90-second original APK runs remain alive and present 4,362/5,869 frames.
 Steady stat open CPU averages 38.498/37.371 ms across 136/112 sampled opens.
 Different content and window sizes prevent a playback-performance comparison.
-The global mapping lock still covers the scan. The arm64 matrix reports
-331 passes, one `test-file-ops` failure and 10 skips. A standalone rerun and
-five alternating baseline/current pairs pass all 19 file-operation cases;
-the matrix failure remains unexplained.
+The global mapping lock still covers the scan. The arm64 matrix after RSS reuse
+reports 331 passes, one `test-file-ops` failure and 10 skips. Standalone runs
+pass, but a dense in-process loop reproduces the UTIME_NOW/UTIME_OMIT check:
+atime becomes current time instead of retaining 1000000000. A native macOS
+fixture also reproduces this with explicit timestamps and no selector values;
+the Linux fixture passes 10,000 iterations. Root-authorized `fs_usage` captures
+CorpLinkExtension opening and reading the failing file in the same window as
+the atime mutation. External access is the supported explanation; the trace
+does not establish that the timestamp syscall itself is wrong. The syscall and
+assertion remain unchanged; security services are not stopped or reconfigured.
+
+The combined-change arm64 matrix reports 331 passes, one `test-futex-pi`
+failure and 10 skips; `test-file-ops` passes. The PI check completes 1,633 of
+2,000 acquisitions within its 10-second deadline while filesystem tracing is
+active. Without tracing, current and pre-pathname binaries both pass all seven
+PI checks. This does not convert the matrix run into a passing result.
 
 Maps and smaps reuse file names across consecutive pieces of one logical VMA.
 Protection splits duplicate descriptors but preserve the VMA ID; each new
