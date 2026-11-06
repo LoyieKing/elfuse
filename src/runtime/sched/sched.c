@@ -365,16 +365,6 @@ static int pick_cpu_locked(thread_entry_t *t)
     if (task_eff_class(t) == SCHED_CLASS_FAIR)
         return find_fair_target_cpu_locked(t);
 
-    /* Unplaced RT and DEADLINE work starts on CPU 0 and stays there (see
-     * task_migratable). CPU 0 is the worker the host gives interactive
-     * priority, so a guest thread that asked to run above everything else
-     * runs on the worker least likely to be descheduled behind another app.
-     */
-    if (affinity_allows(t, 0)) {
-        TS(t)->placement_cpu = 0;
-        return 0;
-    }
-
     int best = -1;
     int best_load = 0;
     uint64_t best_weight = UINT64_MAX;
@@ -1152,16 +1142,8 @@ static int enqueue_ready_locked(thread_entry_t *t,
         a->timer = true;
         return 0;
     }
-    /* RT and DEADLINE tasks belong on CPU 0, the worker the host runs at an
-     * interactive class, and stay there (task_migratable keeps them from being
-     * stolen). Deciding it here rather than only when the policy changes is
-     * what moves a thread that blocked on CPU 1 and woke up RT.
-     */
-    if (task_eff_class(t) != SCHED_CLASS_FAIR && s->placement_cpu != 0 &&
-        affinity_allows(t, 0))
-        s->placement_cpu = 0;
-
     int cpu_index = s->placement_cpu;
+
 
     if (cpu_index < 0 || cpu_index >= sched_ncpu ||
         !affinity_allows(t, cpu_index))
@@ -1524,21 +1506,11 @@ static thread_entry_t *pick_locked(sched_cpu_state_t *cpu,
     return next;
 }
 
-/* Whether @t may leave the CPU it was placed on, for load balancing. A guest
- * that asked for RT or DEADLINE scheduling loses that priority the moment it
- * is stolen to a CPU whose worker the host scheduler treats as less important,
- * so such tasks stay where they were placed. Fair tasks still migrate freely.
- */
-static bool task_migratable(const thread_entry_t *t)
-{
-    return task_eff_class(t) == SCHED_CLASS_FAIR;
-}
-
 static bool steal_affinity_allows(const sched_tree_node_t *node, void *arg)
 {
     const thread_entry_t *t = task_from_node((sched_tree_node_t *) node);
     int cpu = *(const int *) arg;
-    return affinity_allows(t, cpu) && task_migratable(t) &&
+    return affinity_allows(t, cpu) &&
            atomic_load_explicit(&CTS(t)->stop_reasons, memory_order_relaxed) ==
                0;
 }
@@ -3469,20 +3441,6 @@ static int apply_base_attrs_locked(thread_entry_t *t,
 
     s->attrs_initialized = true;
     recompute_effective_locked(t);
-
-    /* A thread that becomes RT or DEADLINE after it was placed moves to CPU 0,
-     * which is the worker the host runs at an interactive class. Without this a
-     * thread placed while still fair would keep that CPU and the placement rule
-     * in pick_cpu_locked would never apply to it. Affinity still wins: a task
-     * that excluded CPU 0 stays where it is.
-     */
-    if (task_eff_class(t) != SCHED_CLASS_FAIR && s->placement_cpu != 0 &&
-        affinity_allows(t, 0)) {
-        s->placement_cpu = 0;
-        if (was_running && cpu_index != 0 && !sched_frozen)
-            cpu_need_resched_locked(&sched_cpus[cpu_index], cpu_index, a);
-    }
-
     profile_change_finish_locked(t, old_class, old_weight, was_queued,
                                  was_running, cpu_index, now, a);
     if (was_queued && old_class == SCHED_CLASS_RT &&

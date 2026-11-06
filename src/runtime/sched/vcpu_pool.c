@@ -1479,25 +1479,11 @@ static void slot_destroy_vcpu_owner(struct vcpu_slot *slot)
         mach_port_deallocate(mach_task_self(), port);
 }
 
-/* Host scheduling class for a vCPU worker. Worker 0 carries the guest's
- * highest-priority runnable work: the scheduler places RT and DEADLINE tasks
- * there and keeps them from being load-balanced away (sched.c). Asking the host
- * for an interactive class on that worker is what makes that placement mean
- * anything, since every other worker stays at the default class.
- *
- * A guest that runs no RT or DEADLINE task sees no difference: the class only
- * orders this process against other work on the machine.
- */
-static qos_class_t worker_qos_class(int index)
-{
-    return index == 0 ? QOS_CLASS_USER_INTERACTIVE : QOS_CLASS_USER_INITIATED;
-}
-
 static void *pool_worker_main(void *arg)
 {
     struct vcpu_slot *slot = (struct vcpu_slot *) arg;
 
-    pthread_set_qos_class_self_np(worker_qos_class(slot->index), 0);
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
 
     if (!pool_cfg_valid || configure_slot_vcpu(slot) != 0) {
         log_error("vcpu_pool: worker %d failed to create vCPU", slot->index);
@@ -1750,7 +1736,7 @@ int vcpu_pool_run_main(int timeout_sec)
         atomic_load_explicit(&slot->current, memory_order_acquire);
     int last_exit = 0;
 
-    pthread_set_qos_class_self_np(worker_qos_class(0), 0);
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
 
     if (main_t && slot->vcpu_live) {
         int exit_code = 0;

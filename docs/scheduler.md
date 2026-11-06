@@ -110,15 +110,6 @@ PRIO_PGRP and PRIO_USER sweeps enumerate local tasks; task-directed remote
 attribute operations use control IPC. Host QoS does not guarantee physical
 CPU placement or hard real-time latency.
 
-Logical CPU 0 is the one the host is asked to treat as interactive: its worker
-runs at an interactive QoS class while the others keep the default class. RT and
-DEADLINE tasks are placed there and are not load balanced away, because a guest
-that asked to run above everything else would otherwise lose that precedence the
-first time the balancer moved it to a worker the host schedules as ordinary
-work. Fair tasks still migrate freely, and affinity still wins: a task whose
-affinity excludes CPU 0 stays where it is. A guest that creates no RT or
-DEADLINE task sees no difference.
-
 Common fork/exec/wait behavior and supported pthread exec remain required.
 Exec with independent live users of the same address space is rejected before
 replacing that address space. Exact Linux de_thread/ptrace corner cases and

@@ -181,35 +181,6 @@ static void *worker_main(void *arg)
     return NULL;
 }
 
-typedef struct {
-    int cpu;
-    int became_rt;
-} rt_probe_t;
-
-static void *rt_probe_thread(void *arg)
-{
-    rt_probe_t *probe = arg;
-
-    /* Run long enough to be placed and possibly stolen as a fair thread. */
-    for (volatile int i = 0; i < 200000; i++) {
-    }
-
-    struct sched_param sp;
-    memset(&sp, 0, sizeof(sp));
-    sp.sched_priority = 12;
-    if (sched_setscheduler(0, SCHED_FIFO, &sp) != 0)
-        return NULL;
-    probe->became_rt = 1;
-
-    /* The placement rule applies at enqueue, so yield once to be requeued. */
-    sched_yield();
-    probe->cpu = sched_getcpu();
-
-    sp.sched_priority = 0;
-    (void) sched_setscheduler(0, SCHED_OTHER, &sp);
-    return NULL;
-}
-
 int main(void)
 {
     long base_priority = get_nice();
@@ -584,32 +555,6 @@ int main(void)
             else
                 EXPECT_RAW_ERRNO(other, -EPERM,
                                  "unprivileged IDLE exit was not EPERM");
-        }
-    }
-
-    /* An RT task belongs on CPU 0, which is the worker the host runs at an
-     * interactive scheduling class, and load balancing must not move it away.
-     * The thread is spawned first and becomes RT from inside, which is what a
-     * guest does: a thread placed while still fair would otherwise keep that
-     * CPU, because only enqueue consults the class.
-     */
-    TEST("a thread that becomes RT moves to CPU 0");
-    {
-        pthread_t rt;
-        rt_probe_t probe = {0};
-        int rc = pthread_create(&rt, NULL, rt_probe_thread, &probe);
-        if (rc != 0) {
-            FAIL("pthread_create");
-        } else {
-            pthread_join(rt, NULL);
-            if (!probe.became_rt) {
-                /* An unprivileged guest without RLIMIT_RTPRIO cannot enter RT
-                 * at all, so there is no placement to check. */
-                PASS();
-            } else {
-                EXPECT_EQ(probe.cpu, 0,
-                          "thread that became RT was not on CPU 0");
-            }
         }
     }
 
