@@ -95,6 +95,10 @@ signal and teardown compete for one completion. Stopped or exiting tasks do
 not become eligible merely because a wait completes. Syscall-specific partial
 results, restart rules and absolute deadlines survive suspension.
 
+Futex completion retires the old waiter, guest pointer and bucket charge before
+publishing READY. The remounted task can immediately arm another wait; cleanup
+after READY would race that publication and clear the new wait's metadata.
+
 Fork freezes address-space access and waits for admitted guest writes and
 execution to reach a consistent boundary. The child starts with one task,
 inherited scheduling attributes and fresh CPU accounting. Shared mappings

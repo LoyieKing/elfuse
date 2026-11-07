@@ -74,6 +74,7 @@ NATIVE_TESTS := tests/bench-fd-create-host.c \
                 tests/test-elf-headers-host.c \
                 tests/test-sched-placement-host.c \
                 tests/test-fork-quiesce-host.c \
+                tests/test-futex-rearm-host.c \
                 tests/test-gdbstub-host.c \
                 tests/test-gtk-native-host.c
 SPECIAL_TEST_SRCS := tests/test-lowbase-mem.c

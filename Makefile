@@ -269,6 +269,13 @@ $(BUILD_DIR)/test-fork-quiesce-host: tests/test-fork-quiesce-host.c \
 	$(Q)$(CC) $(CFLAGS) -Isrc -Itests -o $@ $< \
 		$(filter-out $(BUILD_DIR)/main.o $(BUILD_DIR)/runtime/sched/vcpu_pool.o $(BUILD_DIR)/runtime/forkipc.o,$(OBJS)) $(HVF_LDFLAGS)
 
+$(BUILD_DIR)/test-futex-rearm-host: tests/test-futex-rearm-host.c \
+        src/runtime/futex.c tests/test-harness.h \
+        $(filter-out $(BUILD_DIR)/main.o $(BUILD_DIR)/runtime/futex.o,$(OBJS)) | $(BUILD_DIR)
+	@echo "  CC      $<"
+	$(Q)$(CC) $(CFLAGS) -Isrc -Itests -I$(BUILD_DIR) -o $@ $< \
+		$(filter-out $(BUILD_DIR)/main.o $(BUILD_DIR)/runtime/futex.o,$(OBJS)) $(HVF_LDFLAGS)
+
 
 ## Build the buffered GDB session host regression
 $(BUILD_DIR)/test-gdbstub-host: $(BUILD_DIR)/test-gdbstub-host.o \

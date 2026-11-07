@@ -252,7 +252,7 @@ CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
         test-tlbi-encoder-host \
         test-vcpu-run-hooks-host test-identity-override-host \
         test-sched-fair-host test-sched-placement-host test-fork-quiesce-host \
-        test-profile-host \
+        test-profile-host test-futex-rearm-host \
         test-stdio-nonblock-host \
         test-rlimit-unchanged-host test-casefold-host \
         test-casefold-walk-host test-absock-names-host \
@@ -273,6 +273,7 @@ $(call run-host-unit,test-sched-fair-host,fair scheduler math unit test)
 $(call run-host-unit,test-sched-placement-host,scheduler CPU placement and stealing)
 $(call run-host-unit,test-profile-host,profile lifecycle and continuation accounting)
 $(call run-host-unit,test-fork-quiesce-host,fork and backing-pause ordering)
+$(call run-host-unit,test-futex-rearm-host,futex completion and immediate rearm)
 $(call run-host-unit,test-casefold-host,filename codec unit test)
 $(call run-host-unit,test-casefold-walk-host,case-exact path resolution unit test)
 $(call run-host-unit,test-absock-names-host,absock derived-name unit test)

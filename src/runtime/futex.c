@@ -608,25 +608,18 @@ static void futex_async_finish_bookkeeping_locked(thread_entry_t *t,
     if (!t)
         return;
 
-    /* Prefer the waiter's pub_bucket: FUTEX_REQUEUE rewrites it when it moves
-     * the charge. t->async_futex_pub_bucket is only the entry charge and would
-     * wrap the vacated bucket if used after a requeue (test-futex-requeue-
-     * account).
-     */
+    /* Requeue moves the charge; the task only remembers its entry bucket. */
     unsigned pub = w ? w->pub_bucket : t->async_futex_pub_bucket;
 
+    /* Retire before publishing READY. A remounted owner may arm its next wait
+     * without taking futex_lifetime_mutex.
+     */
     if (exec_park_waiter_load(t) == w) {
         exec_park_waiter_store(t, NULL);
         t->park_guest = NULL;
         t->async_futex_pub_bucket = 0;
         t->async_futex_timed = false;
     }
-
-    /* If remount already published a different waiter, leave thread fields
-     * alone and still free @w / drop its bucket charge below. Snapshot @g was
-     * taken from the park that owned @w (caller must snapshot before
-     * try_complete when racing remount is possible; flush/cancel do).
-     */
 
     if (w) {
         /* A wake that did not hand the lock off leaves the waiter on the PI
@@ -745,12 +738,13 @@ static void futex_async_wake_flush(void)
                 futex_pi_owner_tid(cur) != e->waiter_tid)
                 need_retry = true;
         }
-        bool ok = need_retry ? sched_park_try_complete_reissue_seq(
-                                   owner, PARK_KIND_FUTEX, e->park_seq)
-                             : sched_park_try_complete_seq(
-                                   owner, PARK_KIND_FUTEX, e->park_seq, 0);
-        if (ok)
-            futex_async_finish_bookkeeping_locked(owner, w, e->park_guest);
+        futex_async_finish_bookkeeping_locked(owner, w, e->park_guest);
+        if (need_retry)
+            (void) sched_park_try_complete_reissue_seq(owner, PARK_KIND_FUTEX,
+                                                       e->park_seq);
+        else
+            (void) sched_park_try_complete_seq(owner, PARK_KIND_FUTEX,
+                                               e->park_seq, 0);
         pthread_mutex_unlock(&futex_lifetime_mutex);
     }
 }
@@ -2896,8 +2890,8 @@ static void futex_async_cancel_seq_locked(thread_entry_t *t,
 
     futex_waiter_t *w_done = w;
     guest_t *g_done = t->park_guest;
-    if (sched_park_try_complete_seq(t, PARK_KIND_FUTEX, seq, result))
-        futex_async_finish_bookkeeping_locked(t, w_done, g_done);
+    futex_async_finish_bookkeeping_locked(t, w_done, g_done);
+    (void) sched_park_try_complete_seq(t, PARK_KIND_FUTEX, seq, result);
 }
 
 static void futex_async_cancel_seq(thread_entry_t *t,
@@ -3073,9 +3067,10 @@ void futex_park_on_deadline(thread_entry_t *t)
                         if (w->is_pi)
                             pthread_mutex_unlock(&futex_pi_mutex);
                         guest_t *g_done = t->park_guest;
-                        if (!woken && sched_park_try_complete_reissue_seq(
-                                          t, PARK_KIND_FUTEX, seq)) {
+                        if (!woken) {
                             futex_async_finish_bookkeeping_locked(t, w, g_done);
+                            (void) sched_park_try_complete_reissue_seq(
+                                t, PARK_KIND_FUTEX, seq);
                         }
                         pthread_mutex_unlock(&futex_lifetime_mutex);
                         return;

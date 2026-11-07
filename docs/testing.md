@@ -868,6 +868,25 @@ all owners. The existing pipe-bulk performance ceilings remain unchanged.
 CPU exits the group; scheduler shutdown must release its condition wait.
 Wait, stopped-tracee and fork-barrier cases retain exit status 42.
 
+`test-futex-rearm-host` schedules an immediate second wait at the old waiter's
+retirement boundary. Both wake and signal completions must leave the second
+wait reachable: a wake count of one must make its task runnable. The test uses
+the real futex and scheduler paths without creating an HVF VM.
+
+The rearm regression passes both wake and signal cases. The affected guest
+checks pass requeue races (6), timeout ordering (16), PI (7), parked-task reuse
+(2), and shared aliases (4). The original APK displays feed video and danmaku
+and returns from login; its later PlayerCommon surface-size exception is a
+separate failure. The arm64 matrix reports 332 passes, one PI throughput
+failure and ten skips. `make check` passes its 112 driver entries and host
+units, then exceeds the harness deadline during a guardrail retry. The
+standalone static and dynamic-glibc guardrail passes. Whole-tree commentflow
+does not pass; the changed C files pass both formatters.
+The PI retry still fails its contention-count target (1,024/2,000), while a
+same-flags pre-fix futex build reaches only 340/2,000. Neither reports a failed
+lock acquisition. The contention-count lane remains failed; the rearm fix does
+not establish a throughput improvement.
+
 ## Anonymous backing policies
 
 `make test-memory-mode` runs private zero fill, fixed replacement, discard,
