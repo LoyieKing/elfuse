@@ -1273,3 +1273,22 @@ front end that need no image. The self-hosted `oci-smoke` job runs it
 at the start of its lane; see [oci-images.md](oci-images.md#validation) for the
 lane's coverage and [usage.md](usage.md#running-the-smoke-lane-locally) for the
 command.
+
+## Process-wide Watchdog Termination
+
+`make test-vcpu-watchdog` covers a spinner with a parked sibling, with either
+the leader or worker spinning on one guest CPU. Both cases terminate the
+process with status 124 before the harness deadline. A blocked syscall remains
+outside the execution watchdog, and `--timeout 0` leaves the spinner running.
+
+A real ART/GLES probe reads back a red pbuffer pixel before spinning in native
+code. The baseline reports TIMEOUT but leaves the process, GLES socket and
+GLProcessPipe alive beyond eight seconds. The corrected process exits 124 in
+2.9 seconds; the bridge retains only its listener. Normal cleanup still passes
+24 thread exits and 25 explicit EGL thread releases with red pixel readback.
+
+The full `make check` driver reports 111 passes and one POSIX timer starvation
+failure. The arm64 matrix reports 331 passes, two failures (`test-poll` and
+PI futex contention throughput), and ten skips. Neither gate passes. Changed
+files pass commentflow and clang-format 22.1.8; the full formatting gate stops
+at commentflow differences outside those files.

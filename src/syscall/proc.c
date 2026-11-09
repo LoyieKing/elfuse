@@ -6048,6 +6048,11 @@ static proc_leave_t run_loop_core(hv_vcpu_t vcpu,
 
             crash_report(vcpu, g, CRASH_TIMEOUT, NULL);
             exit_code = 124;
+
+            /* A host timeout cannot run guest TLS destructors. End the process
+             * so shared descriptors cannot outlive the abandoned task.
+             */
+            proc_exit_group_broadcast(exit_code, (exit_code & 0xff) << 8);
             leave = PROC_LEAVE_EXIT;
             break;
         }

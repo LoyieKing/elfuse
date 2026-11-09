@@ -430,6 +430,10 @@ $(BUILD_DIR)/%: tests/%.c | $(BUILD_DIR)
 	@echo "  CROSS   $<"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $<
 
+$(BUILD_DIR)/spin-thread: tests/spin-thread.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
 # Static glibc timer functions need librt and its pthread dependency.
 $(BUILD_DIR)/test-posix-timers: tests/test-posix-timers.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lrt -lpthread)"

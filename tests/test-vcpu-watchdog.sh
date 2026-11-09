@@ -46,31 +46,30 @@ skip=0
 # watchdog regression.
 require_timeout
 
-# The two guest fixtures are built from tests/ in a source checkout and are
-# simply absent from a prebuilt binary tree, which the makefile cannot compile
-# them into. Absent reads as a suite skip, the same answer require_timeout gives
-# for a missing timeout(1), rather than as a watchdog regression.
-for fixture in spin-forever test-sleep-long; do
+# The guest fixtures are built from tests/ in a source checkout and are simply
+# absent from a prebuilt binary tree, which the makefile cannot compile them
+# into. Absent reads as a suite skip, the same answer require_timeout gives for
+# a missing timeout(1), rather than as a watchdog regression.
+for fixture in spin-forever test-sleep-long spin-thread; do
     if [ ! -x "$BINDIR/$fixture" ]; then
         printf 'vCPU watchdog: %s is not in %s; skipping\n' "$fixture" "$BINDIR"
         exit 77
     fi
 done
 
-# 1. A spinning guest is killed, and the message says why. Under timeout,
-# because a broken watchdog means this guest never exits: the lane has to fail,
-# not hang. The cap is well past the two ticks detection needs, so it only fires
-# when the watchdog did not.
+# The outer cap bounds a broken watchdog; exit status and elapsed time must
+# distinguish that cap from the process's own timeout.
 test_host_busy_mark
 start=$(date +%s)
+rc=0
 out="$("$TIMEOUT" $((PERIOD * 5)) "$ELFUSE" --timeout "$PERIOD" \
-    "$BINDIR/spin-forever" 2>&1 || true)"
+    "$BINDIR/spin-forever" 2>&1)" || rc=$?
 elapsed=$(($(date +%s) - start))
 
-if printf '%s' "$out" | grep -q "timed out after ${PERIOD}s"; then
+if [ "$rc" -eq 124 ] && [ "$elapsed" -lt $((PERIOD * 5)) ]; then
     report_pass "spinning guest is killed (${elapsed}s)"
 else
-    report_fail "spinning guest is killed (no timeout reported)"
+    report_fail "spinning guest is killed (rc=$rc, ${elapsed}s)"
     printf '%s\n' "$out" >&2
 fi
 
@@ -134,6 +133,23 @@ if [ "$rc" -eq 124 ]; then
 else
     report_fail "--timeout 0 disables the watchdog (elfuse exited rc=$rc)"
 fi
+
+# A timeout of either the leader or a scheduled worker ends the whole process.
+# The outer cap also returns 124, so require completion before that cap with a
+# parked sibling that cannot exit on its own.
+for spinner in leader worker; do
+    rc=0
+    start=$(date +%s)
+    out="$("$TIMEOUT" $((PERIOD * 5)) "$ELFUSE" --cpus 1 --timeout "$PERIOD" \
+        "$BINDIR/spin-thread" "$spinner" 2>&1)" || rc=$?
+    elapsed=$(($(date +%s) - start))
+    if [ "$rc" -eq 124 ] && [ "$elapsed" -lt $((PERIOD * 5)) ]; then
+        report_pass "$spinner timeout terminates parked sibling (${elapsed}s)"
+    else
+        report_fail "$spinner timeout leaves process alive (rc=$rc, ${elapsed}s)"
+        printf '%s\n' "$out" >&2
+    fi
+done
 
 report_summary
 [ "$fail" -eq 0 ] || exit 1

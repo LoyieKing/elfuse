@@ -56,8 +56,10 @@ absolute path is rejected at startup rather than ignored.
 
 `--timeout` watches guest execution without exception progress across scheduler
 preemption. Detection takes up to two periods; a blocked syscall does not count
-as stalled execution. It does not cap total process runtime. Setting
-`--timeout 0` disables the watchdog for long-running CPU-bound guests.
+as stalled execution. A timeout terminates the entire guest process with status
+124, including runnable and parked sibling threads. It does not cap total
+process runtime. Setting `--timeout 0` disables the watchdog for long-running
+CPU-bound guests.
 
 `--memory-mode=lazy` releases whole host pages on private anonymous discard,
 unmap and exec reset. Fresh anonymous allocations remain zero-fill-on-demand.

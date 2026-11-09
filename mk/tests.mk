@@ -2171,7 +2171,7 @@ test-gva-contracts: $(BUILD_DIR)/test-gva-contracts
 # tests of their own.
 VCPU_WATCHDOG_DEPS := $(ELFUSE_BIN)
 ifndef GUEST_TEST_BINARIES
-  VCPU_WATCHDOG_DEPS += $(TEST_DIR)/spin-forever $(TEST_DIR)/test-sleep-long
+  VCPU_WATCHDOG_DEPS += $(TEST_DIR)/spin-forever $(TEST_DIR)/test-sleep-long $(TEST_DIR)/spin-thread
 endif
 
 ## Verify the vCPU watchdog still kills a wedged guest and spares a blocked one
