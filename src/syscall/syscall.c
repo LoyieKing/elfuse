@@ -43,6 +43,7 @@
 #include "debug/log.h"
 #include "utils.h"
 
+#include "runtime/procemu.h"
 #include "runtime/forkipc.h"
 #include "runtime/futex.h"
 #include "runtime/thread.h"
@@ -514,8 +515,10 @@ static void sc_sync_fdtable_inline(void)
         pthread_mutex_lock(&fd_lock);
         int t = fd_table[i].type;
         int duped = -1;
-        if (t == FD_REGULAR || t == FD_DIR)
+        if (t == FD_REGULAR || t == FD_DIR) {
+            proc_synthetic_disown(fd_table[i].host_fd);
             duped = dup(fd_table[i].host_fd);
+        }
         pthread_mutex_unlock(&fd_lock);
         if (duped < 0)
             continue;
@@ -565,6 +568,7 @@ static int64_t sc_sync_impl(guest_t *g)
         int t = fd_table[i].type;
         if (t != FD_REGULAR && t != FD_DIR)
             continue;
+        proc_synthetic_disown(fd_table[i].host_fd);
         int duped = dup(fd_table[i].host_fd);
         if (duped < 0)
             continue;

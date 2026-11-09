@@ -1334,7 +1334,7 @@ int64_t sys_close(int fd)
         proc_pty_forget_host_fd(host_fd);
         if (chown_overlay_close_may_drop())
             chown_overlay_clear_closed_unlinked_fd(host_fd);
-        if (close(host_fd) < 0)
+        if (!proc_synthetic_release(host_fd) && close(host_fd) < 0)
             return linux_errno();
         return 0;
     }
@@ -1587,7 +1587,8 @@ static int duplicate_guest_fd(int src_fd,
             dir_stream_release(ds);
         } else {
             proc_pty_forget_host_fd(new_host_fd);
-            close(new_host_fd);
+            if (!proc_synthetic_release(new_host_fd))
+                close(new_host_fd);
         }
         if (pidfd_pinned)
             pidfd_unpin(src_snap.ofd_id);

@@ -34,6 +34,7 @@
 #include "proved/slice.h"
 
 #include "runtime/thread.h"
+#include "runtime/procemu.h"
 #include "runtime/sched/vcpu_pool.h"
 #include "syscall/linux-wire.h"
 #include "syscall/fuse.h"
@@ -1836,6 +1837,7 @@ static int64_t sys_mmap_high_va(guest_t *g,
                 goto fail;
             }
         }
+        proc_synthetic_disown(host_backing_fd);
         track_backing_fd = dup(host_backing_fd);
         if (track_backing_fd < 0) {
             ret = -LINUX_ENOMEM;
@@ -3822,6 +3824,7 @@ int64_t sys_mmap(guest_t *g,
             }
         }
         if (!is_anon) {
+            proc_synthetic_disown(host_backing_fd);
             fresh.track_backing_fd = dup(host_backing_fd);
             if (fresh.track_backing_fd < 0) {
                 mmap_fresh_dispose(&fresh);
@@ -4173,6 +4176,7 @@ int64_t sys_mmap(guest_t *g,
             return -LINUX_ENOMEM;
         }
         if (!is_anon) {
+            proc_synthetic_disown(host_backing_fd);
             fresh.track_backing_fd = dup(host_backing_fd);
             if (fresh.track_backing_fd < 0) {
                 mmap_fresh_dispose(&fresh);

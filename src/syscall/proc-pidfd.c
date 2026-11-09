@@ -20,6 +20,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include "runtime/procemu.h"
 #include "utils.h"
 
 #include "core/guest.h"
@@ -1133,6 +1134,7 @@ static void getfd_serve_one(int target_fd, const char *reply_path)
     if (RANGE_CHECK(target_fd, 0, FD_TABLE_SIZE) &&
         fd_table[target_fd].type != FD_CLOSED &&
         fd_table[target_fd].host_fd >= 0) {
+        proc_synthetic_disown(fd_table[target_fd].host_fd);
         host_dup = dup(fd_table[target_fd].host_fd);
         if (host_dup < 0)
             err =

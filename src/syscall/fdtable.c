@@ -1116,6 +1116,17 @@ int fd_host_ref_acquire(int guest_fd,
     }
 }
 
+/* Last reference to a host descriptor this table owned. A synthetic /proc file
+ * with no other vnode reference stays open for the next proc_synthetic_fd.
+ */
+static void close_owned_host_fd(int host_fd)
+{
+    if (host_fd < 0)
+        return;
+    if (!proc_synthetic_release(host_fd))
+        close(host_fd);
+}
+
 void fd_lifetime_release(fd_lifetime_t *lifetime)
 {
     /* Release so every use this thread made of the object happens before the
@@ -1142,7 +1153,7 @@ void fd_lifetime_release(fd_lifetime_t *lifetime)
     if (lifetime->dir)
         dir_stream_release(lifetime->dir);
     else if (lifetime->type != FD_STDIO)
-        close(lifetime->host_fd);
+        close_owned_host_fd(lifetime->host_fd);
     free(lifetime);
 }
 
@@ -1174,7 +1185,7 @@ void fd_retire_published(int fd, int host_fd)
 {
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE)) {
         if (host_fd >= 0)
-            close(host_fd);
+            close_owned_host_fd(host_fd);
         return;
     }
 
@@ -1190,7 +1201,7 @@ void fd_retire_published(int fd, int host_fd)
     if (lifetime)
         fd_lifetime_release(lifetime);
     else if (still_ours && host_fd >= 0)
-        close(host_fd);
+        close_owned_host_fd(host_fd);
 }
 
 /* Snapshot an fd entry under fd_lock.
@@ -1256,6 +1267,8 @@ int fd_snapshot_and_dup_or_share_dir(int guest_fd,
         host = out->host_fd;
     } else {
         host = (out->host_fd >= 0) ? dup(out->host_fd) : -1;
+        if (host >= 0)
+            proc_synthetic_note_alias(out->host_fd, host);
     }
     pthread_mutex_unlock(&fd_lock);
     return host;
@@ -1449,6 +1462,7 @@ int fd_to_host_dup(int guest_fd)
         pthread_mutex_unlock(&fd_lock);
         return -1;
     }
+    proc_synthetic_disown(fd_table[guest_fd].host_fd);
     int owned = dup(fd_table[guest_fd].host_fd);
     pthread_mutex_unlock(&fd_lock);
     return owned;
@@ -1508,7 +1522,7 @@ void fd_cleanup_entry(int guest_fd, const fd_entry_t *snap)
     if (snap->lifetime)
         fd_lifetime_release(snap->lifetime);
     else if (!stream_owns_host_fd && snap->type != FD_STDIO)
-        close(snap->host_fd);
+        close_owned_host_fd(snap->host_fd);
 
     /* Last: the slot's own reference on the stream, and with it the descriptor
      * when no getdents64 or pin still holds one.

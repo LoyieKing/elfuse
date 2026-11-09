@@ -273,6 +273,7 @@ int fork_ipc_send_fd_table(int ipc_sock)
         if (t == FD_PIDFD)
             pidfd_fork_snapshot_locked(fd_table[i].ofd_id,
                                        &fd_entries[num_fds].pidfd);
+        proc_synthetic_disown(host_fd);
         host_fds_to_send[num_fds] = host_fd;
         host_fd_pins[num_fds] = pin;
         num_fds++;

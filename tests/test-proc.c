@@ -16,6 +16,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -655,6 +656,90 @@ int main(void)
         if (rand_fd >= 0)
             close(rand_fd);
         EXPECT_TRUE(ok, "writable device open regression");
+    }
+
+    TEST("synthetic proc reuse dup and fork");
+    {
+        int ok = 1;
+        struct stat mem_st = {0};
+        struct stat cmd_st = {0};
+        int mem = open("/proc/meminfo", O_RDONLY);
+        if (mem < 0 || fstat(mem, &mem_st) != 0 || mem_st.st_size < 64)
+            ok = 0;
+        if (mem >= 0)
+            close(mem);
+
+        int cmd = open("/proc/self/cmdline", O_RDONLY);
+        char first[256];
+        ssize_t first_n = -1;
+        if (cmd < 0 || fstat(cmd, &cmd_st) != 0 ||
+            cmd_st.st_size <= 0 || cmd_st.st_size >= (off_t) sizeof(first) ||
+            cmd_st.st_size >= mem_st.st_size) {
+            ok = 0;
+        } else {
+            first_n = read(cmd, first, sizeof(first));
+            if (first_n != cmd_st.st_size)
+                ok = 0;
+        }
+
+        int alias = cmd >= 0 ? dup(cmd) : -1;
+        if (cmd >= 0)
+            close(cmd);
+        if (alias < 0) {
+            ok = 0;
+        } else {
+            char again[256];
+            if (lseek(alias, 0, SEEK_SET) != 0 ||
+                read(alias, again, sizeof(again)) != first_n ||
+                memcmp(again, first, (size_t) first_n) != 0)
+                ok = 0;
+            close(alias);
+        }
+
+        int reused = open("/proc/self/cmdline", O_RDONLY);
+        struct stat reused_st;
+        if (reused < 0 || fstat(reused, &reused_st) != 0 ||
+            reused_st.st_size != cmd_st.st_size)
+            ok = 0;
+        if (reused >= 0)
+            close(reused);
+
+        int held = open("/proc/self/cmdline", O_RDONLY);
+        int pipefd[2];
+        if (held < 0 || pipe(pipefd) != 0) {
+            ok = 0;
+            if (held >= 0)
+                close(held);
+        } else {
+            pid_t child = fork();
+            if (child < 0) {
+                ok = 0;
+                close(held);
+                close(pipefd[0]);
+                close(pipefd[1]);
+            } else if (child == 0) {
+                char got[256];
+                char go = 0;
+                close(pipefd[1]);
+                if (read(pipefd[0], &go, 1) != 1 ||
+                    lseek(held, 0, SEEK_SET) != 0 ||
+                    read(held, got, sizeof(got)) != first_n ||
+                    memcmp(got, first, (size_t) first_n) != 0)
+                    _exit(2);
+                _exit(0);
+            } else {
+                close(pipefd[0]);
+                close(held);
+                if (write(pipefd[1], "x", 1) != 1)
+                    ok = 0;
+                close(pipefd[1]);
+                int status = 0;
+                if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+                    WEXITSTATUS(status) != 0)
+                    ok = 0;
+            }
+        }
+        EXPECT_TRUE(ok, "synthetic proc fd changed across reuse, dup, or fork");
     }
 
     SUMMARY("test-proc");

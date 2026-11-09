@@ -704,15 +704,159 @@ const char *proc_get_shm_dir(void)
     return shm_dir_path();
 }
 
+/* Live synthetic files eligible to return to proc_syn_pool. A descriptor leaves
+ * the set when another process receives it (fork IPC, SCM_RIGHTS, pidfd_getfd)
+ * or when sync(2) dups it: that vnode must be closed, not rewritten.
+ */
+#define PROC_SYN_TRACK_MAX 128
+#define PROC_SYN_POOL_MAX 32
+
+typedef struct {
+    int fd;
+    dev_t dev;
+    ino_t ino;
+} proc_syn_track_t;
+
+static proc_syn_track_t proc_syn_tracked[PROC_SYN_TRACK_MAX];
+static int proc_syn_tracked_n;
+static int proc_syn_pool[PROC_SYN_POOL_MAX];
+static int proc_syn_pool_n;
+static pthread_mutex_t proc_syn_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int proc_syn_find_locked(int host_fd)
+{
+    for (int i = 0; i < proc_syn_tracked_n; i++) {
+        if (proc_syn_tracked[i].fd == host_fd)
+            return i;
+    }
+    return -1;
+}
+
+static void proc_syn_track(int host_fd)
+{
+    struct stat st;
+    if (host_fd < 0 || fstat(host_fd, &st) != 0)
+        return;
+    pthread_mutex_lock(&proc_syn_lock);
+    if (proc_syn_find_locked(host_fd) < 0 &&
+        proc_syn_tracked_n < PROC_SYN_TRACK_MAX) {
+        proc_syn_tracked[proc_syn_tracked_n++] = (proc_syn_track_t) {
+            .fd = host_fd, .dev = st.st_dev, .ino = st.st_ino};
+    }
+    pthread_mutex_unlock(&proc_syn_lock);
+}
+
+void proc_synthetic_disown(int host_fd)
+{
+    if (host_fd < 0)
+        return;
+    pthread_mutex_lock(&proc_syn_lock);
+    int i = proc_syn_find_locked(host_fd);
+    if (i >= 0)
+        proc_syn_tracked[i] = proc_syn_tracked[--proc_syn_tracked_n];
+    pthread_mutex_unlock(&proc_syn_lock);
+}
+
+/* @alias_host is a dup of @src_host that stays in this process. Both must be
+ * remembered so closing one does not rewrite the vnode the other still reads.
+ * If the table cannot hold the alias, every name of that vnode is dropped and
+ * the closes use close(2).
+ */
+void proc_synthetic_note_alias(int src_host, int alias_host)
+{
+    if (src_host < 0 || alias_host < 0 || src_host == alias_host)
+        return;
+    pthread_mutex_lock(&proc_syn_lock);
+    int src = proc_syn_find_locked(src_host);
+    if (src >= 0 && proc_syn_find_locked(alias_host) < 0) {
+        if (proc_syn_tracked_n >= PROC_SYN_TRACK_MAX) {
+            dev_t dev = proc_syn_tracked[src].dev;
+            ino_t ino = proc_syn_tracked[src].ino;
+            int w = 0;
+            for (int r = 0; r < proc_syn_tracked_n; r++) {
+                if (proc_syn_tracked[r].dev == dev &&
+                    proc_syn_tracked[r].ino == ino)
+                    continue;
+                proc_syn_tracked[w++] = proc_syn_tracked[r];
+            }
+            proc_syn_tracked_n = w;
+        } else {
+            proc_syn_tracked[proc_syn_tracked_n++] = (proc_syn_track_t) {
+                .fd = alias_host,
+                .dev = proc_syn_tracked[src].dev,
+                .ino = proc_syn_tracked[src].ino};
+        }
+    }
+    pthread_mutex_unlock(&proc_syn_lock);
+}
+
+bool proc_synthetic_release(int host_fd)
+{
+    if (host_fd < 0)
+        return false;
+
+    pthread_mutex_lock(&proc_syn_lock);
+    int i = proc_syn_find_locked(host_fd);
+    if (i < 0) {
+        pthread_mutex_unlock(&proc_syn_lock);
+        return false;
+    }
+    dev_t dev = proc_syn_tracked[i].dev;
+    ino_t ino = proc_syn_tracked[i].ino;
+    proc_syn_tracked[i] = proc_syn_tracked[--proc_syn_tracked_n];
+    for (int j = 0; j < proc_syn_tracked_n; j++) {
+        if (proc_syn_tracked[j].dev == dev && proc_syn_tracked[j].ino == ino) {
+            pthread_mutex_unlock(&proc_syn_lock);
+            return false;
+        }
+    }
+    pthread_mutex_unlock(&proc_syn_lock);
+
+    struct stat st;
+    if (fstat(host_fd, &st) != 0 || st.st_dev != dev || st.st_ino != ino ||
+        !S_ISREG(st.st_mode) || st.st_nlink != 0)
+        return false;
+
+    if (ftruncate(host_fd, 0) != 0 || lseek(host_fd, 0, SEEK_SET) < 0)
+        return false;
+
+    pthread_mutex_lock(&proc_syn_lock);
+    bool kept = false;
+    if (proc_syn_pool_n < PROC_SYN_POOL_MAX) {
+        proc_syn_pool[proc_syn_pool_n++] = host_fd;
+        kept = true;
+    }
+    pthread_mutex_unlock(&proc_syn_lock);
+    return kept;
+}
+
+static int proc_syn_take_pool(void)
+{
+    pthread_mutex_lock(&proc_syn_lock);
+    if (proc_syn_pool_n == 0) {
+        pthread_mutex_unlock(&proc_syn_lock);
+        return -1;
+    }
+    int fd = proc_syn_pool[--proc_syn_pool_n];
+    pthread_mutex_unlock(&proc_syn_lock);
+    if (ftruncate(fd, 0) != 0 || lseek(fd, 0, SEEK_SET) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 /* Create a synthetic file from a buffer.
  *
  * Returns a host fd positioned at the start, or -1 on failure. Caller owns the
- * returned fd. Uses a temp file (unlinked immediately) so that pread/lseek
- * work.
+ * returned fd. The file is an unlinked temporary so pread and lseek work, and
+ * proc_synthetic_release may hand that same descriptor to a later call.
  */
 static int proc_synthetic_fd(const void *data, size_t len)
 {
-    int fd = tmpfile_anon("proc");
+    int fd = proc_syn_take_pool();
+    if (fd < 0)
+        fd = tmpfile_anon("proc");
     if (fd < 0)
         return -1;
 
@@ -727,7 +871,11 @@ static int proc_synthetic_fd(const void *data, size_t len)
         p += n;
         remaining -= n;
     }
-    lseek(fd, 0, SEEK_SET); /* Rewind so first read starts at beginning */
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        close(fd);
+        return -1;
+    }
+    proc_syn_track(fd);
     return fd;
 }
 

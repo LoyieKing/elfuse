@@ -123,6 +123,16 @@ void proc_scratch_note_closed_dir(int host_fd);
  */
 void proc_scratch_note_fork(void);
 
+/* A synthetic /proc file is an unlinked temporary. proc_synthetic_release
+ * keeps the descriptor when this process is its only vnode reference, so the
+ * next synthetic file can rewrite it instead of calling mkstemp. A fork or
+ * SCM_RIGHTS send shares that vnode with another process; proc_synthetic_disown
+ * drops it from the set and the close that follows uses close(2).
+ */
+void proc_synthetic_disown(int host_fd);
+void proc_synthetic_note_alias(int src_host, int alias_host);
+bool proc_synthetic_release(int host_fd);
+
 /* Drop the keepalive slave fd paired with a /dev/ptmx master host fd. Called
  * from fd_cleanup_entry when the guest closes the master so the host kernel
  * eventually tears the tty down. Idempotent and safe to call on any host fd
