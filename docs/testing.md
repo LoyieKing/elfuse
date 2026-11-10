@@ -1254,6 +1254,33 @@ pass 9, 9, 3, 53 and 3 checks. Raw binaries, workloads, measurements and APK
 logs are in the sibling umaru build/reports/elfuse-postapp-shared-5ex_z64i/.
 
 
+## Coalesced Anonymous Discards
+
+MADV_DONTNEED and MADV_FREE merge adjacent private anonymous primary-backing
+ranges before resetting them. Shared mappings, file overlays, gaps and backing
+discontinuities stop the merge. Protection and fork-advice metadata remain
+unchanged. Guest-entry quiescence and stage-2 refresh still cover each reset.
+
+On Apple M4 Pro, five alternating process pairs discard an 8 MiB mapping split
+into 128 alternating read-only/read-write VMAs. Each process executes 500
+discard/refill/check rounds. CPU medians are 568.208 versus 175.984 us per
+round; wall medians are 571.732 versus 177.476 us. Every round checks zero
+bytes in every VMA. This measures split-range discard, not application startup
+or single-VMA churn.
+
+The madvise regression checks zero fill across read-only and PROT_NONE splits,
+preserved shared bytes, untouched edge pages and subsequent writes. It passes
+23 checks under lazy and eager backing. Residency and fork-advice probes pass
+10 and 15 checks; fork quiescence passes three. The unchanged original APK
+displays updating video. Evidence is in the sibling umaru
+build/reports/elfuse-postapp-anon-5q6m0wtr/.
+
+Full make check passes all 112 driver entries and host/shared lanes; its
+throughput guardrail passes after the built-in retry. The arm64 matrix passes
+333 entries with zero failures and ten skips. Single-VMA reset still requires
+guest-entry quiescence; these results do not establish a whole-startup gain.
+
+
 ## Runtime Profile Regression
 
 `make test-profile-host` checks disabled clock behavior, strict numeric

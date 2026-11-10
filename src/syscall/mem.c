@@ -5302,9 +5302,24 @@ int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
                 continue;
             }
             if ((r->flags & LINUX_MAP_ANONYMOUS) && !r->shared) {
+                /* Protection splits share contiguous primary backing. */
+                while (!r->overlay_active && i + 1 < g->nregions &&
+                       zend < end) {
+                    const guest_region_t *next = &g->regions[i + 1];
+                    uint64_t next_end = next->end < end ? next->end : end;
+                    if (next->start != zend ||
+                        !(next->flags & LINUX_MAP_ANONYMOUS) || next->shared ||
+                        next->overlay_active ||
+                        !window_fits(rgpa, next_end - zstart, g->guest_size) ||
+                        next->gpa_base != rgpa + (zend - zstart))
+                        break;
+                    zend = next_end;
+                    ++i;
+                }
                 int err = guest_memory_reset_range(g, rgpa, zend - zstart);
                 if (err < 0)
                     return err;
+                continue;
             } else if (r->flags & LINUX_MAP_ANONYMOUS) {
                 continue;
             } else {

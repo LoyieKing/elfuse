@@ -773,6 +773,39 @@ static void test_oob_address_enomem(void)
                 "expected ENOMEM for address beyond guest space");
 }
 
+static void test_split_anon_discard(void)
+{
+    TEST("anonymous discard spans protection splits and keeps shared bytes");
+    const size_t part = 65536, len = 6 * part;
+    unsigned char *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        FAIL("mmap");
+        return;
+    }
+    memset(p, 0x55, len);
+    bool ok = mprotect(p + part, part, PROT_READ) == 0 &&
+              mprotect(p + 2 * part, part, PROT_NONE) == 0;
+    void *shared = mmap(p + 4 * part, part, PROT_READ | PROT_WRITE,
+                        MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    ok = ok && shared == p + 4 * part;
+    if (ok) {
+        memset(shared, 0x66, part);
+        ok = madvise(p + 4096, len - 8192, MADV_DONTNEED) == 0 &&
+             mprotect(p, len, PROT_READ | PROT_WRITE) == 0;
+        for (size_t i = 0; ok && i < len; i++) {
+            unsigned char want = i >= 4 * part && i < 5 * part ? 0x66
+                                 : i < 4096 || i >= len - 4096 ? 0x55
+                                                               : 0;
+            ok = p[i] == want;
+        }
+        p[part] = 0x77;
+        ok = ok && p[part] == 0x77;
+    }
+    EXPECT_TRUE(ok, "discard lost edge/shared bytes or failed to zero splits");
+    munmap(p, len);
+}
+
 int main(void)
 {
     printf("test-madvise: MADV_DONTNEED and parity tests\n");
@@ -798,6 +831,7 @@ int main(void)
     test_dontneed_shared_file_reload();
     test_free_shared_anon();
     test_oob_address_enomem();
+    test_split_anon_discard();
 
     SUMMARY("test-madvise");
     return fails > 0 ? 1 : 0;

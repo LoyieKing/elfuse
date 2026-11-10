@@ -267,6 +267,12 @@ return zero, and a subsequent write must persist. Lazy mode releases fully
 covered host pages; partial host-page edges are zeroed without disturbing
 neighboring guest pages.
 
+Anonymous discard coalesces adjacent private VMAs when their primary backing
+is contiguous. Protection splits remain separate metadata records; one reset
+reclaims their combined range. Shared mappings, file overlays, VA gaps and
+non-contiguous backing stop the run. Partial host-page edges retain the same
+zeroing rules.
+
 Writable file-backed `MAP_SHARED` overlays occupy whole host pages. Non-fixed
 placement checks that rounded extent, including a strong address hint, before
 choosing a gap. A fixed mapping whose rounded tail intersects another guest
