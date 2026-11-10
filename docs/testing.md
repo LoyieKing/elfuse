@@ -1281,6 +1281,31 @@ throughput guardrail passes after the built-in retry. The arm64 matrix passes
 guest-entry quiescence; these results do not establish a whole-startup gain.
 
 
+## Coalesced Anonymous Unmaps
+
+Unmap coalesces contiguous primary backing of adjacent private anonymous VMAs
+before reclaiming it. Overlay-backed and shared mappings remain separate;
+permissions are revoked before reset and region records are removed afterward.
+The memory-mode regression checks protection splits, untouched neighbors and
+zero-filled fixed reuse under lazy and eager backing.
+
+Five alternating processes per version each unmap 200 protection-split 8 MiB
+ranges with 128 VMAs. Timers cover only unmap; fixed reuse checks zero bytes
+outside the timed interval. CPU medians are 548.358 versus 31.737 us, and wall
+medians are 557.825 versus 34.555 us. This does not measure application startup
+or a single-VMA operation. The original APK runs with the modified binary;
+private-file and fork-quiescence regressions pass 53 and three checks.
+Evidence: sibling umaru build/reports/elfuse-postapp-unmap-vvutm8_a/.
+
+Full make check passes, including the throughput guardrail. The arm64 matrix
+reports 331 passes, two failures and ten skips: timer one-shot starvation and
+PI relock contention below 2,000 acquisitions. Three standalone runs per
+binary pass all 36 timer checks. A six-run comparison at two CPUs has PI
+contention failures in three baseline runs and one modified run. This proves
+the PI count failure exists before the change; it does not make the failed
+matrix green or explain the timer failure.
+
+
 ## Runtime Profile Regression
 
 `make test-profile-host` checks disabled clock behavior, strict numeric

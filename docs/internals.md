@@ -273,6 +273,10 @@ reclaims their combined range. Shared mappings, file overlays, VA gaps and
 non-contiguous backing stop the run. Partial host-page edges retain the same
 zeroing rules.
 
+Unmapping adjacent private anonymous VMAs likewise resets a contiguous primary
+backing range once. Shared or overlay-backed regions and discontinuities stop
+the run; VMA removal and overlay teardown retain their existing ordering.
+
 Writable file-backed `MAP_SHARED` overlays occupy whole host pages. Non-fixed
 placement checks that rounded extent, including a strong address hint, before
 choosing a gap. A fixed mapping whose rounded tail intersects another guest

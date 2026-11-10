@@ -5418,8 +5418,20 @@ static int munmap_guest_range(guest_t *g, uint64_t unmap_off, uint64_t end)
             continue;
         uint64_t zstart = (r->start > unmap_off) ? r->start : unmap_off;
         uint64_t zend = (r->end < end) ? r->end : end;
-        int reset_err = guest_memory_reset_range(
-            g, r->gpa_base + (zstart - r->start), zend - zstart);
+        uint64_t rgpa = r->gpa_base + (zstart - r->start);
+        while ((r->flags & LINUX_MAP_ANONYMOUS) && !r->shared &&
+               i + 1 < g->nregions && zend < end) {
+            const guest_region_t *next = &g->regions[i + 1];
+            uint64_t next_end = next->end < end ? next->end : end;
+            if (next->start != zend || !(next->flags & LINUX_MAP_ANONYMOUS) ||
+                next->shared || region_has_live_overlay(next) ||
+                !window_fits(rgpa, next_end - zstart, g->guest_size) ||
+                next->gpa_base != rgpa + (zend - zstart))
+                break;
+            zend = next_end;
+            ++i;
+        }
+        int reset_err = guest_memory_reset_range(g, rgpa, zend - zstart);
         if (reset_err < 0) {
             if (remove_fd >= 0)
                 close(remove_fd);

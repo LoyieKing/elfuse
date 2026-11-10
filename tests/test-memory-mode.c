@@ -730,6 +730,36 @@ static void test_shared_fork_unmap(void)
     munmap(p, len);
 }
 
+static void test_split_unmap(void)
+{
+    TEST("split unmap preserves neighbors and reuse is zero");
+    const size_t part = 65536, len = 6 * part;
+    unsigned char *p = map_anon(len, MAP_PRIVATE);
+    if (!p) {
+        FAIL("mmap");
+        return;
+    }
+    memset(p, 0x55, len);
+    bool ok = mprotect(p + part, part, PROT_READ) == 0 &&
+              mprotect(p + 2 * part, part, PROT_NONE) == 0;
+    unsigned char *shared = mmap(p + 4 * part, part, PROT_READ | PROT_WRITE,
+                                 MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    ok = ok && shared == p + 4 * part;
+    if (ok)
+        memset(shared, 0x66, part);
+    ok = ok && munmap(p + part, 4 * part) == 0;
+    if (ok) {
+        ok = p[0] == 0x55 && p[len - 1] == 0x55;
+        unsigned char *q = mmap(p + part, 4 * part, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        ok = ok && q == p + part;
+        for (size_t i = 0; ok && i < 4 * part; i++)
+            ok = q[i] == 0;
+    }
+    EXPECT_TRUE(ok, "split removal changed neighbors or reused stale bytes");
+    munmap(p, len);
+}
+
 #define CHURN_THREADS 2
 #define CHURN_ITERS 64
 #define CHURN_LEN ((size_t) 4 * 1024 * 1024)
@@ -864,6 +894,7 @@ int main(int argc, char **argv)
     test_fork_parent_churn();
     test_shared_fork_unmap();
     test_threaded_reset();
+    test_split_unmap();
 
     if (fails > 0) {
         SUMMARY("test-memory-mode");
