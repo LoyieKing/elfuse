@@ -163,3 +163,73 @@ deviation; do not label a Linux mismatch PASS.
 Address-space freeze, private/shared mapping correctness and rejection of
 unsupported CLONE_VM exec remain safety gates. Same-VM FIFO/RR, PI,
 affinity, signal migration and CPU accounting retain strict acceptance.
+
+## Planned reusable pre-Application template
+
+This design is for umaru startup reuse; it is not implemented. It leaves the
+ordinary fork/vfork contracts and outstanding work above unchanged. The umaru
+plan is in ../umaru/docs/rendering-performance.md, section 9.
+
+The reusable object contains a package-neutral ART runtime before Application
+construction: matching boot jars and native registrations, initialized system
+font data, and private preloaded heap/code state. ART runs with -Xzygote for
+its fork lifecycle, without starting the Android Zygote service or system_server.
+Process-local service instances, ApplicationSharedMemory, APK identity and
+component database, application class initializers, renderer/GLES/media sockets,
+account data, Binder RPC sessions and pending callbacks are excluded. umaru must
+separate immutable preload from child specialization rather than snapshot its
+current process-bound RuntimeBootstrap inside sLock.
+
+Capture uses the ART pre-fork hooks before elfuse's address-space mutation
+freeze. ART PreZygoteFork requires one remaining guest thread; stopping every
+vCPU does not repair GC/JIT/daemon thread records or locks. The retained image
+is captured at a trusted JNI fork barrier with no application work or held
+framework monitor. The fork register/EL1-frame continuation must be the same
+continuation the existing fork child resumes, with child return value zero.
+
+A template owner retains the Mach CoW entry, span map, guest register state,
+VMA metadata and an explicit descriptor restore policy. Each launch maps the
+same immutable entry into a fresh elfuse host process using the existing
+snapshot mapper and restore machinery. It does not recapture a live app, copy
+the whole guest slab, spawn by host fork(), or replay a consumed IPC stream.
+Serialize immutable memory metadata once; instantiate child-specific process
+state for every request. Native handler userdata and host synchronization
+objects are reconstructed rather than copied as pointers.
+
+Every child receives authenticated session facts before application code:
+session/user/uid/processName, the logical parent and process registry, sysroot
+and private data mounts, abstract-socket namespace, capabilities, rlimits,
+stdio, supervisor/renderer endpoints, environment and runtime properties.
+Fresh entropy, current vvar clocks, signal state, CPU counters, worker pool and
+private EL1 stacks/shim_data accompany ART post-fork Thread/GC/JIT/daemon setup.
+Shared app/service descriptors and writable template MAP_SHARED objects are
+not inherited between sessions. Immutable asset mappings may share backing;
+file offsets must remain independent. Same-app processes share only the
+session resources already allowed by that app's normal multi-process contract.
+
+The owner survives individual session exit. Outstanding child leases retain
+memory and artifact generations until restore or execution no longer uses
+them; eviction blocks new leases, not existing children. Key templates by
+elfuse/shim/fork format, ART/boot/native/font hashes, ABI/IPA/page layout and
+runtime/GC/preload configuration. Mismatches create a new generation through
+the real cold path. This is an in-memory snapshot retained across sessions,
+not a disk checkpoint that promises resume across host restart or reboot.
+
+Proposed operations are create, instantiate and release of a template handle.
+Keep ordinary sys_clone resource inheritance and Linux child registration
+separate from template instantiation; a template owner is not automatically
+the app's logical parent. Reuse the low-level snapshot/restore functions, not
+the entire parent-specific IPC header as a permanent launch descriptor.
+
+Acceptance covers simultaneous same/different APK sessions and same-session
+remote Activity, service-first Activity and headless service/provider launches.
+Each child constructs its own Application and installs only its declared
+providers. Check fresh identity/entropy and independent service/global state,
+cross-child memory writes, descriptor offsets and namespace isolation, pending
+signal/timer cleanup, class initialization and GC/JIT after restore, nested
+ordinary fork/exec/wait, and child survival after session/template retirement.
+Retain tests/test-fork-quiesce-memory, tests/test-fork-quiesce-host and the
+ordinary fork/vfork lanes as regression gates. Benchmark one-time capture,
+cache-hit restore/specialization and cold miss separately, including packed
+bytes, spans, CoW faults, dirty memory, worker count and multiple concurrent
+restores. No resident-size-independent or zero-copy timing is assumed.
