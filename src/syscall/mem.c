@@ -4253,12 +4253,14 @@ int64_t sys_mmap(guest_t *g,
                 g->mmap_end = ext_end;
         }
 
-        bool private_direct =
-            !is_anon && (flags & LINUX_MAP_PRIVATE) &&
-            result_off % host_page_size_cached() == 0 &&
-            (uint64_t) offset % host_page_size_cached() == 0 &&
-            length % host_page_size_cached() == 0;
-        if (!private_direct) {
+        size_t hps = host_page_size_cached();
+        bool file_direct = !is_anon && result_off % hps == 0 &&
+                           (uint64_t) offset % hps == 0 && length % hps == 0 &&
+                           ((flags & LINUX_MAP_PRIVATE) ||
+                            ((flags & LINUX_MAP_SHARED) &&
+                             overlay_fd_writable(host_backing_fd)));
+        /* A direct file mapping replaces every byte of backing itself. */
+        if (!file_direct) {
             int reset_err = guest_memory_reset_range(g, result_off, length);
             if (reset_err < 0) {
                 mmap_fresh_dispose(&fresh);

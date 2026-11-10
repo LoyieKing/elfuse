@@ -1224,6 +1224,36 @@ with both the preserved baseline and formatter binaries. This observation
 does not close the strict PI acceptance or count as a green make check.
 
 
+## Direct Shared File Backing
+
+Host-page-aligned non-fixed writable shared file mappings install the overlay
+without first replacing the range with anonymous backing. The file replaces
+the full range; read-only shared mappings and unaligned snapshot mappings keep
+their zero-fill path. Overlay installation and failure recovery retain the
+guest-entry pause and stage-2 refresh.
+
+Seven alternating baseline/direct process pairs each map and unmap a 64 KiB
+file 20,000 times, checking its first and last bytes. CPU medians are 21.276
+and 20.808 us per pair; wall medians are 21.600 and 21.155 us. The distributions
+overlap, so this sample does not establish a stable speedup or a startup gain.
+The original Douyin APK displays video through the bundled renderer; private
+mapping, shared writeback and fork-isolation probes pass. Anonymous reset and
+discard still pause guest execution.
+
+Seven further alternating pairs use two guest CPUs and fixed work totals:
+10,000 open/close operations and 10,000 shared map/unmap operations. Median
+elapsed time per workload unit is 390.413 versus 354.427 us; process CPU is
+84.761 versus 86.909 us. Elapsed time includes the final thread join, so this
+is not individual open latency. The CPU result does not establish a reduction.
+
+The complete make check passes all 112 driver entries and its host/shared
+lanes; the throughput guardrail passes after its built-in retry. The arm64
+matrix reports 333 passes, zero failures and ten skips. Focused shared-writeback,
+read-only shared, cross-fork shared, private-file and fork-quiescence probes
+pass 9, 9, 3, 53 and 3 checks. Raw binaries, workloads, measurements and APK
+logs are in the sibling umaru build/reports/elfuse-postapp-shared-5ex_z64i/.
+
+
 ## Runtime Profile Regression
 
 `make test-profile-host` checks disabled clock behavior, strict numeric

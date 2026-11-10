@@ -274,6 +274,14 @@ mapping fails with `ENOMEM` before replacing bytes or page tables; it does not
 fall back to a private snapshot. A successful overlay keeps live file and alias
 coherence without replacing neighboring guest pages.
 
+Non-fixed private file mappings with host-page-aligned address, offset and
+length install file backing directly. Writable shared mappings with the same
+alignment also skip the anonymous reset: the overlay replaces the entire
+range before mmap returns. Read-only shared and unaligned mappings retain
+the reset and snapshot path. Overlay installation still pauses guest entry
+and refreshes stage-2; anonymous allocation and discard use the reset policy
+above.
+
 The mmap RW region starts at 8 GiB to match real Linux kernel address-space
 layout, where `mmap` allocations sit well above text/data/brk.
 
