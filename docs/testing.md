@@ -1192,6 +1192,38 @@ chain completes 200 execs with eight live siblings per exec.
 
 
 
+## Procfs Maps Formatting
+
+The maps and smaps headers use bounded hexadecimal formatting. Addresses have
+no leading zeros; offsets have at least eight digits. The numeric prefix fits
+in 64 bytes, including its terminator. Pathnames retain the Linux name column
+and the shared bounded-copy behavior. Every open still snapshots VMAs and
+queries linked backing files, so rename, unlink and fixed replacement remain
+visible without a time-based cache.
+
+On Apple M4 Pro, seven alternating baseline/formatter process pairs each read
+maps 2,000 times over 1,024 file VMAs separated by inaccessible pages. Median
+CPU per read is 924.583 versus 714.854 us; wall time is 931.560 versus
+722.896 us. This measures maps generation, not application startup. An
+unchanged Douyin APK displays advancing video through the bundled CEF/Metal
+renderer with the formatter; its APK and experiment configuration are unchanged.
+
+A temporary formatter comparison passes 3,456 cases under UBSan, including
+UINT64_MAX, permission combinations, empty/long names and output capacities
+from one byte to 4,352 bytes. ASan stalls before main in its Darwin shadow-memory
+initialization; the sample shows recursive allocator initialization, so that run
+does not count as a formatter check. Raw measurements, video captures and the
+sample are in the sibling umaru build/reports/elfuse-postapp-maps-pa_qlj60/.
+
+The arm64 matrix passes 333 entries with zero failures and ten skips. The
+focused procfs, proc-fidelity and smaps suites pass 17, 23 and four checks;
+proc-fidelity skips one root-only check. The complete make check run reports
+111 passes and one PI relock failure (937 of 2,000 contended acquisitions in
+ten seconds). A subsequent standalone comparison passes all seven PI checks
+with both the preserved baseline and formatter binaries. This observation
+does not close the strict PI acceptance or count as a green make check.
+
+
 ## Runtime Profile Regression
 
 `make test-profile-host` checks disabled clock behavior, strict numeric

@@ -1988,6 +1988,21 @@ out_unlock:
     return (int) maps_entries_count(&entries);
 }
 
+/* Callers reserve 16 bytes and request a minimum of one or eight hex digits. */
+static size_t proc_format_maps_hex(char *out, uint64_t value, size_t minimum)
+{
+    static const char digits[] = "0123456789abcdef";
+    char reversed[16];
+    size_t n = 0;
+    do {
+        reversed[n++] = digits[value & 15];
+        value >>= 4;
+    } while (n < sizeof(reversed) && (value || n < minimum));
+    for (size_t i = 0; i < n; i++)
+        out[i] = reversed[n - i - 1];
+    return n;
+}
+
 /* Format the common VMA header. The maps and smaps header must stay byte-for-
  * byte compatible so consumers can use either file interchangeably.
  */
@@ -1995,19 +2010,22 @@ static int proc_format_maps_header(const maps_entry_t *e,
                                    char *header,
                                    size_t headersz)
 {
-    char perms[5];
-    perms[0] = (e->prot & LINUX_PROT_READ) ? 'r' : '-';
-    perms[1] = (e->prot & LINUX_PROT_WRITE) ? 'w' : '-';
-    perms[2] = (e->prot & LINUX_PROT_EXEC) ? 'x' : '-';
-    perms[3] = (e->flags & LINUX_MAP_SHARED) ? 's' : 'p';
-    perms[4] = '\0';
-
-    int header_len =
-        snprintf(header, headersz, "%llx-%llx %s %08llx 00:00 0",
-                 (unsigned long long) e->start, (unsigned long long) e->end,
-                 perms, (unsigned long long) e->offset);
-    if (header_len < 0)
-        return -1;
+    /* Three 16-digit values, separators, permissions and the device/inode
+     * suffix occupy at most 63 bytes before the terminating NUL.
+     */
+    char prefix[64];
+    size_t prefix_len = proc_format_maps_hex(prefix, e->start, 1);
+    prefix[prefix_len++] = '-';
+    prefix_len += proc_format_maps_hex(prefix + prefix_len, e->end, 1);
+    prefix[prefix_len++] = ' ';
+    prefix[prefix_len++] = (e->prot & LINUX_PROT_READ) ? 'r' : '-';
+    prefix[prefix_len++] = (e->prot & LINUX_PROT_WRITE) ? 'w' : '-';
+    prefix[prefix_len++] = (e->prot & LINUX_PROT_EXEC) ? 'x' : '-';
+    prefix[prefix_len++] = (e->flags & LINUX_MAP_SHARED) ? 's' : 'p';
+    prefix[prefix_len++] = ' ';
+    prefix_len += proc_format_maps_hex(prefix + prefix_len, e->offset, 8);
+    memcpy(prefix + prefix_len, " 00:00 0", sizeof(" 00:00 0"));
+    int header_len = (int) str_copy_trunc(header, prefix, headersz);
     if ((size_t) header_len >= headersz)
         header_len = (int) headersz - 1;
 
@@ -2015,13 +2033,11 @@ static int proc_format_maps_header(const maps_entry_t *e,
         while (header_len < MAPS_NAME_COLUMN &&
                (size_t) header_len < headersz - 1)
             header[header_len++] = ' ';
-        int n = snprintf(header + header_len, headersz - (size_t) header_len,
-                         "%s", e->name);
-        if (n > 0) {
-            if ((size_t) n >= headersz - (size_t) header_len)
-                n = (int) (headersz - (size_t) header_len - 1);
-            header_len += n;
-        }
+        size_t remaining = headersz - (size_t) header_len;
+        size_t n = str_copy_trunc(header + header_len, e->name, remaining);
+        if (n >= remaining)
+            n = remaining - 1;
+        header_len += (int) n;
     } else if ((size_t) header_len < headersz - 1) {
         header[header_len++] = ' ';
     }
