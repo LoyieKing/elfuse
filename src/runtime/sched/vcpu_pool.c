@@ -58,6 +58,13 @@ typedef struct vcpu_pool_config {
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stddef.h>
+#include <sys/file.h>
+#include <sys/mman.h>
+#include <sys/sysctl.h>
+#include <unistd.h>
 
 enum {
     SLOT_FREE = 0,
@@ -1637,6 +1644,8 @@ static void pool_cfg_from_vcpu(guest_t *g,
     };
 }
 
+static void hud_stats_start(void);
+
 int vcpu_pool_start_with_main(guest_t *g,
                               hv_vcpu_t vcpu,
                               hv_vcpu_exit_t *vexit,
@@ -1716,6 +1725,7 @@ int vcpu_pool_start_with_main(guest_t *g,
         vcpu_pool_stop();
         return -1;
     }
+    hud_stats_start();
 
     log_debug("vcpu_pool: main tid=%lld adopted on slot 0; other CPUs lazy",
               (long long) thread_tid(main_t));
@@ -1763,8 +1773,231 @@ int vcpu_pool_run_main(int timeout_sec)
     return last_exit;
 }
 
+/* umaru-renderer reads this snapshot from ELFUSE_HUD_STATS, which run-app
+ * sets to the render socket path plus ".hud". seq is a seqlock shared with
+ * that reader: odd while the payload is being written, even when stable.
+ * An unset path leaves the publisher stopped, so a guest that is not driving
+ * a window does not create the file.
+ */
+#define HUD_MAGIC 0x48554431u
+#define HUD_MAX_CPU 64
+
+struct hud_snap {
+    uint32_t magic;
+    uint32_t seq;
+    uint32_t ncpu;
+    uint32_t pad;
+    uint64_t footprint;
+    uint64_t host_total;
+    uint16_t load_permille[HUD_MAX_CPU];
+    uint8_t live[HUD_MAX_CPU];
+};
+
+_Static_assert(sizeof(struct hud_snap) == 224, "umaru HUD snapshot size");
+_Static_assert(offsetof(struct hud_snap, load_permille) == 32,
+               "umaru HUD load offset");
+_Static_assert(offsetof(struct hud_snap, live) == 160, "umaru HUD live offset");
+
+static pthread_t hud_thread;
+static bool hud_started;
+static atomic_int hud_stop;
+static struct hud_snap *hud_map;
+static int hud_fd = -1;
+static char hud_path[PATH_MAX];
+static int hud_suppressed;
+
+/* Fork copies the publisher fd and path into the child. The child must not
+ * join a thread it does not have, and must not unlink the parent's snapshot.
+ * The inherited fd stays open: closing it can drop the parent's flock. A
+ * re-exec'd child does not inherit hud_suppressed; it fails the lock and
+ * does not publish.
+ */
+static void hud_after_fork_child(void)
+{
+    if (hud_map && hud_map != MAP_FAILED)
+        munmap(hud_map, sizeof(*hud_map));
+    hud_map = NULL;
+    hud_fd = -1;
+    hud_path[0] = '\0';
+    hud_started = false;
+    atomic_store_explicit(&hud_stop, 0, memory_order_relaxed);
+    hud_suppressed = 1;
+}
+
+
+static uint64_t hud_mono_ns(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
+    return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
+
+static uint64_t hud_footprint(void)
+{
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t) &info,
+                  &count) != KERN_SUCCESS)
+        return 0;
+    return (uint64_t) info.phys_footprint;
+}
+
+static uint64_t hud_host_total(void)
+{
+    uint64_t bytes = 0;
+    size_t len = sizeof(bytes);
+
+    if (sysctlbyname("hw.memsize", &bytes, &len, NULL, 0) != 0)
+        return 0;
+    return bytes;
+}
+
+static void hud_publish(uint32_t ncpu, uint64_t footprint, uint64_t host_total,
+                        const uint16_t *load, const uint8_t *live)
+{
+    uint32_t seq;
+
+    if (!hud_map)
+        return;
+    seq = atomic_load_explicit((_Atomic uint32_t *) &hud_map->seq,
+                               memory_order_relaxed);
+    atomic_store_explicit((_Atomic uint32_t *) &hud_map->seq, seq + 1,
+                          memory_order_release);
+    hud_map->ncpu = ncpu;
+    hud_map->footprint = footprint;
+    hud_map->host_total = host_total;
+    memcpy(hud_map->load_permille, load, sizeof(hud_map->load_permille));
+    memcpy(hud_map->live, live, sizeof(hud_map->live));
+    atomic_thread_fence(memory_order_release);
+    atomic_store_explicit((_Atomic uint32_t *) &hud_map->seq, seq + 2,
+                          memory_order_release);
+}
+
+static void *hud_thread_main(void *arg)
+{
+    uint64_t prev_cpu[HUD_MAX_CPU];
+    uint64_t prev_wall = 0;
+    bool have = false;
+
+    (void) arg;
+    memset(prev_cpu, 0, sizeof(prev_cpu));
+    while (!atomic_load_explicit(&hud_stop, memory_order_acquire)) {
+        uint64_t wall = hud_mono_ns();
+        int n = slots && slot_count > 0 ? slot_count : 0;
+        uint16_t load[HUD_MAX_CPU];
+        uint8_t live[HUD_MAX_CPU];
+        int i;
+
+        if (n > HUD_MAX_CPU)
+            n = HUD_MAX_CPU;
+        memset(load, 0, sizeof(load));
+        memset(live, 0, sizeof(live));
+        for (i = 0; i < n; i++) {
+            uint64_t cpu = 0;
+            bool sampled = slot_cpu_ns(&slots[i], &cpu);
+
+            live[i] = slots[i].vcpu_live ? 1 : 0;
+            if (have && sampled && wall > prev_wall && cpu >= prev_cpu[i]) {
+                uint64_t perm =
+                    (cpu - prev_cpu[i]) * 1000ULL / (wall - prev_wall);
+                if (perm > 1000)
+                    perm = 1000;
+                load[i] = (uint16_t) perm;
+            }
+            if (sampled)
+                prev_cpu[i] = cpu;
+        }
+        prev_wall = wall;
+        have = true;
+        hud_publish((uint32_t) n, hud_footprint(), hud_host_total(), load,
+                    live);
+        if (!atomic_load_explicit(&hud_stop, memory_order_acquire)) {
+            struct timespec delay = {.tv_sec = 0, .tv_nsec = 200000000L};
+            nanosleep(&delay, NULL);
+        }
+    }
+    return NULL;
+}
+
+static void hud_stats_stop(void)
+{
+    if (hud_suppressed)
+        return;
+    if (hud_started) {
+        atomic_store_explicit(&hud_stop, 1, memory_order_release);
+        (void) pthread_join(hud_thread, NULL);
+        hud_started = false;
+    }
+    if (hud_map && hud_map != MAP_FAILED) {
+        munmap(hud_map, sizeof(*hud_map));
+        hud_map = NULL;
+    }
+    if (hud_fd >= 0) {
+        close(hud_fd);
+        hud_fd = -1;
+    }
+    if (hud_path[0] != '\0') {
+        unlink(hud_path);
+        hud_path[0] = '\0';
+    }
+    atomic_store_explicit(&hud_stop, 0, memory_order_relaxed);
+}
+
+static void hud_stats_start(void)
+{
+    const char *path = getenv("ELFUSE_HUD_STATS");
+    size_t len;
+    int fd;
+    void *mem;
+
+    if (hud_suppressed || hud_started || !path || !path[0])
+        return;
+    len = strlen(path);
+    if (len == 0 || len >= sizeof(hud_path))
+        return;
+    fd = open(path, O_RDWR | O_CREAT, 0600);
+    if (fd < 0)
+        return;
+    /* A re-exec'd fork child inherits the path. Without the lock it would
+     * replace this snapshot and unlink it when its own pool stops.
+     */
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        close(fd);
+        return;
+    }
+    if (ftruncate(fd, (off_t) sizeof(struct hud_snap)) != 0) {
+        close(fd);
+        return;
+    }
+    mem = mmap(NULL, sizeof(struct hud_snap), PROT_READ | PROT_WRITE,
+               MAP_SHARED, fd, 0);
+    if (mem == MAP_FAILED) {
+        close(fd);
+        return;
+    }
+    memset(mem, 0, sizeof(struct hud_snap));
+    ((struct hud_snap *) mem)->magic = HUD_MAGIC;
+    memcpy(hud_path, path, len + 1);
+    hud_map = (struct hud_snap *) mem;
+    hud_fd = fd;
+    atomic_store_explicit(&hud_stop, 0, memory_order_relaxed);
+    if (pthread_atfork(NULL, NULL, hud_after_fork_child) != 0) {
+        hud_stats_stop();
+        return;
+    }
+    if (pthread_create(&hud_thread, NULL, hud_thread_main, NULL) != 0) {
+        hud_stats_stop();
+        return;
+    }
+    hud_started = true;
+}
+
 void vcpu_pool_stop(void)
 {
+    hud_stats_stop();
     pthread_mutex_lock(&pool_lock);
     if (!pool_running) {
         pthread_mutex_unlock(&pool_lock);
