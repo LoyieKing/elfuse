@@ -1416,9 +1416,24 @@ static int64_t sc_prctl(guest_t *g,
     (void) x5;
     (void) verbose;
     switch ((int) x0) {
-    case LINUX_PR_SET_NAME:
-    case LINUX_PR_GET_NAME:
+    case LINUX_PR_SET_NAME: {
+        char name[16] = {0};
+        for (size_t i = 0; i < sizeof(name); i++) {
+            if (x1 > UINT64_MAX - i ||
+                guest_read_small(g, x1 + i, &name[i], 1) < 0)
+                return -LINUX_EFAULT;
+            if (name[i] == '\0')
+                break;
+        }
+        thread_set_comm(current_thread, name);
         return 0;
+    }
+    case LINUX_PR_GET_NAME: {
+        char name[16];
+        thread_get_comm(current_thread, name);
+        return guest_write_small(g, x1, name, sizeof(name)) < 0 ? -LINUX_EFAULT
+                                                                : 0;
+    }
     case LINUX_PR_SET_PDEATHSIG:
         return 0;
     case LINUX_PR_GET_PDEATHSIG: {

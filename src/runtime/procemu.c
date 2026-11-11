@@ -781,10 +781,10 @@ void proc_synthetic_note_alias(int src_host, int alias_host)
             }
             proc_syn_tracked_n = w;
         } else {
-            proc_syn_tracked[proc_syn_tracked_n++] = (proc_syn_track_t) {
-                .fd = alias_host,
-                .dev = proc_syn_tracked[src].dev,
-                .ino = proc_syn_tracked[src].ino};
+            proc_syn_tracked[proc_syn_tracked_n++] =
+                (proc_syn_track_t) {.fd = alias_host,
+                                    .dev = proc_syn_tracked[src].dev,
+                                    .ino = proc_syn_tracked[src].ino};
         }
     }
     pthread_mutex_unlock(&proc_syn_lock);
@@ -983,23 +983,11 @@ static int proc_open_net_dev(void)
         (unsigned long long) eth0->tx_compressed);
 }
 
-/* Return the basename of the loaded ELF binary, falling back to "elfuse" when
- * the path is unavailable. Matches the comm-name semantic Linux uses for
- * /proc/<pid>/comm and the second field of /proc/<pid>/stat. Storage is owned
- * by proc_get_elf_path() (stable for process lifetime) or the literal fallback;
- * caller must not free.
- */
 static const char *proc_comm_name(void)
 {
-    /* Snapshot into a thread-local buffer so a concurrent execve cannot tear
-     * the shared elf_path under the basename scan. The TLS lifetime matches the
-     * calling thread, which is what callers (printf-style formatters) require.
-     */
-    static _Thread_local char exe_tls[LINUX_PATH_MAX];
-    if (!proc_elf_path_snapshot(exe_tls, sizeof(exe_tls)))
-        return "elfuse";
-    const char *slash = strrchr(exe_tls, '/');
-    return slash ? slash + 1 : exe_tls;
+    static _Thread_local char name[16];
+    thread_get_comm(NULL, name);
+    return name;
 }
 
 /* Parse the numeric tail of a /proc/.../<N> or /dev/fd/<N> path. prefix_len is
@@ -2440,6 +2428,13 @@ static int proc_open_self_task_node(const guest_t *g,
         errno = ENOENT;
         return -1;
     }
+    char comm[16];
+    thread_get_comm(task, comm);
+    if (!strcmp(endp, "/comm")) {
+        int rc = proc_emit_fmt("%s\n", comm);
+        thread_release(task);
+        return rc;
+    }
 
     if (!strcmp(endp, "/stat")) {
         uint64_t user_ns, sys_ns, cutime_us = 0, cstime_us = 0;
@@ -2455,7 +2450,7 @@ static int proc_open_self_task_node(const guest_t *g,
             "%ld %ld %d 0 0 0 0 "                          /* 18-24 */
             "18446744073709551615 0 0 %llu 0 0 0 "         /* 25-31 */
             "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", /* 32-52 */
-            tid, proc_comm_name(), state, (long long) proc_get_ppid(),
+            tid, comm, state, (long long) proc_get_ppid(),
             (long long) proc_get_pid(), /* pgid */
             (long long) proc_get_sid(), proc_ns_to_ticks(user_ns),
             proc_ns_to_ticks(sys_ns), proc_ns_to_ticks(cutime_us * 1000ULL),
@@ -2476,11 +2471,10 @@ static int proc_open_self_task_node(const guest_t *g,
             "Uid:\t%u\t%u\t%u\t%u\n"
             "Gid:\t%u\t%u\t%u\t%u\n"
             "Threads:\t%d\n",
-            proc_comm_name(), state, proc_state_name(state),
-            (long long) proc_get_pid(), tid, (long long) proc_get_ppid(),
-            proc_get_uid(), proc_get_euid(), proc_get_suid(), proc_get_euid(),
-            proc_get_gid(), proc_get_egid(), proc_get_sgid(), proc_get_egid(),
-            thread_active_count());
+            comm, state, proc_state_name(state), (long long) proc_get_pid(),
+            tid, (long long) proc_get_ppid(), proc_get_uid(), proc_get_euid(),
+            proc_get_suid(), proc_get_euid(), proc_get_gid(), proc_get_egid(),
+            proc_get_sgid(), proc_get_egid(), thread_active_count());
         thread_release(task);
         return rc;
     }
@@ -2503,6 +2497,8 @@ static int proc_open_self_task_node(const guest_t *g,
         close(open(p, O_CREAT | O_WRONLY, 0444));
         snprintf(p, sizeof(p), "%s/status", dir);
         close(open(p, O_CREAT | O_WRONLY, 0444));
+        snprintf(p, sizeof(p), "%s/comm", dir);
+        close(open(p, O_CREAT | O_WRONLY, 0644));
 
         int fd = proc_open_dir_fd(dir, linux_flags);
         proc_persistent_dir_release(&tiddir);
@@ -2869,6 +2865,8 @@ static int intercept_open_dispatch(const guest_t *g,
         return fd;
     }
 
+    if (!strcmp(path, "/proc/self/comm"))
+        return proc_emit_fmt("%s\n", proc_comm_name());
     /* /proc/self/status -> synthetic process status */
     if (!strcmp(path, "/proc/self/status")) {
         /* VmSize is total_vm, which leaves out [shim] and [shim-data]. VmRSS
@@ -3639,6 +3637,11 @@ static int intercept_stat_dispatch(const char *path,
             return proc_intercept_stat_at(alias, st, follow);
     }
 
+    if (!strcmp(path, "/proc/self/comm")) {
+        stat_fill_proc_file(st, 0644, path);
+        return 0;
+    }
+
     /* /proc/self/task and /proc/self/task/<tid> are directories */
     if (!strcmp(path, "/proc/self/task") || !strcmp(path, "/proc/self/task/")) {
         stat_fill_proc_dir(st, 0555, 2 + (nlink_t) thread_active_count(), path);
@@ -3656,8 +3659,10 @@ static int intercept_stat_dispatch(const char *path,
                 stat_fill_proc_dir(st, 0555, 2, path);
                 return 0;
             }
-            if (!strcmp(endp, "/stat") || !strcmp(endp, "/status")) {
-                stat_fill_proc_file(st, 0444, path);
+            if (!strcmp(endp, "/stat") || !strcmp(endp, "/status") ||
+                !strcmp(endp, "/comm")) {
+                stat_fill_proc_file(st, !strcmp(endp, "/comm") ? 0644 : 0444,
+                                    path);
                 return 0;
             }
         }
@@ -3693,6 +3698,7 @@ static int intercept_stat_dispatch(const char *path,
     }
 
     static const char *known_proc_files[] = {
+        "/proc/self/comm",
         "/proc/self/io",
         "/proc/self/stat",
         "/proc/self/status",
@@ -3982,6 +3988,33 @@ static int intercept_readlink_dispatch(const char *path,
     return PROC_NOT_INTERCEPTED;
 }
 
+static int64_t proc_comm_tid(const char *path)
+{
+    if (!strcmp(path, "/proc/self/comm"))
+        return proc_get_pid();
+    if (strncmp(path, "/proc/self/task/", 16))
+        return 0;
+    char *end;
+    long tid = strtol(path + 16, &end, 10);
+    return tid > 0 && !strcmp(end, "/comm") ? tid : 0;
+}
+
+static int proc_comm_text(const char *path, char text[32])
+{
+    int64_t tid = proc_comm_tid(path);
+    if (!tid)
+        return 0;
+    thread_entry_t *task = thread_acquire_tid(tid);
+    if (!task) {
+        errno = ESRCH;
+        return -1;
+    }
+    char name[16];
+    thread_get_comm(task, name);
+    thread_release(task);
+    return snprintf(text, 32, "%s\n", name);
+}
+
 int proc_intercept_read(int guest_fd,
                         void *buf,
                         size_t count,
@@ -3991,6 +4024,13 @@ int proc_intercept_read(int guest_fd,
     fd_entry_t snap;
     if (!fd_snapshot(guest_fd, &snap))
         return 0;
+    char comm[32];
+    int comm_len = proc_comm_text(snap.proc_path, comm);
+    if (comm_len < 0)
+        return -1;
+    if (comm_len > 0)
+        return proc_oom_copy_slice(buf, count, offset, comm,
+                                   (uint64_t) comm_len, read_out);
 
     int kind = proc_oom_path_kind(snap.proc_path);
     if (kind == OOM_PATH_NONE)
@@ -4020,7 +4060,8 @@ int proc_intercept_readv(int guest_fd,
         return 0;
 
     int kind = proc_oom_path_kind(snap.proc_path);
-    if (kind == OOM_PATH_NONE)
+    int64_t comm_tid = proc_comm_tid(snap.proc_path);
+    if (kind == OOM_PATH_NONE && comm_tid == 0)
         return 0;
     if (offset < 0) {
         errno = EINVAL;
@@ -4028,9 +4069,11 @@ int proc_intercept_readv(int guest_fd,
     }
 
     char text[32];
-    int len = proc_oom_format_value(kind, text, sizeof(text));
+    int len = comm_tid ? proc_comm_text(snap.proc_path, text)
+                       : proc_oom_format_value(kind, text, sizeof(text));
     if (len < 0) {
-        errno = EIO;
+        if (!comm_tid)
+            errno = EIO;
         return -1;
     }
     uint64_t src_len = (uint64_t) len;
@@ -4063,6 +4106,28 @@ int proc_intercept_write(int guest_fd,
     fd_entry_t snap;
     if (!fd_snapshot(guest_fd, &snap))
         return 0;
+    int64_t comm_tid = proc_comm_tid(snap.proc_path);
+    if (comm_tid) {
+        thread_entry_t *task = thread_acquire_tid(comm_tid);
+        if (!task) {
+            errno = ESRCH;
+            return -1;
+        }
+        if (task != current_thread &&
+            (task->is_vm_clone || current_thread->is_vm_clone)) {
+            thread_release(task);
+            errno = EINVAL;
+            return -1;
+        }
+        char name[16] = {0};
+        size_t copied = count < sizeof(name) - 1 ? count : sizeof(name) - 1;
+        memcpy(name, buf, copied);
+        if (count != 0)
+            thread_set_comm(task, name);
+        thread_release(task);
+        *written_out = (ssize_t) count;
+        return 1;
+    }
     int kind = proc_oom_path_kind(snap.proc_path);
     if (kind == OOM_PATH_SCORE) {
         /* Linux: oom_score has no write handler. proc_reg_write returns -EIO

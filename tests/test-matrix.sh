@@ -866,6 +866,7 @@ run_unit_tests()
     test_rc "$runner" "test-proc-limits-fakeroot" 0 --fakeroot \
         "$bindir/test-proc-limits"
     test_rc "$runner" "test-proc-fidelity" 0 "$bindir/test-proc-fidelity"
+    test_check "$runner" "test-task-comm" "0 failed" "$bindir/test-task-comm"
     test_rc "$runner" "test-proc-smap" 0 "$bindir/test-proc-smap"
     test_rc "$runner" "test-rss-mode" 0 "$bindir/test-rss-mode"
 
@@ -1634,12 +1635,14 @@ run_suite()
 # its floor was left for a run that observed one; the second holds every
 # respelling of a path to the answer its canonical spelling gets. No fixture,
 # not in either skip list. 255 and 230, observed here at 297 and 275.
+# test-task-comm adds one portable entry for prctl names, proc comm and
+# clone/fork/exec inheritance in each unit lane.
 EXPECTED_BASELINES=(
-    "elfuse-aarch64|255|0"
-    "qemu-aarch64|230|0"
-    "elfuse-x86_64:apple-m1-m2|71|0"
-    "elfuse-x86_64:apple-m3-plus|71|0"
-    "elfuse-x86_64:apple-unknown|71|0"
+    "elfuse-aarch64|256|0"
+    "qemu-aarch64|231|0"
+    "elfuse-x86_64:apple-m1-m2|72|0"
+    "elfuse-x86_64:apple-m3-plus|72|0"
+    "elfuse-x86_64:apple-unknown|72|0"
 )
 
 # Look up the (min_pass, max_fail) baseline for a mode key. Writes the values

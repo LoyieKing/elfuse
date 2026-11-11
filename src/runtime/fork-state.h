@@ -21,7 +21,7 @@
 /* Fork IPC protocol identity. Bump this whenever the header layout or ordered
  * fork payload changes incompatibly.
  */
-#define FORK_IPC_PROTOCOL_MAGIC 0x454C465BU /* Mach entry with span sharing */
+#define FORK_IPC_PROTOCOL_MAGIC 0x454C465CU /* Task comm in header */
 
 #define IPC_HDR_SOFT_NEWPID 0x1u
 #define IPC_HDR_VFORK_VM 0x2u
@@ -45,6 +45,7 @@ typedef struct {
     uint32_t uid, euid, suid, gid, egid, sgid;
     sched_task_attrs_t sched_attr;
     uint8_t cpu_affinity[SCHED_CPUSET_BYTES];
+    char task_comm[16];
     /* Bit 0: child is soft CLONE_NEWPID init (see IPC_HDR_SOFT_NEWPID). */
     uint32_t flags;
     uint64_t absock_namespace_id;

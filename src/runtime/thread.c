@@ -74,7 +74,7 @@ static inline uint64_t sp_el1_top(const guest_t *g)
  * is a guest page, not a slot: a slot is smaller than a page, and aligning the
  * cache end to a slot would let the lowest slot share a page with the cache.
  */
-#define SP_EL1_GLOBALS_END                                      \
+#define SP_EL1_GLOBALS_END                                    \
     (((uint64_t) SHIM_GLOBALS_SIZE + (GUEST_PAGE_SIZE - 1)) & \
      ~((uint64_t) GUEST_PAGE_SIZE - 1))
 #define SP_EL1_SLOT_MAX \
@@ -265,6 +265,10 @@ void thread_register_main(const guest_t *g,
                           int64_t tid,
                           uint64_t sp_el1)
 {
+    char path[LINUX_PATH_MAX];
+    if (!proc_elf_path_snapshot(path, sizeof(path)))
+        str_copy_trunc(path, "elfuse", sizeof(path));
+    const char *base = strrchr(path, '/');
     pthread_mutex_lock(&thread_lock);
 
     if (thread_table_ensure_capacity_locked(1) < 0) {
@@ -275,6 +279,7 @@ void thread_register_main(const guest_t *g,
     thread_entry_t *t = thread_slots[0];
     main_thread_entry = t;
     atomic_store_explicit(&t->guest_tid, tid, memory_order_relaxed);
+    str_copy_trunc(t->comm, base ? base + 1 : path, sizeof(t->comm));
     if (profile_enabled())
         profile_attach(t);
     guest_ctx_save(vcpu, &t->guest_ctx);
@@ -393,6 +398,8 @@ rescan:
         /* References prevent reuse; generation rejects stale notifications. */
         uint64_t next_generation = t->generation + 1;
         thread_slot_clear(t);
+        if (current_thread)
+            memcpy(t->comm, current_thread->comm, sizeof(t->comm));
         t->generation = next_generation;
         t->sp_el1_slot = -1; /* No SP_EL1 yet; thread_alloc_sp_el1 fills this */
         t->connect_inflight_fd = -1;
@@ -1260,6 +1267,26 @@ void thread_commit_exec_identity(void)
     atomic_store_explicit(&current_thread->guest_tid, proc_get_pid(),
                           memory_order_release);
     main_thread_entry = current_thread;
+    pthread_mutex_unlock(&thread_lock);
+}
+
+void thread_set_comm(thread_entry_t *t, const char name[16])
+{
+    pthread_mutex_lock(&thread_lock);
+    memcpy(t->comm, name, sizeof(t->comm));
+    t->comm[sizeof(t->comm) - 1] = '\0';
+    pthread_mutex_unlock(&thread_lock);
+}
+
+void thread_get_comm(const thread_entry_t *t, char name[16])
+{
+    pthread_mutex_lock(&thread_lock);
+    if (!t)
+        t = main_thread_entry;
+    if (t)
+        memcpy(name, t->comm, sizeof(t->comm));
+    else
+        memset(name, 0, 16);
     pthread_mutex_unlock(&thread_lock);
 }
 

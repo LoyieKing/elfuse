@@ -76,7 +76,7 @@ Top-level areas:
   EL1 shim assembly, and the embedded Rosetta translator host
 - `src/syscall/`: Linux syscall handlers and translation boundaries
 - `src/runtime/`: thread table, futexes, procfs helpers, fork/clone IPC,
-  argv/comm rewriting for `prctl PR_SET_NAME`
+  guest task names and host process-title rewriting
 - `src/debug/`: crash reporting and built-in GDB RSP stub
 
 Key files:
@@ -114,7 +114,7 @@ Key files:
 | `src/runtime/thread.c`, `futex.c`, `sched/` | task lifetime, per-VM scheduling and priority-inherited futex waits |
 | `src/runtime/procemu.c` | `/proc`, `/dev`, and selected pseudo-files |
 | `src/runtime/usb-sysfs.c` | synthetic `/dev/bus/usb` and `/sys/bus/usb` trees from the IOKit registry |
-| `src/runtime/proctitle.c` | argv / comm rewriting for `prctl PR_SET_NAME` |
+| `src/runtime/proctitle.c` | host argv and pthread title at guest launch |
 | `src/debug/gdbstub.c`, `gdbstub-rsp.c`, `gdbstub-reg.c` | GDB RSP stub |
 
 ## Generic Dynamic Containers
@@ -1815,6 +1815,21 @@ listings refresh only when a new directory is opened. The synthetic
 `/sys/devices/system/cpu` tree follows the one-shot rule: its CPU count,
 cpumask files, and `cpuN` directories are captured on first access and then
 remain fixed.
+
+Guest task names are 16-byte TASK_COMM_LEN strings in thread_entry_t, protected
+by thread_lock. PR_SET_NAME truncates to 15 bytes; PR_GET_NAME copies all 16
+bytes and both reject inaccessible guest addresses with EFAULT. Clone and fork
+inherit the calling task's name, while successful exec resets it to the guest
+executable basename. The fork header carries the caller's name separately from
+the process executable path.
+
+/proc/self/task/<tid>/comm reads the target task's current name with a trailing
+newline. The task's stat and status use the same snapshot. The comm file supports
+same-thread-group writes, including names set through pthread_setname_np, and a
+zero-byte write changes nothing. The process comm/stat/status report the group
+leader's name. Exited tasks disappear from path lookup; an already-open comm
+descriptor reports ESRCH if its task has exited.
+
 
 ### Synthetic USB Device Tree
 

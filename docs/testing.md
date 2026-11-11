@@ -1406,3 +1406,28 @@ failure. The arm64 matrix reports 331 passes, two failures (`test-poll` and
 PI futex contention throughput), and ten skips. Neither gate passes. Changed
 files pass commentflow and clang-format 22.1.8; the full formatting gate stops
 at commentflow differences outside those files.
+
+## Guest Task Names
+
+`build/elfuse build/test-task-comm` passes eight checks for prctl truncation,
+bad guest pointers, private clone names, same-group proc writes, zero-byte
+writes, exited task lookup, fork inheritance and exec basename reset. The
+unimplemented baseline fails all seven original checks; the zero-byte case
+was added with the fix.
+
+The original APK reaches its video page and the read-only collector records
+`FUTURE_COLLECTION_DONE`. In the same run, the `process_bind_core_exp` Future
+runs on `keva-4`, whose Linux tid is 24. The close button ends the guest with
+status 0, but the renderer retains its window beyond ten seconds and requires
+SIGTERM (status -15). This is not a clean host shutdown pass. Evidence is in
+`../umaru/build/reports/umaru-native-park-zbbdr1iz/future-probe/run5-comm/`.
+
+`make check` reports 111 passes and one failure: the POSIX timer one-shot
+notification starves beside two fast periodic SIGUSR1 timers. The complete
+gate does not pass; task comm is not a timer fix.
+The arm64 matrix reports 331 passes, three failures and ten skips.
+`test-task-comm` and the proc suites pass. The failures are `test-path-fold`
+and `test-x11` timeouts, plus `test-futex-requeue-race` reporting a wake one
+polling quantum late. No baseline or threshold is adjusted. Changed C files
+pass clang-format 22; commentflow is unavailable on this host.
+

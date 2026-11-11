@@ -1728,6 +1728,10 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     futex_interrupt_clear();
     thread_reset_for_exec();
     thread_commit_exec_identity();
+    char comm[16] = {0};
+    const char *base = strrchr(path, '/');
+    str_copy_trunc(comm, base ? base + 1 : path, sizeof(comm));
+    thread_set_comm(current_thread, comm);
 
     /* POSIX exec signal semantics: Handlers set to SIG_DFL (except SIG_IGN
      * stays SIG_IGN), pending signals preserved, and signal mask preserved.

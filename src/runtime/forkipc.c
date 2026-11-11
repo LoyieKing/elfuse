@@ -506,6 +506,7 @@ int fork_child_main(int ipc_fd,
      * state (signal masks, ptrace, CLONE_THREAD) will dereference NULL.
      */
     thread_register_main(&g, vcpu, vexit, hdr.child_pid, regs.sp_el1);
+    thread_set_comm(current_thread, hdr.task_comm);
     if (sched_task_set_attr(current_thread, &hdr.sched_attr) < 0 ||
         sched_task_set_affinity(current_thread, hdr.cpu_affinity,
                                 sizeof(hdr.cpu_affinity)) < 0) {
@@ -1364,6 +1365,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         .rss_mode = (uint32_t) g->rss_mode,
     };
     sched_task_get_attr(current_thread, &hdr.sched_attr);
+    thread_get_comm(current_thread, hdr.task_comm);
     (void) sched_task_get_affinity(current_thread, hdr.cpu_affinity,
                                    sizeof(hdr.cpu_affinity));
     if (hdr.sched_attr.flags & SCHED_FLAG_RESET_ON_FORK) {

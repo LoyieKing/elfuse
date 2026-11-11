@@ -134,6 +134,7 @@ typedef struct thread_entry {
         *profile;        /* Process-lifetime storage, never recycled. */
     unsigned references; /* Held under thread_lock; prevents slot recycling. */
     bool exit_cleanup_claimed;
+    char comm[16]; /* Linux TASK_COMM_LEN, under thread_lock. */
 
     /* Per-thread signal mask lives at the top of the struct; see the lock-free
      * group there. saved_blocked is touched only under sig_lock by the owning
@@ -393,6 +394,10 @@ void thread_register_main(const guest_t *g,
                           hv_vcpu_exit_t *vexit,
                           int64_t tid,
                           uint64_t sp_el1);
+
+/* Names are snapshotted under thread_lock; get(NULL) selects the leader. */
+void thread_set_comm(struct thread_entry *t, const char name[16]);
+void thread_get_comm(const struct thread_entry *t, char name[16]);
 
 /* What a clone(CLONE_VM) child without CLONE_THREAD records about itself. */
 typedef struct {
