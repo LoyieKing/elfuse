@@ -18,10 +18,12 @@
 #include <Hypervisor/Hypervisor.h>
 #include <Hypervisor/hv_vcpu.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "core/bootstrap.h"
@@ -67,6 +69,40 @@ void launch_destroy_guest(guest_t *g)
 
     sysvipc_reset();
     guest_destroy(g);
+}
+
+static void report_wait_status(int exit_code)
+{
+    const char *value = getenv("ELFUSE_WAIT_STATUS_FD");
+    if (!value)
+        return;
+    char *end;
+    errno = 0;
+    long descriptor = strtol(value, &end, 10);
+    struct stat st;
+    if (errno || end == value || *end || descriptor < 3 ||
+        descriptor > INT_MAX || fstat((int) descriptor, &st) < 0 ||
+        !S_ISREG(st.st_mode)) {
+        log_error("ELFUSE_WAIT_STATUS_FD requires a writable regular file fd");
+        return;
+    }
+    uint32_t status = proc_exit_group_requested()
+                          ? (uint32_t) proc_exit_group_wait_status()
+                          : ((uint32_t) exit_code & 255u) << 8;
+    uint8_t bytes[4] = {status & 255u, (status >> 8) & 255u,
+                        (status >> 16) & 255u, (status >> 24) & 255u};
+    size_t written = 0;
+    while (written < sizeof(bytes)) {
+        ssize_t count = pwrite((int) descriptor, bytes + written,
+                               sizeof(bytes) - written, (off_t) written);
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count <= 0) {
+            log_error("Cannot publish guest wait status: %s", strerror(errno));
+            return;
+        }
+        written += (size_t) count;
+    }
 }
 
 int elfuse_launch(const launch_args_t *args)
@@ -236,6 +272,7 @@ int elfuse_launch(const launch_args_t *args)
      * signal, or timeout.
      */
     int exit_code = vcpu_pool_run_main(args->timeout_sec);
+    report_wait_status(exit_code);
 
     /* Tear down debugger state before joining workers: a worker parked in
      * gdb_stub_handle_stop() stays active (not deactivated) until this

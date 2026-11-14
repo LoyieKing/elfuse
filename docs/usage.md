@@ -158,9 +158,16 @@ Pass guest arguments that begin with `-`:
 build/elfuse -- ./guest-program --guest-flag
 ```
 
-The guest's exit status is propagated as the `elfuse` exit status, so
-`elfuse` composes with shell pipelines, `make`, CI scripts, and
-anything else that inspects `$?`.
+The guest's exit code is propagated as the `elfuse` exit code. A fatal guest
+signal returns `128 + signal`, so a signal and a normal exit can have the same
+shell-visible code.
+
+Supervisors can set the host environment variable `ELFUSE_WAIT_STATUS_FD` to
+an inherited descriptor (at least 3) for an empty writable regular file.
+On guest completion, `elfuse` writes the Linux wait status as four little-endian
+bytes at offset zero: normal exits use `code << 8`; signal exits retain the
+signal number and core-dump bit. The caller owns the descriptor. Bring-up
+failures leave the file empty; reporting errors do not change the exit code.
 
 ### Worked Examples
 
