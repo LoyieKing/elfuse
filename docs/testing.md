@@ -1431,3 +1431,18 @@ and `test-x11` timeouts, plus `test-futex-requeue-race` reporting a wake one
 polling quantum late. No baseline or threshold is adjusted. Changed C files
 pass clang-format 22; commentflow is unavailable on this host.
 
+## Memfd descriptor transfer
+
+test-memfd-scm-host launches independent elfuse sender and receiver instances.
+The received descriptor retains its exact memfd name and seal set, shared
+contents and ashmem size. Ordinary unlinked files remain ordinary; descriptor
+reuse clears the identity. The backing-file marker is hidden from guest xattr
+get, set, remove and list operations. Both guest instances exit zero.
+
+Changed C files pass clang-format 22.1.8 and commentflow. The syscall coverage,
+lock-order, atomic, character-set and restart-contract checks pass.
+make check reports 111 passes and one PI futex contention failure (1332/2000
+acquisitions). The arm64 matrix reports 333 passes, one failure and ten skips;
+the same PI case reaches 894/2000. Neither complete gate passes, and no baseline
+or threshold is changed.
+

@@ -68,6 +68,7 @@ NATIVE_TESTS := tests/bench-fd-create-host.c \
                 tests/test-wakeup-pipe-host.c \
                 tests/test-stdio-nonblock-host.c \
                 tests/test-rlimit-unchanged-host.c \
+                tests/test-memfd-scm-host.c \
                 tests/test-guest-env-host.c \
                 tests/test-usb-desc-host.c \
                 tests/test-usbdev-urb-host.c \

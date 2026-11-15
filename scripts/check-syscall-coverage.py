@@ -38,8 +38,6 @@ INDIRECT_COVERAGE: dict[str, str] = {
     "lsetxattr": "Symlink xattr semantics are filesystem-sensitive; audit via fs-xattr code and negative-path tests.",
     "listxattr": "Covered indirectly through xattr plumbing; success-path coverage is filesystem-dependent.",
     "llistxattr": "Symlink xattr list semantics are filesystem-sensitive; retained as indirect coverage.",
-    "flistxattr": "Covered indirectly through xattr plumbing and fd-based xattr checks.",
-    "fgetxattr": "Covered indirectly through xattr plumbing and fd-based xattr checks.",
     "lremovexattr": "Symlink xattr semantics are filesystem-sensitive; retained as indirect coverage.",
     "rt_sigsuspend": "Signal suspension is exercised by higher-level signal tests; direct raw coverage is timing-sensitive.",
     "rt_sigpending": "Signal pending state is exercised indirectly by the signal suite.",

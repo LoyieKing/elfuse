@@ -751,10 +751,11 @@ typedef struct {
     bool path_poll_capable;
 
     /* Identity of a memfd_create region. The host backing is an unlinked
-     * regular file, which is indistinguishable from any other unlinked file, so
-     * the name and this bit travel with the slot through dup and fork and are
-     * cleared when the slot is reused. memfd_name excludes the kernel's
-     * "memfd:" prefix and is at most LINUX_MFD_NAME_MAX bytes.
+     * regular file, so the name and this bit travel with the slot through dup
+     * and fork, and an SCM_RIGHTS receiver in another elfuse process recovers
+     * them from the marker xattr on that file. Cleared when the slot is reused.
+     * memfd_name excludes the kernel's "memfd:" prefix and is at most
+     * LINUX_MFD_NAME_MAX bytes.
      */
     bool is_memfd;
     char memfd_name[LINUX_MFD_NAME_MAX + 1];

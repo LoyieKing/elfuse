@@ -687,13 +687,17 @@ disabled for Rosetta because HVF caches host VA-to-PA at `hv_vm_map`
 time. Validation: `tests/test-msync.c`,
 `tests/test-cross-fork-mapshared.c`.
 
-`memfd_create` preserves its Linux name through dup and fork; proc fd links
-report `/memfd:<name> (deleted)`. Android's `ASHMEM_GET_SIZE` probe reads the
-actual memfd size and rejects ordinary files with `ENOTTY`.
+`memfd_create` preserves its Linux name and seal set through dup, fork, and an
+`SCM_RIGHTS` transfer to an independently launched elfuse: both ride in a
+reserved xattr on the unlinked backing file, so the receiver's proc fd link
+reports `/memfd:<name> (deleted)` and `F_GET_SEALS` matches. Guest xattr calls
+cannot list, read, set, or remove that entry. Android's `ASHMEM_GET_SIZE` probe
+reads the actual memfd size and rejects ordinary files with `ENOTTY`.
 `F_SEAL_FUTURE_WRITE` rejects descriptor writes and new shared writable
 mappings with `EPERM`. Post-seal shared mappings cannot gain write permission
 through `mprotect` (`EACCES`); existing shared mappings retain write access,
 and private mappings retain COW semantics.
+Validation: `tests/test-memfd-scm-host.c`.
 
 ## Threads And Futexes
 

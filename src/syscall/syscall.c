@@ -1940,10 +1940,16 @@ static int64_t sc_memfd_create(guest_t *g,
         return -LINUX_EINVAL;
     }
 
+    int seals = (flags & LINUX_MFD_ALLOW_SEALING) ? 0 : LINUX_F_SEAL_SEAL;
     uint64_t fd_gen = 0;
     int fd = tmpfile_anon("memfd");
     if (fd < 0)
         return linux_errno();
+
+    /* Before the slot exists, so a sibling scanning /proc/self/fd cannot send
+     * the descriptor without the identity on its backing file.
+     */
+    fd_memfd_xattr_write(fd, name, seals);
     int gfd = fd_alloc_from(0, FD_REGULAR, fd, NULL, &fd_gen);
     if (gfd < 0) {
         close(fd);
@@ -1958,8 +1964,7 @@ static int64_t sc_memfd_create(guest_t *g,
     fd_publish_linux_flags(
         gfd,
         LINUX_O_RDWR | ((flags & LINUX_MFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0));
-    fd_table[gfd].seals =
-        (flags & LINUX_MFD_ALLOW_SEALING) ? 0 : LINUX_F_SEAL_SEAL;
+    fd_table[gfd].seals = seals;
     fd_publish_memfd(gfd, fd_gen, name);
     return gfd;
 }

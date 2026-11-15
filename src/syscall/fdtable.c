@@ -13,6 +13,8 @@
 #include <assert.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -21,6 +23,7 @@
 #include <dirent.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
 
 #include "utils.h"
 
@@ -1422,6 +1425,88 @@ void fd_publish_memfd(int guest_fd, uint64_t generation, const char *name)
         fd_table[guest_fd].memfd_name[len] = '\0';
     }
     pthread_mutex_unlock(&fd_lock);
+}
+
+/* The marker value is fixed-width fields followed by the raw guest name; the
+ * parse rejects anything whose length or bits do not match the layout rather
+ * than scanning for a terminator, and the name ceiling bounds the value.
+ */
+#define FD_MEMFD_XATTR_MAGIC 0x4d464458U
+#define FD_MEMFD_XATTR_SEALS                                       \
+    (LINUX_F_SEAL_SEAL | LINUX_F_SEAL_SHRINK | LINUX_F_SEAL_GROW | \
+     LINUX_F_SEAL_WRITE | LINUX_F_SEAL_FUTURE_WRITE)
+
+struct fd_memfd_xattr {
+    uint32_t magic;
+    uint32_t seals;
+    uint32_t name_len;
+    char name[LINUX_MFD_NAME_MAX];
+};
+
+bool fd_memfd_xattr_write(int host_fd, const char *name, int seals)
+{
+    struct fd_memfd_xattr xa = {
+        .magic = FD_MEMFD_XATTR_MAGIC,
+        .seals = (uint32_t) seals,
+    };
+    size_t len = strlen(name);
+    if (len > LINUX_MFD_NAME_MAX)
+        len = LINUX_MFD_NAME_MAX;
+    xa.name_len = (uint32_t) len;
+    memcpy(xa.name, name, len);
+    int rc;
+    do {
+        rc = fsetxattr(host_fd, FD_MEMFD_XATTR_NAME, &xa,
+                       offsetof(struct fd_memfd_xattr, name) + len, 0, 0);
+    } while (rc < 0 && errno == EINTR);
+    return rc == 0;
+}
+
+static bool fd_memfd_xattr_read(int host_fd,
+                                char *name,
+                                size_t name_size,
+                                int *seals)
+{
+    struct fd_memfd_xattr xa;
+    ssize_t n;
+    do {
+        n = fgetxattr(host_fd, FD_MEMFD_XATTR_NAME, &xa, sizeof(xa), 0, 0);
+    } while (n < 0 && errno == EINTR);
+    size_t hdr = offsetof(struct fd_memfd_xattr, name);
+
+    if (n < 0 || (size_t) n < hdr || xa.magic != FD_MEMFD_XATTR_MAGIC ||
+        xa.name_len > LINUX_MFD_NAME_MAX || (size_t) n != hdr + xa.name_len ||
+        (xa.seals & ~(uint32_t) FD_MEMFD_XATTR_SEALS) != 0 ||
+        name_size <= (size_t) xa.name_len)
+        return false;
+    memcpy(name, xa.name, (size_t) xa.name_len);
+    name[xa.name_len] = '\0';
+    *seals = (int) xa.seals;
+    return true;
+}
+
+void fd_memfd_adopt(int guest_fd, int host_fd)
+{
+    char name[LINUX_MFD_NAME_MAX + 1];
+    int saved_errno = errno;
+    int seals = 0;
+
+    if (!fd_memfd_xattr_read(host_fd, name, sizeof(name), &seals)) {
+        errno = saved_errno;
+        return;
+    }
+
+    pthread_mutex_lock(&fd_lock);
+    if (fd_table[guest_fd].type == FD_REGULAR &&
+        fd_table[guest_fd].host_fd == host_fd) {
+        fd_table[guest_fd].is_memfd = true;
+        size_t len = strlen(name);
+        memcpy(fd_table[guest_fd].memfd_name, name, len);
+        fd_table[guest_fd].memfd_name[len] = '\0';
+        fd_table[guest_fd].seals = seals;
+    }
+    pthread_mutex_unlock(&fd_lock);
+    errno = saved_errno;
 }
 
 /* Sized to cover all FD_* constants in abi.h plus a small headroom. Indexed by

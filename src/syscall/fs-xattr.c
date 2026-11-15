@@ -6,8 +6,10 @@
  */
 
 #include <errno.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/xattr.h>
 
 #include "core/guest.h"
@@ -54,6 +56,15 @@ static int64_t xattr_alloc_buf(uint64_t size, void **buf)
     return *buf ? 0 : -LINUX_ENOMEM;
 }
 
+/* The memfd marker is host metadata on an unlinked backing file. Exact-name
+ * calls answer the way Linux answers an unknown xattr namespace, and the list
+ * calls drop the name, so no guest entry point can see or change the identity.
+ */
+static bool xattr_name_reserved(const char *name)
+{
+    return strcmp(name, FD_MEMFD_XATTR_NAME) == 0;
+}
+
 /* Resolve a path-based xattr call and derive the macOS options flag.
  *
  * One choke point for two facts each entry point below would otherwise carry
@@ -90,6 +101,75 @@ static int64_t xattr_copy_out_result(guest_t *g,
     return ret;
 }
 
+/* Drop the reserved name from a host xattr list of @len bytes. Host and Linux
+ * both spell a list as NUL-terminated names; an unterminated tail is ignored
+ * rather than copied out.
+ */
+static size_t xattr_list_filter(char *list, size_t len)
+{
+    size_t in = 0;
+    size_t out = 0;
+
+    while (in < len) {
+        size_t name_len = strnlen(list + in, len - in);
+        size_t entry_len;
+
+        if (name_len == len - in)
+            break;
+        entry_len = name_len + 1;
+        if (!xattr_name_reserved(list + in)) {
+            if (out != in)
+                memcpy(list + out, list + in, entry_len);
+            out += entry_len;
+        }
+        in += entry_len;
+    }
+    return out;
+}
+
+/* Fetch the full host list so the reserved name can be removed before the
+ * caller's size decides success, then report or copy the filtered list. The
+ * guest buffer ceiling bounds this fetch too: a larger aggregate could not be
+ * copied out by the call that asked for it.
+ */
+static int64_t xattr_list_emit(guest_t *g,
+                               const char *host_path,
+                               int fd,
+                               int opts,
+                               uint64_t list_gva,
+                               uint64_t size)
+{
+    ssize_t total = fd >= 0 ? flistxattr(fd, NULL, 0, 0)
+                            : listxattr(host_path, NULL, 0, opts);
+    if (total < 0)
+        return linux_errno();
+    if (total == 0)
+        return 0;
+    if (total > LINUX_XATTR_SIZE_MAX)
+        return -LINUX_E2BIG;
+
+    char *list = malloc((size_t) total);
+    if (!list)
+        return -LINUX_ENOMEM;
+    ssize_t got = fd >= 0 ? flistxattr(fd, list, (size_t) total, 0)
+                          : listxattr(host_path, list, (size_t) total, opts);
+    if (got < 0) {
+        int64_t err = linux_errno();
+        free(list);
+        return err;
+    }
+    size_t kept = xattr_list_filter(list, (size_t) (got > total ? total : got));
+    if (size != 0 && kept > size) {
+        free(list);
+        return -LINUX_ERANGE;
+    }
+    int64_t result =
+        size == 0 ? (int64_t) kept
+                  : xattr_copy_out_result(g, list_gva, list, (ssize_t) kept);
+    free(list);
+    return result;
+}
+
 int64_t sys_getxattr(guest_t *g,
                      uint64_t path_gva,
                      uint64_t name_gva,
@@ -107,6 +187,9 @@ int64_t sys_getxattr(guest_t *g,
     int opts = xattr_resolve_path(path, nofollow, &tx);
     if (opts < 0)
         return opts;
+
+    if (xattr_name_reserved(name))
+        return -LINUX_EOPNOTSUPP;
 
     if (size == 0) {
         ssize_t ret = getxattr(tx.host_path, name, NULL, 0, 0, opts);
@@ -142,6 +225,9 @@ int64_t sys_setxattr(guest_t *g,
     int opts = xattr_resolve_path(path, nofollow, &tx);
     if (opts < 0)
         return opts;
+
+    if (xattr_name_reserved(name))
+        return -LINUX_EOPNOTSUPP;
     int64_t err;
 
     void *buf;
@@ -179,20 +265,7 @@ int64_t sys_listxattr(guest_t *g,
     if (opts < 0)
         return opts;
 
-    if (size == 0) {
-        ssize_t ret = listxattr(tx.host_path, NULL, 0, opts);
-        return ret < 0 ? linux_errno() : ret;
-    }
-
-    void *buf;
-    int64_t err = xattr_alloc_buf(size, &buf);
-    if (err < 0)
-        return err;
-
-    ssize_t ret = listxattr(tx.host_path, buf, (size_t) size, opts);
-    int64_t result = xattr_copy_out_result(g, list_gva, buf, ret);
-    free(buf);
-    return result;
+    return xattr_list_emit(g, tx.host_path, -1, opts, list_gva, size);
 }
 
 int64_t sys_removexattr(guest_t *g,
@@ -210,6 +283,9 @@ int64_t sys_removexattr(guest_t *g,
     int opts = xattr_resolve_path(path, nofollow, &tx);
     if (opts < 0)
         return opts;
+
+    if (xattr_name_reserved(name))
+        return -LINUX_EOPNOTSUPP;
     int ret = removexattr(tx.host_path, name, opts);
     return ret < 0 ? linux_errno() : 0;
 }
@@ -229,6 +305,11 @@ int64_t sys_fgetxattr(guest_t *g,
     if (guest_read_str(g, name_gva, name, sizeof(name)) < 0) {
         host_fd_ref_close(&host_ref);
         return -LINUX_EFAULT;
+    }
+
+    if (xattr_name_reserved(name)) {
+        host_fd_ref_close(&host_ref);
+        return -LINUX_EOPNOTSUPP;
     }
 
     if (size == 0) {
@@ -273,6 +354,11 @@ int64_t sys_fsetxattr(guest_t *g,
         return -LINUX_EFAULT;
     }
 
+    if (xattr_name_reserved(name)) {
+        host_fd_ref_close(&host_ref);
+        return -LINUX_EOPNOTSUPP;
+    }
+
     void *buf;
     err = xattr_alloc_buf(size, &buf);
     if (err < 0) {
@@ -307,22 +393,7 @@ int64_t sys_flistxattr(guest_t *g, int fd, uint64_t list_gva, uint64_t size)
     if (ref_err < 0)
         return ref_err;
 
-    if (size == 0) {
-        ssize_t ret = flistxattr(host_ref.fd, NULL, 0, 0);
-        host_fd_ref_close(&host_ref);
-        return ret < 0 ? linux_errno() : ret;
-    }
-
-    void *buf;
-    int64_t err = xattr_alloc_buf(size, &buf);
-    if (err < 0) {
-        host_fd_ref_close(&host_ref);
-        return err;
-    }
-
-    ssize_t ret = flistxattr(host_ref.fd, buf, (size_t) size, 0);
-    int64_t result = xattr_copy_out_result(g, list_gva, buf, ret);
-    free(buf);
+    int64_t result = xattr_list_emit(g, NULL, host_ref.fd, 0, list_gva, size);
     host_fd_ref_close(&host_ref);
     return result;
 }
@@ -342,6 +413,11 @@ int64_t sys_fremovexattr(guest_t *g, int fd, uint64_t name_gva)
     if (guest_read_str(g, name_gva, name, sizeof(name)) < 0) {
         host_fd_ref_close(&host_ref);
         return -LINUX_EFAULT;
+    }
+
+    if (xattr_name_reserved(name)) {
+        host_fd_ref_close(&host_ref);
+        return -LINUX_EOPNOTSUPP;
     }
 
     int ret = fremovexattr(host_ref.fd, name, 0);

@@ -1072,8 +1072,7 @@ int64_t sys_openat_path(guest_t *g,
     return guest_fd;
 }
 
-/*
- * ELFUSE_OPEN_TRACE=1 ranks openat paths by the host CPU time each call
+/* ELFUSE_OPEN_TRACE=1 ranks openat paths by the host CPU time each call
  * consumes and prints the most expensive ones every 2000 opens. The counters
  * live in a fixed probe table so tracing never allocates on the open path.
  */
@@ -1175,7 +1174,8 @@ int64_t sys_openat(guest_t *g,
         return sys_openat_path(g, dirfd, pathp, linux_flags, mode);
     }
     const uint64_t open_start = open_trace_cpu_ns();
-    const int64_t open_result = sys_openat_path(g, dirfd, pathp, linux_flags, mode);
+    const int64_t open_result =
+        sys_openat_path(g, dirfd, pathp, linux_flags, mode);
     open_trace_add(pathp, open_trace_cpu_ns() - open_start);
     return open_result;
 }
@@ -2263,7 +2263,14 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
             host_fd_ref_close(&host_ref);
             return -LINUX_EINVAL;
         }
-        fd_set_seals_for_aliases(fd, host_ref.fd, cur | new_seals);
+        int seals = cur | new_seals;
+        fd_set_seals_for_aliases(fd, host_ref.fd, seals);
+
+        /* The backing file is what an SCM_RIGHTS receiver reads; an ordinary
+         * file has no memfd marker to update.
+         */
+        if (fd_snap.is_memfd)
+            fd_memfd_xattr_write(host_ref.fd, fd_snap.memfd_name, seals);
         host_fd_ref_close(&host_ref);
         return 0;
     }
@@ -3137,8 +3144,8 @@ int64_t sys_pipe2(guest_t *g, uint64_t fds_gva, int linux_flags)
  *
  * d_off on the primary side is the telldir cookie of the next entry, and the
  * backing side counts its own entries from 1, so a SEEK_SET past the primary
- * end is not representable; only the positions the walk itself reported are.
- * A rewind also restarts the union, so the backing is drained afresh.
+ * end is not representable; only the positions the walk itself reported are. A
+ * rewind also restarts the union, so the backing is drained afresh.
  */
 static int64_t dir_stream_lseek(int fd, int64_t offset, int whence)
 {

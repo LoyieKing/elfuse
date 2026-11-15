@@ -675,6 +675,25 @@ void fd_publish_linux_flags(int guest_fd, int linux_flags);
  */
 void fd_publish_memfd(int guest_fd, uint64_t generation, const char *name);
 
+/* The xattr that carries a memfd's Linux identity and seal set on its unlinked
+ * backing file. An SCM_RIGHTS transfer hands a second elfuse process the same
+ * inode and nothing else, so without this marker that side has no name and no
+ * seals. Guest xattr calls reserve the name and never see it; see fs-xattr.c.
+ */
+#define FD_MEMFD_XATTR_NAME "com.elfuse.memfd"
+
+/* Write the marker on @host_fd's backing file. False when the host filesystem
+ * does not keep the xattr; the in-process identity still serves this elfuse.
+ */
+bool fd_memfd_xattr_write(int host_fd, const char *name, int seals);
+
+/* Apply the marker to @guest_fd after an inbound descriptor is published, so a
+ * received memfd answers as one. Covers guest SCM_RIGHTS and pidfd_getfd, whose
+ * internal transport is the same. @host_fd is the descriptor stored in that
+ * slot.
+ */
+void fd_memfd_adopt(int guest_fd, int host_fd);
+
 /* Republish the EL1 urandom read fast-path bit for this fd from the current
  * fd_table type and access mode. Only readable /dev/urandom descriptors are
  * eligible for the bitmap.

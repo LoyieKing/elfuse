@@ -381,6 +381,12 @@ $(BUILD_DIR)/test-rlimit-unchanged-host: tests/test-rlimit-unchanged-host.c | $(
 	@echo "  CC      $<"
 	$(Q)$(CC) $(CFLAGS) -Itests -o $@ $<
 
+# test-memfd-scm-host launches two independent elfuse instances and passes a
+# memfd between them, which no single-process test can cover.
+$(BUILD_DIR)/test-memfd-scm-host: tests/test-memfd-scm-host.c | $(BUILD_DIR)
+	@echo "  CC      $<"
+	$(Q)$(CC) $(CFLAGS) -Itests -o $@ $<
+
 # Guest test binaries (cross-compiled, aarch64-linux)
 # Only used when GUEST_TEST_BINARIES is not set.
 

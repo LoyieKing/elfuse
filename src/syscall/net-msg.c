@@ -996,6 +996,12 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
                         fds[i] = -1;
                     } else {
                         fds[i] = gfd;
+
+                        /* The sender may be an independently launched elfuse;
+                         * the backing file's marker is the only identity the
+                         * two processes share.
+                         */
+                        fd_memfd_adopt(gfd, host_recv_fd);
                         if (scm_nfds < (int) ARRAY_SIZE(scm_gfds)) {
                             scm_gfds[scm_nfds] = gfd;
                             scm_hfds[scm_nfds] = host_recv_fd;

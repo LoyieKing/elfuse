@@ -1721,6 +1721,7 @@ static int64_t getfd_cross_process(pid_t host_pid,
             close(got_fd);
             return gfd < 0 ? gfd : -LINUX_EMFILE;
         }
+        fd_memfd_adopt(gfd, got_fd);
         return getfd_force_cloexec(gfd);
     }
 

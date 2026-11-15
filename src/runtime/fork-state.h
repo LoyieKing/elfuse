@@ -136,9 +136,9 @@ typedef struct {
     int32_t sock_type;
     char proc_path[FD_VIRTUAL_PATH_MAX];
 
-    /* memfd_create identity. The host backing is an unlinked regular file, so
-     * neither the name nor the memfd bit can be recovered from the descriptor
-     * the child receives.
+    /* memfd_create identity. The host backing is an unlinked regular file; the
+     * child rebuilds the record from this entry, which keeps its table
+     * independent of the marker xattr the descriptor also carries.
      */
     int32_t is_memfd;
     char memfd_name[LINUX_MFD_NAME_MAX + 1];
