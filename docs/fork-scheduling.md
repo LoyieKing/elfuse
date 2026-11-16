@@ -70,6 +70,13 @@ IPC still carries fork state, lifecycle events, signals, shared-resource
 operations and supported remote task attribute requests. Local scheduling
 does not require per-switch IPC or cross-VM stop/grant acknowledgments.
 
+Independent launchers may assign a guest PID/PPID with `--pid` and `--ppid`.
+These values seed the initial thread, process group and session before guest
+startup; fork children retain their inherited group/session and exec retains
+identity. This does not join independent scheduler domains. UNIX peer
+credentials use the actual host peer and its validated published guest
+identity, rather than substituting the querying process's credentials.
+
 ## Fork snapshot consistency
 
 Stopping every vCPU is insufficient when host threads can mutate guest memory.

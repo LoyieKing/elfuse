@@ -162,6 +162,24 @@ void proc_set_initial_ids(uint32_t uid, uint32_t gid);
  */
 void proc_clear_initial_ids(void);
 
+/* Stage the initial guest PID/PPID (--pid/--ppid) before proc_init, so
+ * getpid()/getppid(), the shim identity cache, the main thread's TGID/TID, and
+ * /proc all see the same identity and so proc_alloc_pid() never reuses it. The
+ * staged identity is also the initial session and process group.
+ *
+ * Returns false without disturbing an earlier staging when pid is outside
+ * [1, INT_MAX] or ppid outside [0, INT_MAX]. ppid 0 is the default and means
+ * the process has no parent in this namespace. Consumed by the next
+ * proc_identity_init.
+ */
+bool proc_set_initial_identity(int64_t pid, int64_t ppid);
+
+/* Drop a staged identity that no proc_identity_init consumed: a launch failing
+ * between proc_set_initial_identity and proc_init would otherwise apply the
+ * failed launch's identity to the next bring-up in the same host process.
+ */
+void proc_clear_initial_identity(void);
+
 /* Store the guest command line for /proc/self/cmdline emulation. argv is a
  * NULL-terminated array of strings.
  */
@@ -193,6 +211,24 @@ const void *proc_get_auxv(size_t *len_out);
 
 /* Set guest identity (called from fork_child_main). */
 void proc_set_identity(int64_t pid, int64_t ppid);
+
+/* Publish this process's guest PID and effective guest UID/GID for SO_PEERCRED
+ * lookups by another elfuse VM, which cannot read this process's per-family
+ * namespace registry. The record lives in the per-user private temp directory,
+ * keyed by host PID and host start time, and is republished whenever the
+ * identity or credentials change.
+ */
+void proc_peer_identity_publish(void);
+
+/* Resolve a live peer host PID to the identity its elfuse process published.
+ * Returns false when the peer is not an elfuse process, published no record, or
+ * the record is stale; callers fail closed rather than report their own
+ * identity. The record's guest PID need not equal the host PID.
+ */
+bool proc_peer_identity_lookup(pid_t host_pid,
+                               int64_t *guest_pid,
+                               uint32_t *uid,
+                               uint32_t *gid);
 
 /* Soft CLONE_NEWPID: this process is the init of a fake pid ns. Used so
  * /proc/self/fdinfo NSpid reports 0 for pidfds of processes outside our ns
@@ -308,7 +344,10 @@ void rseq_set_cpu_ids(guest_t *g,
                       uint32_t cpu,
                       uint32_t node);
 
-/* Allocate next guest PID (called from sys_clone). */
+/* Allocate the next guest PID for a clone child or thread. The result never
+ * repeats this process's own PID or PPID, which an explicit --pid/--ppid can
+ * place inside the shared sequence range.
+ */
 int64_t proc_alloc_pid(void);
 
 /* SoftNS CLONE_THREAD registry: map guest tid -> host pid / tgid so a parent
@@ -349,6 +388,15 @@ const char *proc_get_sysroot(void);
 bool proc_sysroot_snapshot(char *out, size_t outsz);
 void proc_set_sysroot_casefold(bool enabled);
 bool proc_sysroot_casefold_enabled(void);
+
+/* --strict-sysroot: absolute guest paths never fall back to a host spelling,
+ * and a relative name is confined to the sysroot unless the descriptor it is
+ * measured against is one the host passed in. Set once by the launcher before
+ * any vCPU runs, carried to fork children over the fork IPC, and never read
+ * from the guest environment.
+ */
+void proc_set_sysroot_strict(bool enabled);
+bool proc_sysroot_strict_enabled(void);
 
 /* Resolve an absolute guest path through the stored sysroot.
  *

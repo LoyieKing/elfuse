@@ -1084,8 +1084,8 @@ int64_t sys_getpeername(guest_t *g,
         memset(&mac_sa, 0, sizeof(mac_sa));
         sun->sun_family = AF_UNIX;
         memcpy(sun->sun_path, path, sizeof(path));
-        sun->sun_len = (uint8_t) (offsetof(struct sockaddr_un, sun_path) +
-                                  sizeof(path));
+        sun->sun_len =
+            (uint8_t) (offsetof(struct sockaddr_un, sun_path) + sizeof(path));
         mac_len = sun->sun_len;
     }
 
@@ -1666,6 +1666,82 @@ static inline uint32_t sockopt_write_len(uint32_t actual_len,
     return actual_len < guest_optlen ? actual_len : guest_optlen;
 }
 
+/* Linux ucred for an AF_UNIX peer. Darwin reports the peer's host PID
+ * (LOCAL_PEERPID); the guest PID and the peer's emulated effective IDs come
+ * from the fork-family registry or from the record the peer itself published,
+ * never from this process's identity. A same-process socketpair keeps the
+ * existing self identity. Anything else fails closed: a connected socket whose
+ * peer cannot be mapped has no guest credential to report.
+ */
+static int64_t net_unix_peer_cred(int fd, linux_ucred_t *cred)
+{
+    host_fd_ref_t host_ref = HOST_FD_REF_INIT;
+    int64_t guest_pid = -1;
+    int64_t peer_pid = 0;
+    uint32_t uid = 0, gid = 0;
+    pid_t host_pid = 0;
+
+    int64_t rc = host_fd_ref_open(fd, &host_ref);
+    if (rc < 0)
+        return rc;
+
+    struct sockaddr_storage addr;
+    socklen_t addr_len = sizeof(addr);
+    if (getsockname(host_ref.fd, (struct sockaddr *) &addr, &addr_len) < 0) {
+        rc = linux_errno();
+        goto out;
+    }
+    if (addr.ss_family != AF_UNIX) {
+        rc = -LINUX_ENOPROTOOPT;
+        goto out;
+    }
+
+    socklen_t host_pid_len = sizeof(host_pid);
+    if (getsockopt(host_ref.fd, SOL_LOCAL, LOCAL_PEERPID, &host_pid,
+                   &host_pid_len) < 0) {
+        rc = (errno == ENOTCONN || errno == EINVAL) ? -LINUX_ENOTCONN
+                                                    : linux_errno();
+        goto out;
+    }
+    if (host_pid <= 0) {
+        rc = -LINUX_ENOTCONN;
+        goto out;
+    }
+
+    if (host_pid == getpid()) {
+        cred->pid = (int32_t) proc_get_pid();
+        cred->uid = proc_get_euid();
+        cred->gid = proc_get_egid();
+        rc = 0;
+        goto out;
+    }
+
+    guest_pid = proc_host_to_guest_pid(host_pid);
+    if (!proc_peer_identity_lookup(host_pid, &peer_pid, &uid, &gid)) {
+        rc = -LINUX_ENOTCONN;
+        goto out;
+    }
+    if (guest_pid > 0 && guest_pid != peer_pid) {
+        /* The family registry and the peer's own record disagree. */
+        rc = -LINUX_ENOTCONN;
+        goto out;
+    }
+    if (guest_pid <= 0)
+        guest_pid = peer_pid;
+    if (guest_pid < 1 || guest_pid > INT_MAX) {
+        rc = -LINUX_ENOTCONN;
+        goto out;
+    }
+    cred->pid = (int32_t) guest_pid;
+    cred->uid = uid;
+    cred->gid = gid;
+    rc = 0;
+
+out:
+    host_fd_ref_close(&host_ref);
+    return rc;
+}
+
 int64_t sys_getsockopt(guest_t *g,
                        int fd,
                        int level,
@@ -1683,24 +1759,23 @@ int64_t sys_getsockopt(guest_t *g,
         0)
         return -LINUX_EFAULT;
 
-    /* SO_PEERCRED: synthesize struct ucred from guest identity. macOS has
-     * LOCAL_PEERCRED but returns a different struct; fabricate the Linux ucred
-     * with the guest's own PID/UID/GID, which is correct for AF_UNIX sockets
-     * within the same elfuse instance.
+    /* SO_PEERCRED: report the peer's emulated identity, not this process's.
+     * The peer may be a fork child of this VM or an independently spawned
+     * elfuse worker whose guest PID was fixed by --pid.
      */
     if (level == LINUX_SOL_SOCKET && optname == LINUX_SO_PEERCRED) {
         if (!net_socket_fd_is_valid(fd))
             return -LINUX_EBADF;
-        linux_ucred_t cred = {
-            .pid = (int32_t) proc_get_pid(),
-            .uid = proc_get_uid(),
-            .gid = proc_get_gid(),
-        };
+        linux_ucred_t cred;
+        int64_t rc = net_unix_peer_cred(fd, &cred);
+        if (rc < 0)
+            return rc;
         uint32_t out_len =
             sockopt_write_len((uint32_t) sizeof(cred), guest_optlen);
         if (out_len > 0 && guest_write_small(g, optval_gva, &cred, out_len) < 0)
             return -LINUX_EFAULT;
-        uint32_t actual_len = sizeof(cred);
+        /* Linux records the number of bytes it copied, not the full ucred. */
+        uint32_t actual_len = out_len;
         if (guest_write_small(g, optlen_gva, &actual_len, sizeof(actual_len)) <
             0)
             return -LINUX_EFAULT;

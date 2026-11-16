@@ -61,6 +61,29 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         check-name-caseexact test-sysroot-path-matrix \
         test-usage-synopsis \
         probe-volume-naming perf
+.PHONY: test-initial-identity test-strict-sysroot
+
+test-initial-identity: $(ELFUSE_BIN) $(TEST_DIR)/test-initial-identity
+	@bash tests/test-initial-identity.sh $(ELFUSE_BIN) $(TEST_DIR)/test-initial-identity
+
+test-strict-sysroot: $(ELFUSE_BIN) $(BUILD_DIR)/test-strict-sysroot
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	outside=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir" "$$outside"' EXIT; \
+	mkdir -p "$$tmpdir/d" "$$tmpdir/data" "$$tmpdir/bin"; \
+	printf 'inside-sysroot\n' > "$$tmpdir/d/inside.txt"; \
+	printf 'SECRET-HOST-FILE\n' > "$$outside/secret.txt"; \
+	ln -s /d/inside.txt "$$tmpdir/d/good-link"; \
+	ln -s "$$outside/secret.txt" "$$tmpdir/d/host-link"; \
+	ln -s "$$outside" "$$tmpdir/d/host-dir"; \
+	cp $(BUILD_DIR)/test-strict-sysroot "$$tmpdir/bin/strict-probe"; \
+	$(ELFUSE_BIN) --sysroot "$$tmpdir" --strict-sysroot \
+	    /bin/strict-probe "$$outside"; \
+	test ! -e "$$outside/evil.txt"; \
+	test ! -e "$$outside/sock"; \
+	test -f "$$tmpdir/data/new.txt"
+
 
 ## Build and run the assembly hello world test
 test-hello: $(ELFUSE_BIN) $(TEST_HELLO_DEP)
@@ -345,6 +368,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract ch
 	$(call run-lane,test-sysroot-tmp-remove,sysroot /tmp remove/rename consistency)
 	$(call run-lane,test-sysroot-case-exact,sysroot byte-exact lookup validation)
 	$(call run-lane,test-sysroot-symlink-escape,sysroot relative-dirfd symlink escape validation)
+	$(call run-lane,test-strict-sysroot,strict sysroot isolation)
+	$(call run-lane,test-initial-identity,explicit initial guest identity)
 	$(call run-lane,test-sysroot-symlink-chain-splice,symlink chains spliced over the unconsumed path)
 	$(call run-lane,test-sysroot-openat2-walk,no-symlinks path walking)
 	$(call run-lane,test-sysroot-dotdot,sysroot '..' resolution)

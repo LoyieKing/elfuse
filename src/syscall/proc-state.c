@@ -70,6 +70,18 @@ static _Atomic bool sysroot_casefold = false;
  */
 static _Atomic bool sysroot_canonical = false;
 
+/* --strict-sysroot: no host fallback for an absolute guest path, and relative
+ * names only through descriptors the host passed in. Atomic for the same
+ * reason as the fold flag above: published once at startup and to a forked
+ * child before any vCPU thread issues a syscall.
+ *
+ * Deliberately absent from proc_state_init(): the bootstrap interpreter probe
+ * resolves the guest image before proc_init() runs, so the policy has to hold
+ * from the launcher's one store onward. A fork child is a fresh process that
+ * receives the value over the fork IPC instead.
+ */
+static _Atomic bool sysroot_strict = false;
+
 /* Cached current working directory for getcwd() and /proc/self/cwd. */
 static pthread_mutex_t cwd_lock = PTHREAD_MUTEX_INITIALIZER;
 static char cwd_path[LINUX_PATH_MAX] = {0};
@@ -452,6 +464,16 @@ bool proc_sysroot_casefold_enabled(void)
     return atomic_load_explicit(&sysroot_casefold, memory_order_relaxed);
 }
 
+void proc_set_sysroot_strict(bool enabled)
+{
+    atomic_store_explicit(&sysroot_strict, enabled, memory_order_relaxed);
+}
+
+bool proc_sysroot_strict_enabled(void)
+{
+    return atomic_load_explicit(&sysroot_strict, memory_order_relaxed);
+}
+
 /* True when realpath(3) failed because the path stopped resolving rather than
  * because it resolves somewhere it should not. A sibling thread or process can
  * unlink or rename the entry between the resolver's existence probe and this
@@ -696,6 +718,36 @@ static bool clamp_dotdot_at_guest_root(char *dest,
         dest[out++] = '/';
     dest[out] = '\0';
     return true;
+}
+
+/* The sysroot spelling of a guest path: the prefix plus the path with '..'
+ * clamped at the guest root. Strict mode hands this back where the default
+ * policy hands the host literal, so the caller's own syscall answers
+ * ENOENT/ENOTDIR inside the tree rather than acting on an unrelated host
+ * file.
+ */
+static const char *sysroot_spelling(const char *sr,
+                                    const char *guest,
+                                    char *buf,
+                                    size_t bufsz)
+{
+    char clamped[LINUX_PATH_MAX];
+
+    if (!clamp_dotdot_at_guest_root(clamped, guest, LINUX_PATH_MAX)) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    int n = snprintf(buf, bufsz, "%s%s", sr, clamped);
+    if (n < 0) {
+        if (errno == 0)
+            errno = EINVAL;
+        return NULL;
+    }
+    if ((size_t) n >= bufsz) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    return buf;
 }
 
 /* Snapshot the sysroot, clamp @path, and spell the host path it names.
@@ -1055,10 +1107,22 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
                                                    bool follow_final)
 {
     char sr[LINUX_PATH_MAX], clamped[LINUX_PATH_MAX];
+    bool strict = proc_sysroot_strict_enabled();
     int seeded =
         sysroot_seed_host_path(path, buf, bufsz, sr, clamped, follow_final);
-    if (seeded <= 0)
-        return seeded < 0 ? NULL : path;
+    if (seeded < 0)
+        return NULL;
+    if (seeded == 0) {
+        /* Strict mode has no root to confine resolution to, so an absolute
+         * name is refused rather than answered from the host. A relative one
+         * is the caller's dirfd walk, decided in path_translate_at.
+         */
+        if (strict && path && path[0] == '/') {
+            errno = ENOENT;
+            return NULL;
+        }
+        return path;
+    }
 
     /* Moves to the link's target once one is followed, so everything below
      * decides from where resolution actually ended up.
@@ -1175,6 +1239,19 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
         return buf;
     }
 
+    /* Strict mode answers from the sysroot spelling of where resolution ended,
+     * never from the host. The guest spelling is clamped the same way the seed
+     * clamps it, because a followed link target is an ordinary guest path:
+     * absolute, and free to carry '..' above the root.
+     */
+    char strict_buf[LINUX_PATH_MAX];
+    const char *fallback = path;
+    if (strict) {
+        fallback = sysroot_spelling(sr, lookup, strict_buf, sizeof(strict_buf));
+        if (!fallback)
+            return NULL;
+    }
+
     /* The sysroot holds an entry where this path asked, spelled differently, so
      * the path is absent to a byte-exact reader but the sysroot has a claim on
      * it, and the answer Linux owes is ENOENT. Falling through would open an
@@ -1192,7 +1269,7 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
         return buf;
 
     char real_input_path[LINUX_PATH_MAX];
-    if (!forced_original_path && realpath(path, real_input_path)) {
+    if (!strict && !forced_original_path && realpath(path, real_input_path)) {
         size_t sr_len = strlen(sr);
         if (strncmp(real_input_path, sr, sr_len) != 0 ||
             (sr_len != 1 && real_input_path[sr_len] != '\0' &&
@@ -1220,9 +1297,13 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
      * target's guest spelling. For non-forced paths, keep the same host
      * fallback rule as a path the guest typed directly: if the target exists on
      * the host, hand that resolved target to the caller; otherwise leave the
-     * syscall on the sysroot spelling so dangling links report normally.
+     * syscall on the sysroot spelling so dangling links report normally. Strict
+     * mode never takes the host arm: the target's own sysroot spelling is the
+     * only answer, whether it exists there or not.
      */
     if (followed_link) {
+        if (strict)
+            return fallback;
         if (!followed_relative_link &&
             sysroot_path_exists(path_to_check, follow_final))
             return copy_host_fallback_path(path_to_check, buf, bufsz);
@@ -1235,7 +1316,7 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
         return buf;
     }
 
-    return path;
+    return fallback;
 }
 
 const char *proc_resolve_sysroot_path(const char *path, char *buf, size_t bufsz)
@@ -1256,9 +1337,20 @@ const char *proc_resolve_sysroot_create_path(const char *path,
                                              bool create_parents)
 {
     char sr[LINUX_PATH_MAX], clamped[LINUX_PATH_MAX];
+    bool strict = proc_sysroot_strict_enabled();
     int seeded = sysroot_seed_host_path(path, buf, bufsz, sr, clamped, false);
-    if (seeded <= 0)
-        return seeded < 0 ? NULL : path;
+    if (seeded < 0)
+        return NULL;
+    if (seeded == 0) {
+        /* Same fail-closed rule as the lookup resolvers: an absolute name with
+         * no root configured is refused, not created on the host.
+         */
+        if (strict && path && path[0] == '/') {
+            errno = ENOENT;
+            return NULL;
+        }
+        return path;
+    }
 
     /* Moves to the link's target once one is followed, so everything below
      * decides from where resolution actually ended up.
@@ -1384,20 +1476,30 @@ const char *proc_resolve_sysroot_create_path(const char *path,
 
     /* Parent doesn't exist in sysroot. Only the temp roots and the guest system
      * directories are forced to resolve there; everything else falls back to
-     * the host literal.
+     * the host literal. Strict mode has no host literal: the create lands on
+     * the sysroot spelling, and the parent it would need is the guest's to
+     * make. Creating that parent here would answer a create Linux denies with
+     * ENOENT, while for the forced classes the auto-provisioning is the point
+     * rather than a side effect.
      */
     char norm_path[LINUX_PATH_MAX];
     bool has_norm =
         lexical_normalize_absolute_path(norm_path, lookup, sizeof(norm_path));
     const char *path_to_check = has_norm ? norm_path : lookup;
+    bool forced_class = is_sysroot_backed_temp_path(path_to_check) ||
+                        is_guest_system_path(path_to_check);
 
-    if (!is_sysroot_backed_temp_path(path_to_check) &&
-        !is_guest_system_path(path_to_check)) {
-        if (followed_link) {
-            errno = ELOOP;
-            return NULL;
+    if (!forced_class) {
+        if (!strict) {
+            if (followed_link) {
+                errno = ELOOP;
+                return NULL;
+            }
+            return path;
         }
-        return path;
+        if (sysroot_validate_dir_prefix(parent) < 0)
+            return NULL;
+        return buf;
     }
 
     if (!create_parents) {

@@ -22,11 +22,14 @@ Supported user-facing options:
 | `--rss=approx\|exact` | How `/proc` reports resident pages (default `approx`); `--rss MODE` also works |
 | `--sysroot PATH` | Resolve guest absolute paths under `PATH`, falling back to the host for paths it does not hold |
 | `--create-sysroot PATH` | Provision a case-sensitive APFS sparsebundle mounted at `PATH`, then use it as the sysroot |
+| `--strict-sysroot` | Remove the host fallback for absolute guest paths; requires `--sysroot` or `--create-sysroot` |
 | `--no-rosetta` | Disable the x86_64-via-Rosetta translator (also `ELFUSE_NO_ROSETTA=1`) |
 | `--fakeroot` | Start the guest as uid/gid 0 with full emulated capabilities (also `ELFUSE_FAKEROOT=1`) |
 | `--gdb PORT` | Listen for a GDB RSP client on `PORT` (aarch64 guests only) |
 | `--gdb-stop-on-entry` | Stop before the first guest instruction |
 | `--user UID[:GID]` | Run the guest as `UID`, and `GID` when given (defaults to `UID`). Numeric only |
+| `--pid N` | Guest PID to report, from `1` to `INT_MAX` (default `1`) |
+| `--ppid N` | Guest parent PID to report, from `0` to `INT_MAX` (default `0`); requires `--pid` |
 | `--workdir DIR` | Guest-absolute initial working directory, resolved under `--sysroot` |
 | `--env KEY=VALUE` | Set a guest environment variable. Repeatable; a bare `KEY` imports the host value |
 | `--clear-env` | Start from an empty environment; only `--env` entries apply |
@@ -91,12 +94,12 @@ Fork inherits the mode and exec preserves it.
 
 ## Guest Identity, Working Directory, And Environment
 
-`--user`, `--workdir`, `--env`, and `--clear-env` select what the guest starts as,
-where it starts, and what it sees in its environment. A contradictory `--user`
-request or a malformed `--env` entry is rejected before the VM is created, and
-`--workdir` is resolved during bring-up, before the first guest instruction, so
-a bad request fails with a diagnostic instead of launching a guest that runs as
-something other than what was asked for.
+`--user`, `--pid`, `--ppid`, `--workdir`, `--env`, and `--clear-env` select
+what the guest starts as, where it starts, and what it sees in its environment.
+A contradictory `--user` request or a malformed `--env` entry is rejected
+before the VM is created, and `--workdir` is resolved during bring-up, before
+the first guest instruction, so a bad request fails with a diagnostic instead
+of launching a guest that runs as something other than what was asked for.
 
 By default the guest inherits the host's real and effective UID/GID. Saved IDs
 start at the corresponding effective IDs. These values initialize guest state;
@@ -110,6 +113,16 @@ files take precedence; inheriting a numeric ID does not import macOS usernames.
 `getgid`. It does not change the host process credentials: elfuse translates the
 guest's syscalls, so the number the guest sees is elfuse's to choose. The spec is
 numeric, and a bare `UID` sets the group to the same value.
+
+`--pid N` and `--ppid N` set the identity the guest reports through `getpid`
+and `getppid`, and the initial session and process group. The defaults are PID
+`1` and parent PID `0`; `--pid` alone leaves the parent at `0`, and `--ppid`
+without `--pid` is refused. Values are decimal digits with no sign or leading
+space, bounded to `1` through `INT_MAX` for `--pid` and `0` through `INT_MAX`
+for `--ppid`, and rejected before the VM is created. A launcher running several
+elfuse VMs beside each other assigns a distinct pair to each; the descendant
+allocator skips both IDs, so a fork never lands on the guest's own or its
+declared parent's identity.
 
 `--fakeroot` cannot be combined with a non-root `--user`. Fakeroot starts the guest
 as uid/gid 0, and the setuid permission check grants every id switch on that basis,
@@ -257,7 +270,8 @@ the SHA-256-keyed translations.
 Dynamic Linux guests need a sysroot that contains the expected interpreter and
 shared libraries. `elfuse` reads `PT_INTERP`, loads the requested interpreter
 from the supplied sysroot, and redirects guest absolute-path opens to that tree,
-falling back to the host filesystem for paths the sysroot does not hold.
+falling back to the host filesystem for paths the sysroot does not hold, unless
+`--strict-sysroot` is given.
 
 Example:
 
@@ -286,6 +300,14 @@ Practical notes:
   the sysroot itself lives in is not reachable from the guest.
 - The sysroot setting is preserved across guest `fork` and `execve`, so spawned
   children see the same view of the filesystem.
+- `--strict-sysroot` removes the host fallback for absolute guest paths: a
+  name the sysroot does not hold reports `ENOENT` instead of opening a
+  same-named host file, and a create resolves inside the sysroot rather than
+  creating a same-named host path. The flag requires `--sysroot` or
+  `--create-sysroot`, is preserved across guest `fork` and `execve`, and has no
+  environment-variable form. A relative path measured from a descriptor inside
+  the sysroot is handed back as a confined absolute path; a descriptor the host
+  passed in names a subtree outside the root and keeps its own relative walk.
 - On case-insensitive macOS volumes, `elfuse` keeps Linux's byte-exact name
   semantics: a lookup whose spelling differs from the on-disk entry only by
   case or Unicode normalization form reports `ENOENT`, and a name the volume

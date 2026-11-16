@@ -763,6 +763,16 @@ int64_t proc_alloc_pid(void)
     if (next < 2 || next > INT_MAX)
         goto out;
 
+    /* An explicit --pid/--ppid can sit anywhere in the sequence range. Skipping
+     * the identity's two ids keeps the allocation O(1); advancing the sequence
+     * past a large --pid would strand every pid below it.
+     */
+    while (proc_pid_is_reserved(next)) {
+        if (next >= INT_MAX)
+            goto out;
+        next++;
+    }
+
     int64_t pid = next;
     next++;
     size_t done = 0;
@@ -2394,6 +2404,21 @@ pid_t proc_resolve_guest_pid(int64_t guest_pid)
     return host_pid > 0 ? host_pid : proc_namespace_host_pid(guest_pid);
 }
 
+/* True when host process @pid runs this exact elfuse binary, the check that
+ * keeps a recycled host pid from being mistaken for a family member.
+ */
+static bool host_runs_this_elfuse(pid_t pid)
+{
+    char our_path[PROC_PIDPATHINFO_MAXSIZE];
+    int our_len = proc_pidpath(getpid(), our_path, sizeof(our_path));
+    if (our_len <= 0)
+        return false;
+    char peer_path[PROC_PIDPATHINFO_MAXSIZE];
+    int peer_len = proc_pidpath(pid, peer_path, sizeof(peer_path));
+    return peer_len == our_len &&
+           memcmp(peer_path, our_path, (size_t) our_len) == 0;
+}
+
 int64_t proc_host_to_guest_pid(pid_t host_pid)
 {
     pthread_mutex_lock(&pid_lock);
@@ -2423,15 +2448,131 @@ int64_t proc_host_to_guest_pid(pid_t host_pid)
     /* Guard against host pid reuse: only trust the hit if the pid still runs
      * this elfuse binary, same check as proc_get_namespace_targets.
      */
-    char our_path[PROC_PIDPATHINFO_MAXSIZE];
-    int our_len = proc_pidpath(getpid(), our_path, sizeof(our_path));
-    if (our_len <= 0)
-        return -1;
-    char ppath[PROC_PIDPATHINFO_MAXSIZE];
-    int plen = proc_pidpath(host_pid, ppath, sizeof(ppath));
-    if (plen != our_len || memcmp(ppath, our_path, (size_t) our_len))
+    if (!host_runs_this_elfuse(host_pid))
         return -1;
     return ctx.guest_pid;
+}
+
+/* One elfuse process's emulated identity, published for SO_PEERCRED lookups
+ * from another elfuse VM. That reader cannot see this process's namespace
+ * registry, which is per family, and the host only exposes the peer's PID.
+ */
+#define PEER_IDENTITY_MAGIC 0x50454552u /* "PEER" */
+#define PEER_IDENTITY_VERSION 1
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    int32_t host_pid;
+    uint32_t uid;
+    uint32_t gid;
+    int64_t guest_pid;
+    uint64_t start_us;
+} peer_identity_t;
+
+static bool peer_identity_path(char *out, size_t out_size, pid_t host_pid)
+{
+    return private_tmp_path(out, out_size, "peer",
+                            (unsigned long long) host_pid);
+}
+
+static void peer_identity_cleanup(void)
+{
+    char path[PATH_MAX];
+    if (!peer_identity_path(path, sizeof(path), getpid()))
+        return;
+    unlink(path);
+    char tmp[PATH_MAX];
+    int n = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    if (n > 0 && (size_t) n < sizeof(tmp))
+        unlink(tmp);
+}
+
+void proc_peer_identity_publish(void)
+{
+    static _Atomic bool cleanup_armed;
+    pid_t host_pid = getpid();
+    uint64_t start_us;
+    char path[PATH_MAX];
+    if (!peer_identity_path(path, sizeof(path), host_pid) ||
+        !host_start_us(host_pid, &start_us))
+        return;
+
+    peer_identity_t record = {
+        .magic = PEER_IDENTITY_MAGIC,
+        .version = PEER_IDENTITY_VERSION,
+        .host_pid = (int32_t) host_pid,
+        .uid = proc_get_euid(),
+        .gid = proc_get_egid(),
+        .guest_pid = proc_get_pid(),
+        .start_us = start_us,
+    };
+
+    /* Write beside the record and rename over it so a concurrent lookup sees
+     * one complete identity, never a half-written credential change.
+     */
+    char tmp[PATH_MAX];
+    int n = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    if (n < 0 || (size_t) n >= sizeof(tmp))
+        return;
+    int fd = open(
+        tmp, O_CREAT | O_TRUNC | O_WRONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC,
+        0600);
+    if (fd < 0)
+        return;
+    struct stat tmp_st;
+    if (fstat(fd, &tmp_st) != 0 || !S_ISREG(tmp_st.st_mode)) {
+        close(fd);
+        unlink(tmp);
+        return;
+    }
+    bool written = write_all(fd, &record, sizeof(record)) == 0;
+    close(fd);
+    if (!written || rename(tmp, path) != 0) {
+        unlink(tmp);
+        return;
+    }
+    if (!atomic_exchange_explicit(&cleanup_armed, true, memory_order_relaxed))
+        atexit(peer_identity_cleanup);
+}
+
+bool proc_peer_identity_lookup(pid_t host_pid,
+                               int64_t *guest_pid,
+                               uint32_t *uid,
+                               uint32_t *gid)
+{
+    if (host_pid <= 0)
+        return false;
+    char path[PATH_MAX];
+    if (!peer_identity_path(path, sizeof(path), host_pid))
+        return false;
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0)
+        return false;
+    struct stat st;
+    peer_identity_t record;
+    bool ok =
+        fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+        st.st_size == (off_t) sizeof(record) && st.st_uid == geteuid() &&
+        read_all(fd, &record, sizeof(record), true) == (ssize_t) sizeof(record);
+    close(fd);
+    if (!ok || record.magic != PEER_IDENTITY_MAGIC ||
+        record.version != PEER_IDENTITY_VERSION ||
+        record.host_pid != (int32_t) host_pid || record.guest_pid < 1 ||
+        record.guest_pid > INT_MAX)
+        return false;
+
+    uint64_t live_us;
+    if (!host_start_us(host_pid, &live_us) || live_us != record.start_us ||
+        !host_runs_this_elfuse(host_pid))
+        return false;
+    if (guest_pid)
+        *guest_pid = record.guest_pid;
+    if (uid)
+        *uid = record.uid;
+    if (gid)
+        *gid = record.gid;
+    return true;
 }
 
 int proc_get_child_pids(pid_t *out, int max_pids)

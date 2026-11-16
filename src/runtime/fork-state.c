@@ -856,9 +856,12 @@ int fork_ipc_send_process_state(int ipc_sock,
     char sysroot_ipc[LINUX_PATH_MAX] = {0};
     (void) proc_sysroot_snapshot(sysroot_ipc, sizeof(sysroot_ipc));
     uint8_t sysroot_casefold_ipc = proc_sysroot_casefold_enabled() ? 1 : 0;
+    uint8_t sysroot_strict_ipc = proc_sysroot_strict_enabled() ? 1 : 0;
     if (fork_ipc_write_all(ipc_sock, sysroot_ipc, sizeof(sysroot_ipc)) < 0 ||
         fork_ipc_write_all(ipc_sock, &sysroot_casefold_ipc,
-                           sizeof(sysroot_casefold_ipc)) < 0)
+                           sizeof(sysroot_casefold_ipc)) < 0 ||
+        fork_ipc_write_all(ipc_sock, &sysroot_strict_ipc,
+                           sizeof(sysroot_strict_ipc)) < 0)
         return -1;
 
     char elf_path_ipc[LINUX_PATH_MAX] = {0};
@@ -1081,6 +1084,14 @@ int fork_ipc_recv_process_state(int ipc_fd,
         return -1;
     }
     proc_set_sysroot_casefold(sysroot_casefold_ipc != 0);
+
+    uint8_t sysroot_strict_ipc = 0;
+    if (fork_ipc_read_all(ipc_fd, &sysroot_strict_ipc,
+                          sizeof(sysroot_strict_ipc)) < 0) {
+        log_error("fork-child: failed to read sysroot strict policy");
+        return -1;
+    }
+    proc_set_sysroot_strict(sysroot_strict_ipc != 0);
 
     char elf_path_ipc[LINUX_PATH_MAX];
     if (fork_ipc_read_all(ipc_fd, elf_path_ipc, sizeof(elf_path_ipc)) < 0) {

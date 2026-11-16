@@ -172,6 +172,12 @@ What they do:
   (`test-rosetta-cli`, `test-rosetta-failure-modes`,
   `test-rosetta-statics`, `test-rosetta-alpine`,
   `test-rosetta-audit`, `test-rosetta-jit`, `test-rosetta-glibc`)
+- `make test-initial-identity`: explicit initial PID/PPID, inherited process
+  group/session, descendant allocation and fork/exec identity. The default
+  PID 1 / PPID 0 behavior remains covered.
+- `make test-strict-sysroot`: real host-only files, escaping symlinks, relative
+  descriptors, file creation, pathname sockets and fork/exec policy retention.
+  `test-sysroot-host-fallback` covers the unchanged non-strict contract.
 - `make test-sysroot-name-soak`: minutes of threaded and forked churn over
   one case-colliding name set (`SECS=N` overrides the default 120). Excluded
   from `check` for its runtime; a pass is only the absence of a reproducer,

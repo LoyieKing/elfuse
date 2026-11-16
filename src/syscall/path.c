@@ -831,7 +831,7 @@ int path_translate_at(guest_fd_t dirfd,
      * collapses ".." and any symlink indirection, including an absolute target,
      * before the prefix check runs.
      */
-    bool climbed_root = false;
+    bool absolute_handback = false;
     bool relative_in_sysroot = false;
     char relative_host[LINUX_PATH_MAX];
     if (tx->host_path && tx->guest_path[0] != '/' && proc_get_sysroot()) {
@@ -843,15 +843,17 @@ int path_translate_at(guest_fd_t dirfd,
             if (errno == 0)
                 errno = ELOOP;
         } else if (recheck > 0) {
-            /* The reconstructed path clamped at the guest root, so the host
-             * must not walk the guest's own spelling from dirfd: its ".." runs
-             * out of the sysroot, where the guest's stops. Hand over the
-             * absolute host path the recheck already resolved; POSIX has the
-             * kernel ignore dirfd for an absolute path, so the two agree.
+            /* The resolution has to be handed over rather than walked from
+             * dirfd: the reconstructed path may have clamped at the guest root,
+             * whose ".." runs out of the sysroot where the guest's stops, and
+             * --strict-sysroot hands back every path measured from a descriptor
+             * inside the root so the host cannot follow a link the resolver
+             * refused. POSIX has the kernel ignore dirfd for an absolute path,
+             * so the two agree.
              */
             str_copy_trunc(tx->host_buf, relative_host, sizeof(tx->host_buf));
             tx->host_path = tx->host_buf;
-            climbed_root = true;
+            absolute_handback = true;
         }
     }
 
@@ -872,7 +874,7 @@ int path_translate_at(guest_fd_t dirfd,
      * Runs after that check, so a path it rejected is not resolved to a usable
      * spelling afterwards.
      */
-    if (tx->host_path && relative_in_sysroot && !climbed_root &&
+    if (tx->host_path && relative_in_sysroot && !absolute_handback &&
         casefold_active()) {
         /* The caller's follow decision applies to the final component here
          * exactly as it does in the absolute resolvers: a create names the
@@ -2122,10 +2124,26 @@ out:
     return rc;
 }
 
-/* Returns 1 when the reconstruction climbed the guest root, so the caller opens
- * @host_out instead of walking from dirfd; 0 when it stays beneath; -1 with
- * errno set. @in_sysroot reports whether the sysroot claims the path; @host_out
- * is filled for a climbed or in-sysroot path, NULL to opt out.
+/* True when @host_dir lies at or below the canonical sysroot. "--sysroot /"
+ * owns every path, and the bare separator is the one prefix path_prefix_match
+ * cannot match by name.
+ */
+static bool host_path_in_sysroot(const char *host_dir)
+{
+    char sr[LINUX_PATH_MAX];
+
+    if (!proc_sysroot_snapshot(sr, sizeof(sr)))
+        return false;
+    size_t sr_len = strlen(sr);
+    if (sr_len == 1)
+        return host_dir[0] == '/';
+    return path_prefix_match(host_dir, sr, sr_len);
+}
+
+/* Returns 1 when the caller must open @host_out instead of walking from dirfd;
+ * 0 when the relative walk stays relative; -1 with errno set. @in_sysroot
+ * reports whether the sysroot claims the path; @host_out is filled for a
+ * handed-back or in-sysroot path, NULL to opt out.
  */
 static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
                                                    const char *path,
@@ -2136,6 +2154,24 @@ static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
 {
     *in_sysroot = false;
 
+    /* Strict mode: the anchor decides. A descriptor inside the sysroot must be
+     * handed back an absolute spelling, because the host walk from dirfd would
+     * otherwise follow the symlink the resolver refused. One the host passed
+     * in names a subtree outside the root that the guest was lent, and keeps
+     * its relative walk.
+     */
+    bool strict = proc_sysroot_strict_enabled();
+    bool hand_back = false;
+    if (strict) {
+        char host_base[LINUX_PATH_MAX];
+        if (path_openat2_dirfd_host_path(dirfd, host_base, sizeof(host_base)) <
+            0)
+            return -1;
+        if (!host_path_in_sysroot(host_base))
+            return 0;
+        hand_back = true;
+    }
+
     char abs_path[LINUX_PATH_MAX];
     if (dirfd_reconstruct_abs_path(dirfd, path, abs_path, sizeof(abs_path)) < 0)
         return -1;
@@ -2145,6 +2181,8 @@ static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
      * absolute spelling the resolver returns below reconciles the two.
      */
     bool climbed = !path_openat2_stays_beneath(abs_path, false);
+    if (climbed)
+        hand_back = true;
 
     char host_buf[LINUX_PATH_MAX];
     const char *checked;
@@ -2160,11 +2198,12 @@ static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
      */
     if (flags & PATH_TR_CREATE) {
         /* A pure containment probe must not mkdir() anything: its result is
-         * discarded. A climbed resolution is the path the caller actually
+         * discarded. A handed-back resolution is the path the caller actually
          * opens, so it owes the caller's create-parents semantics, or the
          * create fails ENOENT where the absolute spelling succeeds.
          */
-        bool create_parents = climbed && (flags & PATH_TR_CREATE_PARENTS) != 0;
+        bool create_parents =
+            hand_back && (flags & PATH_TR_CREATE_PARENTS) != 0;
         checked = path_resolve_sysroot_create_path(
             abs_path, host_buf, sizeof(host_buf), create_parents);
     } else if (flags & PATH_TR_NOFOLLOW) {
@@ -2176,7 +2215,7 @@ static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
     }
 
     char fallback_buf[LINUX_PATH_MAX];
-    if (!checked && errno == ELOOP && !(flags & PATH_TR_CREATE) &&
+    if (!strict && !checked && errno == ELOOP && !(flags & PATH_TR_CREATE) &&
         dirfd_symlink_chain_reaches_absolute_target(dirfd, path) > 0) {
         if (dirfd_realpath_relative(dirfd, path, fallback_buf,
                                     sizeof(fallback_buf)) == 0) {
@@ -2195,17 +2234,26 @@ static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
      */
     *in_sysroot = checked != abs_path;
 
+    /* Strict mode has no host spelling to fall back to: an answer that is the
+     * input pointer is one resolution could not confine, so fail closed rather
+     * than hand it back.
+     */
+    if (strict && !*in_sysroot) {
+        errno = ELOOP;
+        return -1;
+    }
+
     /* Handing the resolution back rather than letting a caller re-derive it
      * keeps the two flag mappings from drifting. A path that clamped at the
      * guest root needs it either way: both spellings are absolute, so the
      * descriptor drops out of the walk.
      */
-    if (host_out && (*in_sysroot || climbed) &&
+    if (host_out && (*in_sysroot || hand_back) &&
         str_copy_trunc(host_out, checked, host_outsz) >= host_outsz) {
         errno = ENAMETOOLONG;
         return -1;
     }
-    return climbed ? 1 : 0;
+    return hand_back ? 1 : 0;
 }
 
 static bool normalized_proc_self_fd_anchor(const char *path)

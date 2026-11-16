@@ -68,6 +68,14 @@ typedef struct {
     bool has_creds;
     uint32_t uid, gid;
 
+    /* Explicit guest PID/PPID for a worker launched alongside other elfuse
+     * VMs (--pid/--ppid). Staged before bring-up so getpid(), getppid(), the
+     * shim identity cache, the main thread's TGID/TID, /proc, and the
+     * descendant allocator agree. Unset keeps the PID 1 / PPID 0 default.
+     */
+    bool has_process_identity;
+    int64_t initial_pid, initial_ppid;
+
     /* Guest-absolute initial working directory, resolved under sysroot. NULL
      * inherits the host cwd.
      */

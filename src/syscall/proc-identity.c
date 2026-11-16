@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <string.h>
 #include <unistd.h>
@@ -37,6 +38,9 @@ static _Atomic bool fakeroot_enabled = false;
 static _Atomic bool initial_ids_staged = false;
 static _Atomic uint32_t initial_uid;
 static _Atomic uint32_t initial_gid;
+static _Atomic bool initial_identity_staged = false;
+static _Atomic int64_t initial_pid = 1;
+static _Atomic int64_t initial_ppid;
 
 void proc_set_fakeroot_enabled(bool enabled)
 {
@@ -84,10 +88,50 @@ void proc_clear_initial_ids(void)
     atomic_store_explicit(&initial_ids_staged, false, memory_order_relaxed);
 }
 
+bool proc_set_initial_identity(int64_t pid, int64_t ppid)
+{
+    if (pid < 1 || pid > INT_MAX || ppid < 0 || ppid > INT_MAX)
+        return false;
+
+    /* Release on the staged flag publishes both ids with it. The consumer in
+     * proc_identity_init acquires through the same flag before reading them.
+     */
+    atomic_store_explicit(&initial_pid, pid, memory_order_relaxed);
+    atomic_store_explicit(&initial_ppid, ppid, memory_order_relaxed);
+    atomic_store_explicit(&initial_identity_staged, true, memory_order_release);
+    return true;
+}
+
+void proc_clear_initial_identity(void)
+{
+    atomic_store_explicit(&initial_identity_staged, false,
+                          memory_order_relaxed);
+}
+
+bool proc_pid_is_reserved(int64_t pid)
+{
+    if (pid <= 0)
+        return false;
+    return pid == atomic_load_explicit(&guest_pid, memory_order_relaxed) ||
+           pid == atomic_load_explicit(&parent_pid, memory_order_relaxed);
+}
+
 void proc_identity_init(void)
 {
-    guest_pid = 1;
-    parent_pid = 0;
+    int64_t pid = 1;
+    int64_t ppid = 0;
+
+    /* A staged --pid/--ppid wins over the defaults; consumed here so it
+     * applies to one bring-up only (contract in proc.h).
+     */
+    if (atomic_exchange_explicit(&initial_identity_staged, false,
+                                 memory_order_acquire)) {
+        pid = atomic_load_explicit(&initial_pid, memory_order_relaxed);
+        ppid = atomic_load_explicit(&initial_ppid, memory_order_relaxed);
+    }
+
+    guest_pid = pid;
+    parent_pid = ppid;
     child_subreaper = false;
     atomic_store_explicit(&dumpable, 1, memory_order_relaxed);
 
@@ -118,10 +162,11 @@ void proc_identity_init(void)
     atomic_store_explicit(&emu_gid, gid, memory_order_relaxed);
     atomic_store_explicit(&emu_egid, egid, memory_order_relaxed);
     atomic_store_explicit(&emu_sgid, egid, memory_order_relaxed);
-    guest_sid = 1;
-    guest_pgid = 1;
-    guest_fg_pgrp = 1;
+    guest_sid = pid;
+    guest_pgid = pid;
+    guest_fg_pgrp = pid;
     guest_has_ctty = 1;
+    proc_peer_identity_publish();
 }
 
 int64_t proc_get_pid(void)
@@ -188,6 +233,7 @@ int64_t proc_sys_setuid(uint32_t uid)
         emu_suid = uid;
     } else
         emu_euid = uid;
+    proc_peer_identity_publish();
     return 0;
 }
 
@@ -201,6 +247,7 @@ int64_t proc_sys_setgid(uint32_t gid)
         emu_sgid = gid;
     } else
         emu_egid = gid;
+    proc_peer_identity_publish();
     return 0;
 }
 
@@ -226,6 +273,7 @@ int64_t proc_sys_setgid(uint32_t gid)
          */                                                                \
         if (r != (uint32_t) -1 || (e != (uint32_t) -1 && eff != old_real)) \
             saved = eff;                                                   \
+        proc_peer_identity_publish();                                      \
         return 0;                                                          \
     }
 
@@ -249,6 +297,7 @@ DEFINE_SETRE(gid, emu_gid, emu_egid, emu_sgid, gid_is_permitted)
             eff = e;                                                    \
         if (s != (uint32_t) -1)                                         \
             saved = s;                                                  \
+        proc_peer_identity_publish();                                   \
         return 0;                                                       \
     }
 
@@ -270,6 +319,7 @@ void proc_set_ids(uint32_t uid,
     emu_gid = gid;
     emu_egid = egid;
     emu_sgid = sgid;
+    proc_peer_identity_publish();
 }
 
 
@@ -398,6 +448,7 @@ void proc_set_identity(int64_t pid, int64_t ppid)
 {
     guest_pid = pid;
     parent_pid = ppid;
+    proc_peer_identity_publish();
 }
 
 void proc_set_soft_newpid(bool enabled)

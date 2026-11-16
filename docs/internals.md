@@ -2154,10 +2154,12 @@ before it can act, and `path_translate_at()` in `src/syscall/path.c` answers
 both in one place so no two syscalls can answer them differently for the same
 name:
 
-1. Does the sysroot claim this path? A path it holds resolves there; one it
-   does not falls back to the host filesystem, except for the guest system
-   directories and the temp roots, which resolve in the sysroot whether or not
-   it holds them.
+1. Does the sysroot claim this path? By default, a path it holds resolves
+   there; one it does not falls back to the host filesystem, except for guest
+   system directories and temp roots. With `--strict-sysroot`, every absolute
+   filesystem name resolves inside the root, including missing paths and
+   guest-absolute symlink targets. Kernel intercepts and already-held
+   descriptor capabilities keep their documented behavior.
 2. What host spelling does it get? That is the sysroot prefix plus the guest
    path, adjusted so the host kernel's own resolution lands where Linux's
    would.
@@ -2245,10 +2247,11 @@ resolved and the caller uses that instead of the guest's relative spelling.
 POSIX has the kernel ignore `dirfd` for an absolute path, so the descriptor
 drops out of the resolution entirely, which is the point.
 
-A climbed path is the one case where the recheck's answer is the resolution
-itself rather than a discarded verdict, so it also honors the caller's create
-intent: missing sysroot parents are materialized exactly as they would be for
-the absolute spelling.
+In default mode, only a climbed path requires this absolute handback. Strict
+mode uses it for every relative walk anchored inside the sysroot and disables
+the host-symlink rescue. A host-passed directory descriptor remains an explicit
+capability for relative access outside the root; absolute paths ignore that
+descriptor and remain confined. Create intent follows the same resolution.
 
 ### Why The No-Symlinks Precheck Has No Component Budget
 

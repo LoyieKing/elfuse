@@ -147,6 +147,18 @@ int elfuse_launch(const launch_args_t *args)
      */
     if (args->has_creds)
         proc_set_initial_ids(args->uid, args->gid);
+
+    /* Stage --pid/--ppid before bring-up for the same reason as --user, and
+     * validate here so every embedder inherits the bound rather than only the
+     * CLI parser.
+     */
+    if (args->has_process_identity &&
+        !proc_set_initial_identity(args->initial_pid, args->initial_ppid)) {
+        log_error("initial guest pid/ppid out of range: %lld/%lld",
+                  (long long) args->initial_pid,
+                  (long long) args->initial_ppid);
+        goto fail;
+    }
     if (proc_preempt_init() < 0)
         goto fail;
     profile_start_writer();
@@ -325,9 +337,10 @@ int elfuse_launch(const launch_args_t *args)
 fail:
     /* Bring-up failed: unwind whatever exists so far, including the temp unlink
      * this side owns past the prepare call (contract in launch.h). Staged
-     * --user credentials are dropped too (proc.h).
+     * --user and --pid/--ppid are dropped too (proc.h).
      */
     proc_clear_initial_ids();
+    proc_clear_initial_identity();
     if (guest_initialized)
         launch_destroy_guest(&g);
     if (elf_host_temp)

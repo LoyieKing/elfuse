@@ -85,6 +85,21 @@ static bool parse_id_component(const char *s, const char **end, uint32_t *out)
     return true;
 }
 
+/* --pid and --ppid are digits only. strtol, which parse_int_arg wraps, takes a
+ * sign and leading whitespace, so "--ppid -0" and " 0" would otherwise pass.
+ */
+static int parse_guest_pid_arg(const char *s, int min, int *out)
+{
+    const char *end;
+    uint32_t value;
+    if (!parse_id_component(s, &end, &value))
+        return -1;
+    if (*end != '\0' || value > (uint32_t) INT_MAX || value < (uint32_t) min)
+        return -1;
+    *out = (int) value;
+    return 0;
+}
+
 /* --memory-mode takes lazy or eager. The choice is host-side only: either way a
  * retired range reads back as zero, so nothing in the launch path below the
  * option depends on it.
@@ -248,13 +263,15 @@ static int host_dc_zva_assert(void)
  * 80 columns. Sharing one body keeps the flag list from drifting between them
  * (one copy had already lost the --gdb flags).
  */
-#define ELFUSE_USAGE_BODY(sep)                                    \
-    "usage: elfuse [--verbose] [--timeout N] [--cpus N]" sep      \
-    "[--memory-mode MODE] [--rss MODE]" sep                       \
-    "[--sysroot PATH] [--create-sysroot PATH] [--no-rosetta]" sep \
-    "[--fakeroot] [--gdb PORT] [--gdb-stop-on-entry]" sep         \
-    "[--user UID[:GID]] [--workdir DIR] [--env KEY=VALUE]" sep    \
-    "[--clear-env] <elf-path> [args...]"
+#define ELFUSE_USAGE_BODY(sep)                               \
+    "usage: elfuse [--verbose] [--timeout N] [--cpus N]" sep \
+    "[--memory-mode MODE] [--rss MODE]" sep                  \
+    "[--sysroot PATH] [--create-sysroot PATH]" sep           \
+    "[--strict-sysroot] [--no-rosetta]" sep                  \
+    "[--fakeroot] [--gdb PORT] [--gdb-stop-on-entry]" sep    \
+    "[--user UID[:GID]] [--pid N] [--ppid N]" sep            \
+    "[--workdir DIR] [--env KEY=VALUE] [--clear-env]" sep    \
+    "<elf-path> [args...]"
 
 #define ELFUSE_USAGE ELFUSE_USAGE_BODY(" ")
 #define ELFUSE_USAGE_WRAPPED ELFUSE_USAGE_BODY("\n              ")
@@ -295,6 +312,9 @@ int main(int argc, char **argv)
     bool fakeroot = false;
     bool has_creds = false;
     uint32_t uid = 0, gid = 0;
+    bool has_pid = false, has_ppid = false;
+    int initial_pid = 1, initial_ppid = 0;
+    bool strict_sysroot = false;
     char *workdir = NULL;
     char **env_overrides = NULL;
     int n_env_overrides = 0;
@@ -366,6 +386,8 @@ int main(int argc, char **argv)
                 "PATH first\n"
                 "  --create-sysroot PATH   Provision and use a case-sensitive "
                 "APFS sparsebundle mounted at PATH\n"
+                "  --strict-sysroot        No host fallback for an absolute "
+                "guest path (requires --sysroot or --create-sysroot)\n"
                 "  --no-rosetta            Disable x86_64-via-Rosetta "
                 "(architecture is auto-detected from the ELF header; "
                 "on by default)\n"
@@ -377,6 +399,10 @@ int main(int argc, char **argv)
                 "instruction\n"
                 "  --user UID[:GID]        Run the guest as UID (and GID; "
                 "defaults to UID). Numeric only\n"
+                "  --pid N                 Guest PID to report, 1 to "
+                "INT_MAX (default 1)\n"
+                "  --ppid N                Guest parent PID, 0 to INT_MAX "
+                "(default 0); requires --pid\n"
                 "  --workdir DIR           Guest-absolute initial working "
                 "directory (resolved under --sysroot)\n"
                 "  --env KEY=VALUE         Set a guest environment variable; "
@@ -488,6 +514,9 @@ int main(int argc, char **argv)
                    arg_start + 1 < argc) {
             create_sysroot = argv[arg_start + 1];
             arg_start += 2;
+        } else if (!strcmp(argv[arg_start], "--strict-sysroot")) {
+            strict_sysroot = true;
+            arg_start++;
         } else if (!strcmp(argv[arg_start], "--no-rosetta")) {
             rosetta_enabled = false;
             arg_start++;
@@ -526,6 +555,23 @@ int main(int argc, char **argv)
             uid = u;
             gid = g;
             has_creds = true;
+            arg_start += 2;
+        } else if (!strcmp(argv[arg_start], "--pid") && arg_start + 1 < argc) {
+            if (parse_guest_pid_arg(argv[arg_start + 1], 1, &initial_pid) < 0) {
+                log_error("invalid --pid value: %s (want 1 to %d)",
+                          argv[arg_start + 1], INT_MAX);
+                goto cleanup;
+            }
+            has_pid = true;
+            arg_start += 2;
+        } else if (!strcmp(argv[arg_start], "--ppid") && arg_start + 1 < argc) {
+            if (parse_guest_pid_arg(argv[arg_start + 1], 0, &initial_ppid) <
+                0) {
+                log_error("invalid --ppid value: %s (want 0 to %d)",
+                          argv[arg_start + 1], INT_MAX);
+                goto cleanup;
+            }
+            has_ppid = true;
             arg_start += 2;
         } else if (!strcmp(argv[arg_start], "--workdir") &&
                    arg_start + 1 < argc) {
@@ -575,6 +621,14 @@ int main(int argc, char **argv)
     if (sysroot && create_sysroot) {
         log_error(
             "use either --sysroot PATH or --create-sysroot PATH, not both");
+        goto cleanup;
+    }
+    if (has_ppid && !has_pid) {
+        log_error("--ppid requires --pid");
+        goto cleanup;
+    }
+    if (strict_sysroot && !sysroot && !create_sysroot) {
+        log_error("--strict-sysroot requires --sysroot or --create-sysroot");
         goto cleanup;
     }
     const char *cpu_env = getenv("ELFUSE_CPUS");
@@ -751,6 +805,10 @@ int main(int argc, char **argv)
         goto cleanup;
 
     proc_set_sysroot(sysroot);
+    /* The program path and its shebang chain are guest paths, so the policy
+     * must be in force before resolve_guest_elf_host_path() below.
+     */
+    proc_set_sysroot_strict(strict_sysroot);
 
     int shebang_depth = 0;
 
@@ -887,6 +945,9 @@ int main(int argc, char **argv)
         .has_creds = has_creds,
         .uid = uid,
         .gid = gid,
+        .has_process_identity = has_pid,
+        .initial_pid = initial_pid,
+        .initial_ppid = initial_ppid,
         .cwd_guest = workdir,
         .gdb_port = gdb_port,
         .gdb_stop_on_entry = gdb_stop_on_entry,

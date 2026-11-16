@@ -2451,7 +2451,7 @@ static int proc_open_self_task_node(const guest_t *g,
             "18446744073709551615 0 0 %llu 0 0 0 "         /* 25-31 */
             "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", /* 32-52 */
             tid, comm, state, (long long) proc_get_ppid(),
-            (long long) proc_get_pid(), /* pgid */
+            (long long) proc_get_pgid(), /* pgid */
             (long long) proc_get_sid(), proc_ns_to_ticks(user_ns),
             proc_ns_to_ticks(sys_ns), proc_ns_to_ticks(cutime_us * 1000ULL),
             proc_ns_to_ticks(cstime_us * 1000ULL), priority, nice,
@@ -3362,9 +3362,8 @@ static int intercept_open_dispatch(const guest_t *g,
             "18446744073709551615 0 0 %llu 0 0 0 "         /* 25-31 */
             "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", /* 32-52 */
             (long long) proc_get_pid(), proc_comm_name(), state,
-            (long long) proc_get_ppid(),
-            (long long) proc_get_pid(), /* pgrp = pid */
-            (long long) proc_get_pid(), /* session = pid */
+            (long long) proc_get_ppid(), (long long) proc_get_pgid(), /* pgrp */
+            (long long) proc_get_sid(), /* session */
             tty_nr, tpgid, proc_ns_to_ticks(user_ns), proc_ns_to_ticks(sys_ns),
             proc_ns_to_ticks(cutime_us * 1000ULL),
             proc_ns_to_ticks(cstime_us * 1000ULL), priority, nice,
