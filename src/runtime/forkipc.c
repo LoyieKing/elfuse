@@ -47,6 +47,7 @@ extern int posix_spawnattr_set_registered_ports_np(posix_spawnattr_t *attr,
 #include "runtime/forkipc.h"
 #include "runtime/fork-state.h"
 #include "runtime/futex.h"
+#include "runtime/perf.h"
 #include "runtime/procemu.h"
 
 #include "syscall/linux-wire.h"
@@ -134,6 +135,15 @@ int fork_child_main(int ipc_fd,
      * Disable before any guest syscall is dispatched.
      */
     syscall_hist_disable();
+
+    /* A fork child publishes a performance slot into its parent's HUD file
+     * rather than the CPU prefix; hud_stats_start reads this before the pool
+     * starts. Set before any guest syscall so no I/O goes uncounted.
+     */
+    perf_mark_fork_child();
+    const char *hud = getenv("ELFUSE_HUD_STATS");
+    if (hud && hud[0])
+        perf_enable();
 
     /* Reset static process/thread/futex state before receiving the parent
      * snapshot so the incoming metadata survives child restore.

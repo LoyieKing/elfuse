@@ -568,6 +568,13 @@ int fd_snapshot_and_dup_or_share_dir(int guest_fd,
  */
 int fd_get_type(int guest_fd);
 
+/* The PERF_IO_* class recorded when this fd was installed (runtime/perf.h).
+ * Lock-free: the HUD accounting calls it on the return path of every counted
+ * transfer. PERF_IO_NONE for a closed slot, an IPC endpoint, a device, or a
+ * file-like fd whose host object is not a regular file.
+ */
+int fd_io_class(int guest_fd);
+
 /* The fields a transfer needs to decide how to run, read in one go. type is
  * FD_CLOSED when the slot is closed or out of range. guest_nonblock is what the
  * guest asked for, which on an owned fd is the only place it is recorded. seals

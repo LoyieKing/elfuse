@@ -30,6 +30,7 @@ SRCS := \
     core/rosetta.c \
     core/sysroot.c \
     runtime/thread.c \
+    runtime/perf.c \
     runtime/sched/fair.c \
     runtime/sched/sched.c \
     runtime/sched/vcpu_pool.c \
@@ -437,6 +438,14 @@ $(BUILD_DIR)/%: tests/%.c | $(BUILD_DIR)
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $<
 
 $(BUILD_DIR)/spin-thread: tests/spin-thread.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-perf-io runs the exact HUD counter workload: two host-synchronised
+# phases over stdin's pipe, with one helper parked on a pipe for the thread
+# counts. The host reads ELFUSE_HUD_STATS and compares the deltas; the binary
+# alone asserts nothing.
+$(BUILD_DIR)/test-perf-io: tests/test-perf-io.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 

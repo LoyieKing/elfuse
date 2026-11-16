@@ -1446,3 +1446,36 @@ acquisitions). The arm64 matrix reports 333 passes, one failure and ten skips;
 the same PI case reaches 894/2000. Neither complete gate passes, and no baseline
 or threshold is changed.
 
+## Guest performance telemetry
+
+ELFUSE_HUD_STATS enables mode-0600 HUD snapshots. The CPU prefix remains
+224 bytes; runtime/perf.h defines the version-2 extension and row seqlocks.
+The root owns file creation and unlink; fork children claim separate rows.
+Row publication and reclamation acquire the same sequence word before checking
+ownership. The 16-row limit sets an incomplete flag instead of silently
+reporting a partial process set.
+
+Thread totals count live guest tasks; active counts READY and RUNNING tasks,
+not host threads or vCPU workers. The two gauges are sampled separately.
+I/O counters measure successful guest transfers through regular-file and
+INET descriptors. File bytes include page-cache and memfd traffic, not mmap
+faults or physical disk activity. Pipe, AF_UNIX, device and netlink traffic
+are excluded. Copy calls count their measured file/socket endpoints;
+sendmmsg and recvmmsg count individual messages. Empty UDP messages count as
+operations with zero bytes; stream EOF and zero-byte file calls do not.
+Fork restoration enables classification before installing inherited sockets.
+
+Build and run the real guest regression from the sibling Umaru checkout:
+
+```sh
+make build/elfuse build/test-perf-io
+python3 ../umaru/tests/host/test-performance-hud.py
+```
+
+The isolated workload verifies seven disk writes / 1838 bytes, seven disk
+reads / 1463 bytes, and seven INET operations / 313 bytes in each direction.
+IPC transfers do not alter those totals. It observes two live threads with
+one runnable thread, then checks a fork child's inherited UDP socket emits
+one operation / 17 bytes in its own row. The inherited-socket check fails
+before early classification and passes afterward.
+

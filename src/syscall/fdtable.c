@@ -21,7 +21,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <netinet/in.h>
 #include <pthread.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/xattr.h>
 
@@ -30,6 +32,7 @@
 #include "proved/fdset.h"
 
 #include "core/shim-globals.h"
+#include "runtime/perf.h"
 #include "runtime/procemu.h"
 #include "syscall/linux-wire.h"
 #include "syscall/asyncio.h"
@@ -109,41 +112,61 @@ static inline void fd_bitmap_set_used(int fd)
     fd_free_bitmap[(unsigned) fd >> 6] &= ~BIT64((unsigned) fd & 63);
 }
 
-/* A host read/write blocks only on non-regular, non-directory fds (pipe,
- * socket, fifo, char/tty). Callers cache this so the interruptible wait path
- * can skip fds that never block.
- */
-static bool host_fd_may_block(int host_fd)
-{
-    struct stat st;
-    return host_fd >= 0 && fstat(host_fd, &st) == 0 && !S_ISREG(st.st_mode) &&
-           !S_ISDIR(st.st_mode);
-}
-
-/* Whether a read/write on a newly allocated fd of this type can block. Pipes
- * and sockets always can; regular-file slots may actually be a fifo or char
- * device (opened_fd_type does not split those out) and stdio may be a tty, so
- * both need an fstat; everything else (dir, path, urandom, fuse, synthetic)
- * never reaches the blocking wait path.
+/* Answer the two questions fd_init_entry needs about a new descriptor's host
+ * object in one pass, before fd_lock: whether a host read/write can block, and
+ * the PERF_IO_* class the HUD counters use.
  *
- * Resolving the common pipe/socket/synthetic cases from the type keeps an fstat
- * off the fd-creation lock hold, but does not empty it: fd_init_entry still
- * takes O_NONBLOCK ownership inside the same window. That is a small slice of a
- * pipe()+close or open()+close pair, so hoisting it out of the lock was not
- * done -- it would not remove the syscall, only the lock hold, and nothing
- * measures a contended fd-creation path today.
+ * A regular-file slot may actually be a fifo or a character device, and stdio
+ * may be a tty or a file, so both need an fstat; the same mode decides the
+ * class, so the classification costs no second host call there. Pipes and
+ * sockets always block. A socket's family and type decide whether the guest is
+ * talking over INET, and getsockname reports the family of an unbound socket.
+ * Everything else (dir, path, urandom, fuse, synthetic) neither blocks nor
+ * counts.
  */
-static bool type_may_block(int type, int host_fd)
+static int fd_probe_io_class(int type, int host_fd, bool *may_block)
 {
     switch (type) {
-    case FD_PIPE:
-    case FD_SOCKET:
-        return true;
     case FD_STDIO:
-    case FD_REGULAR:
-        return host_fd_may_block(host_fd);
+    case FD_REGULAR: {
+        struct stat st;
+        bool got = host_fd >= 0 && fstat(host_fd, &st) == 0;
+
+        *may_block = got && !S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode);
+        return got && S_ISREG(st.st_mode) ? PERF_IO_DISK : PERF_IO_NONE;
+    }
+    case FD_PIPE:
+        *may_block = true;
+        return PERF_IO_NONE;
+    case FD_SOCKET: {
+        struct sockaddr_storage ss;
+        socklen_t slen = sizeof(ss);
+        int so_type = 0;
+        socklen_t tlen = sizeof(so_type);
+
+        *may_block = true;
+
+        /* Two host calls are worth paying only while the counters can use the
+         * answer. A socket installed while the HUD is off stays unclassified;
+         * the HUD starts before guest code, so this only affects descriptors
+         * restored from a parent before a fork child's publisher exists.
+         */
+        if (!perf_enabled() || host_fd < 0 ||
+            getsockname(host_fd, (struct sockaddr *) &ss, &slen) != 0)
+            return PERF_IO_NONE;
+        if (ss.ss_family != AF_INET && ss.ss_family != AF_INET6)
+            return PERF_IO_NONE;
+        if (getsockopt(host_fd, SOL_SOCKET, SO_TYPE, &so_type, &tlen) != 0)
+            return PERF_IO_NONE;
+        if (so_type == SOCK_DGRAM)
+            return PERF_IO_NET_DGRAM;
+        if (so_type == SOCK_STREAM || so_type == SOCK_SEQPACKET)
+            return PERF_IO_NET_STREAM;
+        return PERF_IO_NONE;
+    }
     default:
-        return false;
+        *may_block = false;
+        return PERF_IO_NONE;
     }
 }
 
@@ -211,23 +234,24 @@ static int fd_flags_with_accmode(int type, int linux_flags)
     return (linux_flags & ~LINUX_O_ACCMODE) | accmode;
 }
 
-/* The two answers fd_init_entry needs from the host descriptor, taken before
+/* The answers fd_init_entry needs from the host descriptor, taken before
  * fd_lock rather than under it.
  *
- * Both are host syscalls: type_may_block fstats a regular or stdio fd, and
- * taking O_NONBLOCK ownership is an F_GETFL that issues F_SETFL only when the
- * bit is missing. Holding the table lock across them puts up to two host calls
- * in front of every read, write and close that wants the table, and the design
- * note above fd_alloc says the lock is held for table mutation only.
+ * The probe is host work: one fstat for a file or stdio fd, two socket calls to
+ * classify an INET socket, and an F_GETFL that issues F_SETFL only when the bit
+ * is missing. Holding the table lock across them puts host calls in front of
+ * every read, write and close that wants the table, and the design note above
+ * fd_alloc says the lock is held for table mutation only.
  *
  * Nothing races: the host fd is not published until fd_init_entry writes the
  * slot, so this thread is the only one that can see it. The alias state is
- * thread-local for the same reason, and an alias needs no probe at all -- it
- * shares a description whose flag the source already answers for.
+ * thread-local for the same reason, and an alias takes its class from the
+ * description it names rather than probing a second time.
  */
 typedef struct {
     bool can_block;
     bool nonblock_owned;
+    int io_class; /* PERF_IO_* class of the host object, PERF_IO_NONE if none */
 
     /* The host status flags to put back if no slot is published after all, or
      * -1 when the probe changed nothing. Taking the answers before the lock
@@ -251,8 +275,9 @@ static void fd_probe_rollback(const fd_host_probe_t *probe, int host_fd)
 
 static fd_host_probe_t fd_probe_host(int type, int host_fd)
 {
-    fd_host_probe_t probe = {.can_block = type_may_block(type, host_fd),
-                             .restore_flags = -1};
+    fd_host_probe_t probe = {.restore_flags = -1};
+
+    probe.io_class = fd_probe_io_class(type, host_fd, &probe.can_block);
 
     if (fd_alias_pending) {
         probe.nonblock_owned = fd_alias_spec.nonblock_owned;
@@ -292,6 +317,7 @@ static inline void fd_init_entry(int fd,
     fd_table[fd].type = type;
     fd_table[fd].host_fd = host_fd;
     fd_table[fd].lifetime = NULL;
+    int io_class = probe->io_class;
 
     /* Take the description state again, here, from the live source. The spec
      * carries a snapshot the caller made before this lock was held, and an
@@ -324,6 +350,14 @@ static inline void fd_init_entry(int fd,
             fd_alias_spec.foreign_description = src->foreign_description;
             fd_alias_spec.nonblock_owned = src->nonblock_owned;
             fd_alias_spec.path_poll_capable = src->path_poll_capable;
+
+            /* The description decides the class, and an alias can be built for
+             * an fd whose host object can no longer be re-probed (the Rosetta
+             * socket upgrade rebuilds the slot it names). Take it from the
+             * source when the generation still matches.
+             */
+            io_class =
+                atomic_load_explicit(&src->io_class, memory_order_relaxed);
         }
     }
 
@@ -373,6 +407,12 @@ static inline void fd_init_entry(int fd,
      * re-stating it on every call. Taken by fd_probe_host before the lock.
      */
     fd_table[fd].can_block = probe->can_block;
+
+    /* Recorded once, so the syscall return path needs no fstat or getsockname
+     * per transfer; runtime/perf.h owns the classes.
+     */
+    atomic_store_explicit(&fd_table[fd].io_class, io_class,
+                          memory_order_relaxed);
 
     /* Own O_NONBLOCK on every fd whose host transfer could otherwise park a
      * vCPU thread, and emulate the guest's blocking semantics on top of it
@@ -508,12 +548,21 @@ void fdtable_init(void)
      * for foreign_description, which fd_init_entry derives from the type and
      * nothing derives here: these three descriptions belong to whoever launched
      * elfuse, and every alias of them reads the answer from this entry.
+     *
+     * The same pass classifies them for the HUD, because a launcher may hand
+     * over a file or a socket on 0, 1 or 2 and these three entries are built
+     * without fd_probe_host.
      */
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 3; i++) {
+        bool may_block = false;
+        int io_class =
+            fd_probe_io_class(FD_STDIO, fd_table[i].host_fd, &may_block);
+
         fd_table[i].foreign_description = true;
-    fd_table[0].can_block = host_fd_may_block(STDIN_FILENO);
-    fd_table[1].can_block = host_fd_may_block(STDOUT_FILENO);
-    fd_table[2].can_block = host_fd_may_block(STDERR_FILENO);
+        fd_table[i].can_block = may_block;
+        atomic_store_explicit(&fd_table[i].io_class, io_class,
+                              memory_order_relaxed);
+    }
     fd_bitmap_set_used(0);
     fd_bitmap_set_used(1);
     fd_bitmap_set_used(2);
@@ -888,6 +937,8 @@ fd_lifetime_t *fd_mark_closed_unlocked(int fd)
      */
     shim_globals_mark_urandom_fd(fd, false);
     fd_table[fd].type = FD_CLOSED;
+    atomic_store_explicit(&fd_table[fd].io_class, PERF_IO_NONE,
+                          memory_order_relaxed);
     fd_table[fd].host_fd = -1;
     fd_table[fd].lifetime = NULL;
     fd_table[fd].ofd_id = 0;
@@ -1285,6 +1336,18 @@ int fd_get_type(int guest_fd)
     int type = fd_table[guest_fd].type;
     pthread_mutex_unlock(&fd_lock);
     return type;
+}
+
+/* Lock-free by design: this runs on the return path of every counted read and
+ * write, and a slot reused between the transfer and the accounting can only
+ * misattribute bytes from a guest racing close/open on the same number.
+ */
+int fd_io_class(int guest_fd)
+{
+    if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
+        return PERF_IO_NONE;
+    return atomic_load_explicit(&fd_table[guest_fd].io_class,
+                                memory_order_relaxed);
 }
 
 fd_block_state_t fd_block_state(int guest_fd)

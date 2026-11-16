@@ -16,6 +16,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 /* Linux ptrace constants. */
 #define LINUX_PTRACE_CONT 7
@@ -765,6 +766,15 @@ typedef struct {
                      * once at allocation via fstat so the interruptible wait
                      * path can skip fds that never block.
                      */
+
+    /* PERF_IO_* class of the stream this fd transfers over, recorded at install
+     * (runtime/perf.h owns the values). Reading it on the syscall return path
+     * costs one relaxed load, where classifying there would cost an fstat or a
+     * getsockname per transfer. fd_mark_closed_unlocked resets it, and
+     * fd_init_entry always writes it, so a reused slot cannot keep the previous
+     * file's class.
+     */
+    _Atomic int io_class;
     bool foreign_description; /* The open file description behind this fd came
                                * from outside elfuse -- the launcher's stdio,
                                * or an alias of it -- so its status flags are

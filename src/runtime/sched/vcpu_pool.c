@@ -21,6 +21,7 @@
 #include "runtime/sched/fair.h"
 #include "runtime/thread.h"
 #include "runtime/futex.h"
+#include "runtime/perf.h"
 
 #include "debug/gdbstub.h"
 #include "debug/gdbstub-reg.h"
@@ -63,6 +64,7 @@ typedef struct vcpu_pool_config {
 #include <stddef.h>
 #include <sys/file.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
 
@@ -1773,11 +1775,17 @@ int vcpu_pool_run_main(int timeout_sec)
     return last_exit;
 }
 
-/* umaru-renderer reads this snapshot from ELFUSE_HUD_STATS, which run-app
- * sets to the render socket path plus ".hud". seq is a seqlock shared with
- * that reader: odd while the payload is being written, even when stable.
- * An unset path leaves the publisher stopped, so a guest that is not driving
- * a window does not create the file.
+/* umaru-renderer reads this snapshot from ELFUSE_HUD_STATS, which run-app sets
+ * to the render socket path plus ".hud". seq is a seqlock shared with that
+ * reader: odd while the payload is being written, even when stable. An unset
+ * path leaves the publisher stopped, so a guest that is not driving a window
+ * does not create the file.
+ *
+ * Past the 224-byte CPU prefix the file carries one row per elfuse process that
+ * owns a guest, runtime/perf.h owning the layout: the root publishes the prefix
+ * and its own row, and each fork child writes only its row under that row's
+ * seqlock. The prefix and its seqlock are unchanged, so a reader of the old 224
+ * bytes sees what it always saw.
  */
 #define HUD_MAGIC 0x48554431u
 #define HUD_MAX_CPU 64
@@ -1806,17 +1814,27 @@ static int hud_fd = -1;
 static char hud_path[PATH_MAX];
 static int hud_suppressed;
 
-/* Fork copies the publisher fd and path into the child. The child must not
- * join a thread it does not have, and must not unlink the parent's snapshot.
- * The inherited fd stays open: closing it can drop the parent's flock. A
- * re-exec'd child does not inherit hud_suppressed; it fails the lock and
- * does not publish.
+/* This process's row in the extension, and the fork child's reduced role: write
+ * a row, never the CPU prefix, never unlink the parent's file.
+ */
+static hud_ext_header_t *hud_ext;
+static hud_proc_slot_t *hud_slots;
+static hud_proc_slot_t *hud_slot;
+static bool hud_participant;
+
+/* A fork child detaches inherited mapping and thread ownership without closing
+ * the publisher fd or unlinking the root's snapshot. A re-exec child registers
+ * its own row in that file.
  */
 static void hud_after_fork_child(void)
 {
     if (hud_map && hud_map != MAP_FAILED)
-        munmap(hud_map, sizeof(*hud_map));
+        munmap(hud_map, HUD_FILE_BYTES);
     hud_map = NULL;
+    hud_ext = NULL;
+    hud_slots = NULL;
+    hud_slot = NULL;
+    hud_participant = false;
     hud_fd = -1;
     hud_path[0] = '\0';
     hud_started = false;
@@ -1855,8 +1873,223 @@ static uint64_t hud_host_total(void)
     return bytes;
 }
 
-static void hud_publish(uint32_t ncpu, uint64_t footprint, uint64_t host_total,
-                        const uint16_t *load, const uint8_t *live)
+static uint64_t hud_wall_ns(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0)
+        return 0;
+    return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
+
+/* Point the extension pointers at @mem, the root of the mapped file. */
+static void hud_layout(void *mem)
+{
+    hud_ext = (hud_ext_header_t *) ((char *) mem + HUD_EXT_OFFSET);
+    hud_slots = (hud_proc_slot_t *) ((char *) mem + HUD_SLOT_OFFSET);
+}
+
+/* True when @slot carries this incarnation's generation string. A mismatch
+ * means a later process reclaimed a row this one stopped publishing, so the
+ * caller claims a new one.
+ */
+static bool hud_slot_is_ours(const hud_proc_slot_t *slot)
+{
+    char gen[HUD_GENERATION_BYTES];
+
+    perf_generation(gen, sizeof(gen));
+    return strcmp(slot->generation, gen) == 0;
+}
+
+/* A row whose publisher has been silent past HUD_SLOT_STALE_NS is free even
+ * when its generation is set: the owner revalidates before every publish and
+ * claims elsewhere, so the two never write one row past that window.
+ */
+static bool hud_slot_reclaimable(const hud_proc_slot_t *slot, uint64_t now)
+{
+    if (slot->sample_ns == 0 || now < slot->sample_ns)
+        return true;
+    return now - slot->sample_ns > HUD_SLOT_STALE_NS;
+}
+
+/* Write a row's payload. Caller owns the row's seqlock (odd) and has already
+ * revalidated its generation, so no other process can be writing these fields.
+ */
+static void hud_slot_fill(hud_proc_slot_t *slot)
+{
+    perf_snapshot_t s = perf_sample();
+
+    slot->sample_ns = hud_mono_ns();
+    slot->threads_total = s.threads_total;
+    slot->threads_active = s.threads_active;
+    slot->disk_read_ops = s.disk_read_ops;
+    slot->disk_write_ops = s.disk_write_ops;
+    slot->disk_read_bytes = s.disk_read_bytes;
+    slot->disk_write_bytes = s.disk_write_bytes;
+    slot->network_read_ops = s.network_read_ops;
+    slot->network_write_ops = s.network_write_ops;
+    slot->network_read_bytes = s.network_read_bytes;
+    slot->network_write_bytes = s.network_write_bytes;
+    slot->guest_pid = (uint64_t) proc_get_pid();
+}
+
+/* Claim a row for this process, or NULL when every row belongs to a live
+ * publisher. The CAS on the row's seqlock makes the claim exclusive across the
+ * root and every fork child sharing this mapping; every decision taken before
+ * the CAS is taken again after it, where no other writer can change the row.
+ */
+static hud_proc_slot_t *hud_claim_slot(void)
+{
+    uint64_t now;
+
+    if (!hud_slots)
+        return NULL;
+    now = hud_mono_ns();
+    for (int i = 0; i < HUD_MAX_PROC; i++) {
+        hud_proc_slot_t *slot = &hud_slots[i];
+        uint32_t seq = atomic_load_explicit((_Atomic uint32_t *) &slot->seq,
+                                            memory_order_acquire);
+
+        if ((seq & 1u) != 0)
+            continue;
+        /* Pre-filter only; the same questions are asked again below. */
+        if (slot->generation[0] != '\0') {
+            if (hud_slot_is_ours(slot))
+                return slot;
+            if (!hud_slot_reclaimable(slot, now))
+                continue;
+        }
+        if (!atomic_compare_exchange_strong_explicit(
+                (_Atomic uint32_t *) &slot->seq, &seq, seq + 1,
+                memory_order_acq_rel, memory_order_relaxed))
+            continue;
+
+        /* Owned. A repeated claim of our own row must not reset its counters,
+         * and a row that turns out to still be live belongs to someone else.
+         */
+        if (hud_slot_is_ours(slot)) {
+            atomic_store_explicit((_Atomic uint32_t *) &slot->seq, seq + 2,
+                                  memory_order_release);
+            return slot;
+        }
+        if (slot->generation[0] != '\0' &&
+            !hud_slot_reclaimable(slot, hud_mono_ns())) {
+            atomic_store_explicit((_Atomic uint32_t *) &slot->seq, seq + 2,
+                                  memory_order_release);
+            continue;
+        }
+
+        /* Zero only what follows the seqlock word. Clearing seq itself would
+         * let a reader see an even zero word and accept an empty row as stable;
+         * the payload below is filled before the word turns even.
+         */
+        memset(&slot->sample_ns, 0,
+               sizeof(*slot) - offsetof(hud_proc_slot_t, sample_ns));
+        perf_generation(slot->generation, sizeof(slot->generation));
+        hud_slot_fill(slot);
+        atomic_thread_fence(memory_order_release);
+        atomic_store_explicit((_Atomic uint32_t *) &slot->seq, seq + 2,
+                              memory_order_release);
+        return slot;
+    }
+    return NULL;
+}
+
+/* Record that an owned process has no row. A reader surfaces this as an
+ * incomplete snapshot rather than as a silently shorter process list.
+ */
+static void hud_mark_proc_full(void)
+{
+    if (!hud_ext)
+        return;
+    atomic_fetch_or_explicit((_Atomic uint32_t *) &hud_ext->flags,
+                             HUD_EXT_FLAG_PROC_FULL, memory_order_relaxed);
+}
+
+/* Publish this process's counters. The generation is revalidated inside the
+ * exclusive window, so a publisher that stalled long enough for its row to be
+ * reclaimed cannot resume and overwrite the new owner's row.
+ */
+static void hud_publish_slot(void)
+{
+    hud_proc_slot_t *slot = hud_slot;
+    uint32_t seq;
+
+    if (!hud_map)
+        return;
+    if (!slot) {
+        hud_slot = hud_claim_slot();
+        return;
+    }
+    seq = atomic_load_explicit((_Atomic uint32_t *) &slot->seq,
+                               memory_order_acquire);
+    if ((seq & 1u) != 0)
+        return;
+    if (!hud_slot_is_ours(slot)) {
+        hud_slot = hud_claim_slot();
+        return;
+    }
+    if (!atomic_compare_exchange_strong_explicit(
+            (_Atomic uint32_t *) &slot->seq, &seq, seq + 1,
+            memory_order_acq_rel, memory_order_relaxed))
+        return;
+    if (!hud_slot_is_ours(slot)) {
+        atomic_store_explicit((_Atomic uint32_t *) &slot->seq, seq + 2,
+                              memory_order_release);
+        hud_slot = hud_claim_slot();
+        return;
+    }
+    hud_slot_fill(slot);
+    atomic_thread_fence(memory_order_release);
+    atomic_store_explicit((_Atomic uint32_t *) &slot->seq, seq + 2,
+                          memory_order_release);
+}
+
+/* Release this process's row so a fork child can claim it immediately rather
+ * than waiting out HUD_SLOT_STALE_NS. A row another process reclaimed is left
+ * alone, and one a live writer owns is left to go stale.
+ */
+static void hud_clear_slot(void)
+{
+    hud_proc_slot_t *slot = hud_slot;
+    uint32_t seq;
+
+    hud_slot = NULL;
+    if (!slot)
+        return;
+    seq = atomic_load_explicit((_Atomic uint32_t *) &slot->seq,
+                               memory_order_acquire);
+    if ((seq & 1u) != 0)
+        return;
+    if (!atomic_compare_exchange_strong_explicit(
+            (_Atomic uint32_t *) &slot->seq, &seq, seq + 1,
+            memory_order_acq_rel, memory_order_relaxed))
+        return;
+    if (hud_slot_is_ours(slot)) {
+        slot->generation[0] = '\0';
+        atomic_thread_fence(memory_order_release);
+    }
+    atomic_store_explicit((_Atomic uint32_t *) &slot->seq, seq + 2,
+                          memory_order_release);
+}
+
+/* The extension header is the reader's freshness reference: sample_ns is the
+ * same CLOCK_MONOTONIC a row stamps, wall_ns lets a reader on another clock
+ * decide the publisher itself is still ticking.
+ */
+static void hud_publish_ext(void)
+{
+    if (!hud_ext)
+        return;
+    hud_ext->sample_ns = hud_mono_ns();
+    hud_ext->wall_ns = hud_wall_ns();
+}
+
+static void hud_publish(uint32_t ncpu,
+                        uint64_t footprint,
+                        uint64_t host_total,
+                        const uint16_t *load,
+                        const uint8_t *live)
 {
     uint32_t seq;
 
@@ -1885,35 +2118,42 @@ static void *hud_thread_main(void *arg)
     (void) arg;
     memset(prev_cpu, 0, sizeof(prev_cpu));
     while (!atomic_load_explicit(&hud_stop, memory_order_acquire)) {
-        uint64_t wall = hud_mono_ns();
-        int n = slots && slot_count > 0 ? slot_count : 0;
-        uint16_t load[HUD_MAX_CPU];
-        uint8_t live[HUD_MAX_CPU];
-        int i;
+        if (hud_participant) {
+            /* A fork child owns no vCPU slot and must not touch the prefix. */
+            hud_publish_slot();
+        } else {
+            uint64_t wall = hud_mono_ns();
+            int n = slots && slot_count > 0 ? slot_count : 0;
+            uint16_t load[HUD_MAX_CPU];
+            uint8_t live[HUD_MAX_CPU];
+            int i;
 
-        if (n > HUD_MAX_CPU)
-            n = HUD_MAX_CPU;
-        memset(load, 0, sizeof(load));
-        memset(live, 0, sizeof(live));
-        for (i = 0; i < n; i++) {
-            uint64_t cpu = 0;
-            bool sampled = slot_cpu_ns(&slots[i], &cpu);
+            if (n > HUD_MAX_CPU)
+                n = HUD_MAX_CPU;
+            memset(load, 0, sizeof(load));
+            memset(live, 0, sizeof(live));
+            for (i = 0; i < n; i++) {
+                uint64_t cpu = 0;
+                bool sampled = slot_cpu_ns(&slots[i], &cpu);
 
-            live[i] = slots[i].vcpu_live ? 1 : 0;
-            if (have && sampled && wall > prev_wall && cpu >= prev_cpu[i]) {
-                uint64_t perm =
-                    (cpu - prev_cpu[i]) * 1000ULL / (wall - prev_wall);
-                if (perm > 1000)
-                    perm = 1000;
-                load[i] = (uint16_t) perm;
+                live[i] = slots[i].vcpu_live ? 1 : 0;
+                if (have && sampled && wall > prev_wall && cpu >= prev_cpu[i]) {
+                    uint64_t perm =
+                        (cpu - prev_cpu[i]) * 1000ULL / (wall - prev_wall);
+                    if (perm > 1000)
+                        perm = 1000;
+                    load[i] = (uint16_t) perm;
+                }
+                if (sampled)
+                    prev_cpu[i] = cpu;
             }
-            if (sampled)
-                prev_cpu[i] = cpu;
+            prev_wall = wall;
+            have = true;
+            hud_publish((uint32_t) n, hud_footprint(), hud_host_total(), load,
+                        live);
+            hud_publish_ext();
+            hud_publish_slot();
         }
-        prev_wall = wall;
-        have = true;
-        hud_publish((uint32_t) n, hud_footprint(), hud_host_total(), load,
-                    live);
         if (!atomic_load_explicit(&hud_stop, memory_order_acquire)) {
             struct timespec delay = {.tv_sec = 0, .tv_nsec = 200000000L};
             nanosleep(&delay, NULL);
@@ -1931,19 +2171,79 @@ static void hud_stats_stop(void)
         (void) pthread_join(hud_thread, NULL);
         hud_started = false;
     }
+    hud_clear_slot();
     if (hud_map && hud_map != MAP_FAILED) {
-        munmap(hud_map, sizeof(*hud_map));
+        munmap(hud_map, HUD_FILE_BYTES);
         hud_map = NULL;
     }
+    hud_ext = NULL;
+    hud_slots = NULL;
     if (hud_fd >= 0) {
         close(hud_fd);
         hud_fd = -1;
     }
-    if (hud_path[0] != '\0') {
+
+    /* Only the lock holder created the file; a fork child leaves it for the
+     * parent to unlink.
+     */
+    if (!hud_participant && hud_path[0] != '\0')
         unlink(hud_path);
-        hud_path[0] = '\0';
+    hud_path[0] = '\0';
+    hud_participant = false;
+    atomic_store_explicit(&hud_stop, 0, memory_order_relaxed);
+}
+
+/* A fork child maps the file its parent created and publishes one row. It never
+ * truncates, writes the CPU prefix, or unlinks: the root owns all three, and
+ * its flock stays held while the child writes.
+ */
+static void hud_stats_start_participant(const char *path, size_t len)
+{
+    hud_ext_header_t *ext;
+    struct stat st;
+    void *mem;
+    int fd;
+
+    fd = open(path, O_RDWR);
+    if (fd < 0)
+        return;
+    if (fstat(fd, &st) != 0 || (uint64_t) st.st_size < HUD_FILE_BYTES) {
+        close(fd);
+        return;
+    }
+    mem = mmap(NULL, HUD_FILE_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mem == MAP_FAILED) {
+        close(fd);
+        return;
+    }
+    ext = (hud_ext_header_t *) ((char *) mem + HUD_EXT_OFFSET);
+    if (((struct hud_snap *) mem)->magic != HUD_MAGIC ||
+        ext->magic != HUD_EXT_MAGIC || ext->version != HUD_EXT_VERSION ||
+        ext->slot_count != HUD_MAX_PROC ||
+        ext->slot_size != (uint32_t) sizeof(hud_proc_slot_t)) {
+        munmap(mem, HUD_FILE_BYTES);
+        close(fd);
+        return;
+    }
+    hud_map = (struct hud_snap *) mem;
+    hud_layout(mem);
+    hud_participant = true;
+    hud_fd = fd;
+    memcpy(hud_path, path, len + 1);
+    perf_enable();
+    hud_slot = hud_claim_slot();
+    if (!hud_slot) {
+        log_error("hud: no free performance slot for this child");
+        hud_mark_proc_full();
+        hud_stats_stop();
+        return;
     }
     atomic_store_explicit(&hud_stop, 0, memory_order_relaxed);
+    if (pthread_create(&hud_thread, NULL, hud_thread_main, NULL) != 0) {
+        hud_stats_stop();
+        return;
+    }
+    hud_started = true;
 }
 
 static void hud_stats_start(void)
@@ -1958,9 +2258,14 @@ static void hud_stats_start(void)
     len = strlen(path);
     if (len == 0 || len >= sizeof(hud_path))
         return;
+    if (perf_is_fork_child()) {
+        hud_stats_start_participant(path, len);
+        return;
+    }
     fd = open(path, O_RDWR | O_CREAT, 0600);
     if (fd < 0)
         return;
+
     /* A re-exec'd fork child inherits the path. Without the lock it would
      * replace this snapshot and unlink it when its own pool stops.
      */
@@ -1968,21 +2273,33 @@ static void hud_stats_start(void)
         close(fd);
         return;
     }
-    if (ftruncate(fd, (off_t) sizeof(struct hud_snap)) != 0) {
+    if (ftruncate(fd, (off_t) HUD_FILE_BYTES) != 0) {
         close(fd);
         return;
     }
-    mem = mmap(NULL, sizeof(struct hud_snap), PROT_READ | PROT_WRITE,
-               MAP_SHARED, fd, 0);
+    mem = mmap(NULL, HUD_FILE_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (mem == MAP_FAILED) {
         close(fd);
         return;
     }
-    memset(mem, 0, sizeof(struct hud_snap));
+    memset(mem, 0, HUD_FILE_BYTES);
     ((struct hud_snap *) mem)->magic = HUD_MAGIC;
-    memcpy(hud_path, path, len + 1);
     hud_map = (struct hud_snap *) mem;
+    hud_layout(mem);
+    hud_ext->magic = HUD_EXT_MAGIC;
+    hud_ext->version = HUD_EXT_VERSION;
+    hud_ext->slot_count = HUD_MAX_PROC;
+    hud_ext->slot_size = (uint32_t) sizeof(hud_proc_slot_t);
+    hud_publish_ext();
+    memcpy(hud_path, path, len + 1);
     hud_fd = fd;
+    hud_participant = false;
+    perf_enable();
+    hud_slot = hud_claim_slot();
+    if (!hud_slot) {
+        log_error("hud: no free performance slot for the root process");
+        hud_mark_proc_full();
+    }
     atomic_store_explicit(&hud_stop, 0, memory_order_relaxed);
     if (pthread_atfork(NULL, NULL, hud_after_fork_child) != 0) {
         hud_stats_stop();

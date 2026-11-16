@@ -46,6 +46,7 @@
 #include "runtime/procemu.h"
 #include "runtime/forkipc.h"
 #include "runtime/futex.h"
+#include "runtime/perf.h"
 #include "runtime/thread.h"
 #include "runtime/sched/vcpu_pool.h"
 #include "runtime/sched/exec.h"
@@ -178,11 +179,30 @@ typedef int64_t (*syscall_handler_t)(guest_t *g,
  *
  *   SC_FORWARD(name, expr): cast args and forward to sys_xxx / signal_xxx
  *   SC_LOCKED(name, expr):  same, but hold mmap_lock during the call
+ *   SC_IO(name, expr, rd):  same, and account the bytes it returned on fd x0
  *   SC_STUB(name, val):     return a constant (alias for SC_FORWARD)
  *
  * All parameters are marked (void) to suppress -Wunused-parameter. The body
  * expression may reference g, x0-x5, and verbose freely.
  */
+
+/* Account a read/write-family result against the class captured before the
+ * transfer ran, so a close and reopen of the same fd number during the call
+ * cannot reclassify it. A handler that parked and was re-dispatched returns its
+ * final count once, and a failure contributes nothing.
+ *
+ * A zero-byte result is a transfer for a datagram socket (an empty datagram is
+ * a real message) and not for a stream or a file (EOF or a no-op write).
+ */
+static void perf_note_transfer(int io_class, bool is_read, int64_t result)
+{
+    if (result < 0 || io_class == PERF_IO_NONE)
+        return;
+    if (result > 0)
+        perf_count(io_class, is_read, 1, (uint64_t) result);
+    else if (io_class == PERF_IO_NET_DGRAM)
+        perf_count(io_class, is_read, 1, 0);
+}
 
 /* clang-format off */
 #define SC_FORWARD(name, body)                                                \
@@ -207,6 +227,43 @@ typedef int64_t (*syscall_handler_t)(guest_t *g,
     }
 
 #define SC_STUB(name, val) SC_FORWARD(name, (val))
+
+#define SC_IO(name, body, is_read)                                            \
+    static int64_t name(guest_t *g, uint64_t x0, uint64_t x1, uint64_t x2,    \
+                        uint64_t x3, uint64_t x4, uint64_t x5, bool verbose)  \
+    {                                                                         \
+        (void) g; (void) x0; (void) x1; (void) x2;                            \
+        (void) x3; (void) x4; (void) x5; (void) verbose;                      \
+        int io_class =                                                        \
+            perf_enabled() ? fd_io_class((int) x0) : PERF_IO_NONE;            \
+        int64_t r = (body);                                                   \
+        perf_note_transfer(io_class, (is_read), r);                           \
+        return r;                                                             \
+    }
+
+/* A copy syscall whose positive result moved bytes from one descriptor to
+ * another: sendfile, copy_file_range, splice, tee. The classes are captured
+ * before the call, and the handlers move data through internal C calls rather
+ * than the SC wrappers, so nothing is counted twice. A pipe or device end
+ * contributes nothing because its class is PERF_IO_NONE.
+ */
+#define SC_PAIR(name, body, in_fd, out_fd)                                    \
+    static int64_t name(guest_t *g, uint64_t x0, uint64_t x1, uint64_t x2,    \
+                        uint64_t x3, uint64_t x4, uint64_t x5, bool verbose)  \
+    {                                                                         \
+        (void) g; (void) x0; (void) x1; (void) x2;                            \
+        (void) x3; (void) x4; (void) x5; (void) verbose;                      \
+        int in_class = perf_enabled() ? fd_io_class((int) (in_fd))            \
+                                      : PERF_IO_NONE;                          \
+        int out_class = perf_enabled() ? fd_io_class((int) (out_fd))          \
+                                       : PERF_IO_NONE;                         \
+        int64_t r = (body);                                                   \
+        if (r > 0) {                                                          \
+            perf_note_transfer(in_class, true, r);                             \
+            perf_note_transfer(out_class, false, r);                           \
+        }                                                                     \
+        return r;                                                             \
+    }
 
 /* Bracket setuid/setgid family invocations so concurrent shim-fast-path readers
  * cannot observe stale credentials. The host-side proc_sys_* mutators flip the
@@ -241,29 +298,29 @@ typedef int64_t (*syscall_handler_t)(guest_t *g,
  */
 
 /* I/O */
-SC_FORWARD(sc_write,     sys_write(g, (int) x0, x1, x2))
-SC_FORWARD(sc_read,      sys_read(g, (int) x0, x1, x2))
+SC_IO(sc_write,     sys_write(g, (int) x0, x1, x2), false)
+SC_IO(sc_read,      sys_read(g, (int) x0, x1, x2), true)
 SC_FORWARD(sc_openat,    sys_openat(g, (int) x0, x1, (int) x2, (int) x3))
 SC_FORWARD(sc_close,     sys_close((int) x0))
-SC_FORWARD(sc_readv,     sys_readv(g, (int) x0, x1, (int) x2))
-SC_FORWARD(sc_writev,    sys_writev(g, (int) x0, x1, (int) x2))
-SC_FORWARD(sc_pread64,   sys_pread64(g, (int) x0, x1, x2, (int64_t) x3))
-SC_FORWARD(sc_pwrite64,  sys_pwrite64(g, (int) x0, x1, x2, (int64_t) x3))
+SC_IO(sc_readv,     sys_readv(g, (int) x0, x1, (int) x2), true)
+SC_IO(sc_writev,    sys_writev(g, (int) x0, x1, (int) x2), false)
+SC_IO(sc_pread64,   sys_pread64(g, (int) x0, x1, x2, (int64_t) x3), true)
+SC_IO(sc_pwrite64,  sys_pwrite64(g, (int) x0, x1, x2, (int64_t) x3), false)
 SC_FORWARD(sc_ioctl,     sys_ioctl(g, (int) x0, x1, x2))
-SC_FORWARD(sc_preadv,    sys_preadv(g, (int) x0, x1, (int) x2, (int64_t) x3))
-SC_FORWARD(sc_pwritev,   sys_pwritev(g, (int) x0, x1, (int) x2, (int64_t) x3))
+SC_IO(sc_preadv,    sys_preadv(g, (int) x0, x1, (int) x2, (int64_t) x3), true)
+SC_IO(sc_pwritev,   sys_pwritev(g, (int) x0, x1, (int) x2, (int64_t) x3), false)
 
 /* aarch64 LP64 raw ABI: x3=pos_l (full 64-bit offset), x4=pos_h (0), x5=flags
  */
-SC_FORWARD(sc_preadv2,   sys_preadv2(g, (int) x0, x1, (int) x2, (int64_t) x3, (int) x5))
-SC_FORWARD(sc_pwritev2,  sys_pwritev2(g, (int) x0, x1, (int) x2, (int64_t) x3, (int) x5))
+SC_IO(sc_preadv2,   sys_preadv2(g, (int) x0, x1, (int) x2, (int64_t) x3, (int) x5), true)
+SC_IO(sc_pwritev2,  sys_pwritev2(g, (int) x0, x1, (int) x2, (int64_t) x3, (int) x5), false)
 SC_FORWARD(sc_process_vm_readv, sys_process_vm_readv(g, (int64_t) x0, x1, x2, x3, x4, x5))
 SC_FORWARD(sc_process_vm_writev, sys_process_vm_writev(g, (int64_t) x0, x1, x2, x3, x4, x5))
-SC_FORWARD(sc_sendfile,  sys_sendfile(g, (int) x0, (int) x1, x2, x3))
-SC_FORWARD(sc_splice,    sys_splice(g, (int) x0, x1, (int) x2, x3, (size_t) x4, (unsigned int) x5))
+SC_PAIR(sc_sendfile,  sys_sendfile(g, (int) x0, (int) x1, x2, x3), (int) x1, (int) x0)
+SC_PAIR(sc_splice,    sys_splice(g, (int) x0, x1, (int) x2, x3, (size_t) x4, (unsigned int) x5), (int) x0, (int) x2)
 SC_FORWARD(sc_vmsplice,  sys_vmsplice(g, (int) x0, x1, (unsigned long) x2, (unsigned int) x3))
-SC_FORWARD(sc_tee,       sys_tee((int) x0, (int) x1, (size_t) x2, (unsigned int) x3))
-SC_FORWARD(sc_copy_file_range, sys_copy_file_range(g, (int) x0, x1, (int) x2, x3, x4, (unsigned int) x5))
+SC_PAIR(sc_tee,       sys_tee((int) x0, (int) x1, (size_t) x2, (unsigned int) x3), (int) x0, (int) x1)
+SC_PAIR(sc_copy_file_range, sys_copy_file_range(g, (int) x0, x1, (int) x2, x3, x4, (unsigned int) x5), (int) x0, (int) x2)
 SC_FORWARD(sc_lseek,     sys_lseek((int) x0, (int64_t) x1, (int) x2))
 
 /* Filesystem */
@@ -340,13 +397,13 @@ SC_FORWARD(sc_accept4,     sys_accept4(g, (int) x0, x1, x2, (int) x3))
 SC_FORWARD(sc_connect,     sys_connect(g, (int) x0, x1, (uint32_t) x2))
 SC_FORWARD(sc_getsockname, sys_getsockname(g, (int) x0, x1, x2))
 SC_FORWARD(sc_getpeername, sys_getpeername(g, (int) x0, x1, x2))
-SC_FORWARD(sc_sendto,      sys_sendto(g, (int) x0, x1, x2, (int) x3, x4, (uint32_t) x5))
-SC_FORWARD(sc_recvfrom,    sys_recvfrom(g, (int) x0, x1, x2, (int) x3, x4, x5))
+SC_IO(sc_sendto,      sys_sendto(g, (int) x0, x1, x2, (int) x3, x4, (uint32_t) x5), false)
+SC_IO(sc_recvfrom,    sys_recvfrom(g, (int) x0, x1, x2, (int) x3, x4, x5), true)
 SC_FORWARD(sc_setsockopt,  sys_setsockopt(g, (int) x0, (int) x1, (int) x2, x3, (uint32_t) x4))
 SC_FORWARD(sc_getsockopt,  sys_getsockopt(g, (int) x0, (int) x1, (int) x2, x3, x4))
 SC_FORWARD(sc_shutdown,    sys_shutdown((int) x0, (int) x1))
-SC_FORWARD(sc_sendmsg,     sys_sendmsg(g, (int) x0, x1, (int) x2))
-SC_FORWARD(sc_recvmsg,     sys_recvmsg(g, (int) x0, x1, (int) x2))
+SC_IO(sc_sendmsg,     sys_sendmsg(g, (int) x0, x1, (int) x2), false)
+SC_IO(sc_recvmsg,     sys_recvmsg(g, (int) x0, x1, (int) x2), true)
 SC_FORWARD(sc_sendmmsg,    sys_sendmmsg(g, (int) x0, x1, (unsigned int) x2, (int) x3))
 SC_FORWARD(sc_recvmmsg,    sys_recvmmsg(g, (int) x0, x1, (unsigned int) x2, (int) x3, x4))
 
@@ -2853,11 +2910,13 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
             }
 
             ssize_t ret;
+            int io_class = perf_enabled() ? fd_io_class(fd) : PERF_IO_NONE;
             ret = (nr == SYS_read) ? read(host_ref.fd, buf, count)
                                    : write(host_ref.fd, buf, count);
             if (ret >= 0) {
                 host_fd_ref_close(&host_ref);
                 result = ret;
+                perf_note_transfer(io_class, nr == SYS_read, result);
                 goto fast_done;
             }
 

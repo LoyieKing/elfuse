@@ -22,6 +22,7 @@
 
 #include "proved/cmsg.h"
 #include "proved/timespec.h"
+#include "runtime/perf.h"
 #include "syscall/internal.h"
 #include "syscall/io.h"
 #include "syscall/net.h"
@@ -30,6 +31,21 @@
 #include "syscall/net-absock.h"
 #include "syscall/proc.h"
 #include "syscall/signal.h"
+
+/* Account one sendmmsg/recvmmsg batch: @count messages moving @bytes in total.
+ * The per-message handlers are called directly, so the SC_IO wrappers do not
+ * see these; @io_class is captured before the first message is sent or
+ * received, so a close and reopen of the fd number cannot reclassify it.
+ */
+static void perf_note_mmsg(int io_class,
+                           bool is_read,
+                           uint64_t count,
+                           uint64_t bytes)
+{
+    if (count == 0 || io_class == PERF_IO_NONE)
+        return;
+    perf_count(io_class, is_read, count, bytes);
+}
 
 /* Linux SCM_MAX_FD: maximum number of file descriptors in SCM_RIGHTS */
 #define LINUX_SCM_MAX_FD 253
@@ -1141,6 +1157,8 @@ int64_t sys_sendmmsg(guest_t *g,
                      unsigned int vlen,
                      int flags)
 {
+    int io_class = perf_enabled() ? fd_io_class(fd) : PERF_IO_NONE;
+
     if (vlen == 0)
         return 0;
     if (vlen > 1024)
@@ -1169,6 +1187,7 @@ int64_t sys_sendmmsg(guest_t *g,
             if (ret < 0)
                 return ret;
             msg_len = (uint32_t) ret;
+            perf_note_mmsg(io_class, false, 1, (uint64_t) ret);
             if (write_linux_mmsghdr_len(g, mmsg_gva, msg_len) < 0)
                 return -LINUX_EFAULT;
             return 1;
@@ -1182,16 +1201,24 @@ int64_t sys_sendmmsg(guest_t *g,
      * first send reaches the guest as an errno.
      */
     unsigned int sent = 0;
+    uint64_t sent_bytes = 0;
     for (unsigned int i = 0; i < vlen; i++) {
         uint64_t hdr_gva = mmsg_gva + (uint64_t) i * LINUX_MMSGHDR_SIZE;
         int64_t ret = sys_sendmsg(g, fd, hdr_gva, flags);
-        if (ret < 0)
+        if (ret < 0) {
+            perf_note_mmsg(io_class, false, sent, sent_bytes);
             return sent > 0 ? (int64_t) sent : ret;
+        }
+        sent_bytes += (uint64_t) ret;
         uint32_t msg_len = (uint32_t) ret;
-        if (write_linux_mmsghdr_len(g, hdr_gva, msg_len) < 0)
+        if (write_linux_mmsghdr_len(g, hdr_gva, msg_len) < 0) {
+            /* This message was sent; only its length could not be written. */
+            perf_note_mmsg(io_class, false, sent + 1, sent_bytes);
             return sent > 0 ? (int64_t) sent : -LINUX_EFAULT;
+        }
         sent++;
     }
+    perf_note_mmsg(io_class, false, sent, sent_bytes);
     return (int64_t) sent;
 }
 
@@ -1202,6 +1229,8 @@ int64_t sys_recvmmsg(guest_t *g,
                      int flags,
                      uint64_t timeout_gva)
 {
+    int io_class = perf_enabled() ? fd_io_class(fd) : PERF_IO_NONE;
+
     if (vlen == 0)
         return 0;
     if (vlen > 1024)
@@ -1329,6 +1358,7 @@ int64_t sys_recvmmsg(guest_t *g,
                 host_msg.msg_flags = 0;
             }
             uint32_t msg_len = (uint32_t) ret;
+            perf_note_mmsg(io_class, true, 1, (uint64_t) msg_len);
             int32_t out_flags =
                 (int32_t) mac_to_linux_msg_flags(host_msg.msg_flags);
             if (guest_write_small(
@@ -1394,17 +1424,24 @@ int64_t sys_recvmmsg(guest_t *g,
     int msg_flags = flags & ~LINUX_MSG_WAITFORONE;
 
     unsigned int received = 0;
+    uint64_t received_bytes = 0;
     for (unsigned int i = 0; i < vlen; i++) {
         uint64_t hdr_gva = mmsg_gva + (uint64_t) i * LINUX_MMSGHDR_SIZE;
         int cur_flags = msg_flags;
         if (waitforone && received > 0)
             cur_flags |= 0x40;
         int64_t ret = sys_recvmsg(g, fd, hdr_gva, cur_flags);
-        if (ret < 0)
+        if (ret < 0) {
+            perf_note_mmsg(io_class, true, received, received_bytes);
             return received > 0 ? (int64_t) received : ret;
+        }
+        received_bytes += (uint64_t) ret;
         uint32_t msg_len = (uint32_t) ret;
-        if (write_linux_mmsghdr_len(g, hdr_gva, msg_len) < 0)
+        if (write_linux_mmsghdr_len(g, hdr_gva, msg_len) < 0) {
+            /* This message was received; only its length could not land. */
+            perf_note_mmsg(io_class, true, received + 1, received_bytes);
             return received > 0 ? (int64_t) received : -LINUX_EFAULT;
+        }
         received++;
 
         /* A zero-length message ends the batch. On a connection-oriented socket
@@ -1417,5 +1454,6 @@ int64_t sys_recvmmsg(guest_t *g,
         if (ret == 0)
             break;
     }
+    perf_note_mmsg(io_class, true, received, received_bytes);
     return (int64_t) received;
 }

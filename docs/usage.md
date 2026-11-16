@@ -490,6 +490,12 @@ Off by default, and useful when a guest misbehaves rather than in normal use:
   consumes and print the twelve most expensive paths every 2000 opens, with
   call count, total milliseconds and average microseconds. The counters live in
   a fixed in-process table; nothing is allocated or written to disk per open.
+- `ELFUSE_HUD_STATS=/absolute/path`: publish the Umaru HUD every 200 ms. Set
+  this in the host environment; guest `--env` does not enable the publisher.
+  The 224-byte CPU prefix is followed by versioned, per-process thread and
+  cumulative I/O rows. The root owns the file and fork children own separate
+  rows. Missing or stale rows are unavailable, not zero. See
+  [Guest performance telemetry](testing.md#guest-performance-telemetry).
 
 ## Runtime Profile
 

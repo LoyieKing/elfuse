@@ -2659,6 +2659,28 @@ int sched_ready_count(void)
     return count;
 }
 
+/* Queued plus mounted tasks, so a reader sees the count the guest would call
+ * runnable: READY tasks waiting on a CPU and the task each CPU is running.
+ * Takes sched_lock once; the HUD thread is the caller and runs every tick, so
+ * no per-task lock is taken.
+ */
+int sched_active_count(void)
+{
+    int count = 0;
+
+    if (!sched_initialized)
+        return 0;
+    pthread_mutex_lock(&sched_lock);
+    for (int i = 0; i < sched_ncpu; i++) {
+        count += (int) sched_cpus[i].fair.count + (int) sched_cpus[i].dl.count +
+                 (int) sched_cpus[i].rt_nr;
+        if (sched_cpus[i].current)
+            count++;
+    }
+    pthread_mutex_unlock(&sched_lock);
+    return count;
+}
+
 uint64_t sched_cpu_weight_sum(int cpu_index)
 {
     uint64_t weight = 0;

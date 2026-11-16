@@ -469,6 +469,11 @@ bool sched_take_resched(struct thread_entry *t);
 int sched_thread_cpu(const struct thread_entry *t);
 bool sched_cpu_has_ready(int cpu);
 int sched_ready_count(void);
+
+/* Queued plus mounted tasks: what the guest calls runnable, as opposed to the
+ * host vCPU workers it may be spread over.
+ */
+int sched_active_count(void);
 uint64_t sched_cpu_weight_sum(int cpu);
 
 /* Current fair time slice of @t in actual nanoseconds (0 for FIFO/DL, which
