@@ -18,7 +18,7 @@ DISPATCH_TABLE_SIZE = 512
 ENTRY_RE = re.compile(r"^(SYS_[A-Za-z0-9_]+)\s+(sc_[A-Za-z0-9_]+)\s+([01])$")
 ABI_RE = re.compile(r"^#define\s+(SYS_[A-Za-z0-9_]+)\s+([0-9]+)\s*$")
 WRAPPER_RE = re.compile(
-    r"^\s*SC_(?:FORWARD|LOCKED|STUB)\((sc_[A-Za-z0-9_]+),", re.MULTILINE
+    r"^\s*SC_(?:FORWARD|LOCKED|STUB|IO|PAIR)\((sc_[A-Za-z0-9_]+),", re.MULTILINE
 )
 HANDLER_RE = re.compile(r"^\s*static\s+int64_t\s+(sc_[A-Za-z0-9_]+)\s*\(", re.MULTILINE)
 ALIAS_RE = re.compile(

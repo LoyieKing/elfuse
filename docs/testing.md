@@ -92,6 +92,9 @@ make lint
 make clean
 ```
 
+
+Dispatch generation checks every manifest handler against the C wrappers,
+including the I/O and paired-descriptor macros, before writing `build/dispatch.h`.
 What they do:
 
 - `make elfuse`: build and sign `build/elfuse`
