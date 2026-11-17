@@ -1005,6 +1005,8 @@ run_unit_tests()
         "$bindir/test-futex-wake-nowaiter"
     test_rc "$runner" "test-futex-shared-alias" 0 \
         "$bindir/test-futex-shared-alias"
+    test_rc "$runner" "test-futex-shared-vm" 0 \
+        "$bindir/test-futex-shared-vm"
     test_rc "$runner" "test-futex-requeue-account" 0 \
         "$bindir/test-futex-requeue-account"
     test_rc "$runner" "test-futex-requeue-samebucket" 0 \

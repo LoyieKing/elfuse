@@ -109,6 +109,16 @@
  *                                     sched_lock where a completion is
  *                                     published; signal claims (sig_lock) run
  *                                     before it, never beneath it
+ *   futex_shared_mutex (runtime/futex.c): process-local registry mapping and
+ *                                     waiter list. Nests the registry fd's
+ *                                     flock before any bucket, and buckets
+ *                                     while publishing/requeueing a record.
+ *                                     mmap_lock precedes it for word access;
+ *                                     futex_lifetime_mutex precedes it for
+ *                                     retirement. The host notification wait
+ *                                     holds neither mutex nor flock. Retirement
+ *                                     uses state atomics without flock; slot
+ *                                     allocation/key edits serialize under it
  *   futex bucket (runtime/futex.c):   per-bucket, index-ordered if >1. Also
  *                                     taken alone by futex_kick, beneath
  *                                     whatever lock a signal is queued under,

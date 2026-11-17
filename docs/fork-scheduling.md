@@ -77,6 +77,13 @@ identity. This does not join independent scheduler domains. UNIX peer
 credentials use the actual host peer and its validated published guest
 identity, rather than substituting the querying process's credentials.
 
+File-backed shared futex WAIT/WAKE and BITSET operations match the backing
+device, inode and byte offset across independent VMs. A per-user host registry
+arbitrates exact counts and masks; notification helpers complete the existing
+scheduler parks without blocking guest workers. Waiters pin backing descriptors,
+and timeout, signal and exit retire their records. This does not provide
+cross-VM PI donation or full shared-mm semantics for anonymous vfork backing.
+
 ## Fork snapshot consistency
 
 Stopping every vCPU is insufficient when host threads can mutate guest memory.

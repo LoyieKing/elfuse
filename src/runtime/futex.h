@@ -5,12 +5,13 @@
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Hash table of wait queues keyed by guest virtual address. Supports
- * FUTEX_WAIT, FUTEX_WAKE, FUTEX_WAIT_BITSET, FUTEX_WAKE_BITSET, FUTEX_REQUEUE,
- * FUTEX_CMP_REQUEUE, FUTEX_WAKE_OP, and PI futexes (FUTEX_LOCK_PI,
- * FUTEX_UNLOCK_PI, FUTEX_TRYLOCK_PI, FUTEX_WAIT_REQUEUE_PI,
- * FUTEX_CMP_REQUEUE_PI). Each waiter has its own condition variable for precise
- * wakeup.
+ * Bucket queues use private guest addresses or shared backing object/offset.
+ * File-backed WAIT/WAKE and bitsets share a host registry across processes; PI
+ * ownership and donation remain process-local. Supports FUTEX_WAIT, FUTEX_WAKE,
+ * FUTEX_WAIT_BITSET, FUTEX_WAKE_BITSET, FUTEX_REQUEUE, FUTEX_CMP_REQUEUE,
+ * FUTEX_WAKE_OP, and PI futexes (FUTEX_LOCK_PI, FUTEX_UNLOCK_PI,
+ * FUTEX_TRYLOCK_PI, FUTEX_WAIT_REQUEUE_PI, FUTEX_CMP_REQUEUE_PI). Each waiter
+ * has its own condition variable for precise wakeup.
  *
  * This header deliberately does not include runtime/thread.h: thread.h embeds
  * futex_pi_task_t, so the dependency runs the other way. Public entry points

@@ -282,7 +282,7 @@ CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
         test-profile-host test-futex-rearm-host \
         test-stdio-nonblock-host \
         test-rlimit-unchanged-host test-casefold-host \
-        test-memfd-scm-host \
+        test-memfd-scm-host test-futex-shared-vm-host \
         test-casefold-walk-host test-absock-names-host \
         test-dynamic-array-host test-string-builder-host \
         test-wakeup-pipe-host test-guest-env-host \
@@ -311,6 +311,7 @@ $(call run-host-unit,test-wakeup-pipe-host,wakeup pipe concurrency unit test)
 $(call run-host-unit,test-stdio-nonblock-host,launcher stdio flags across a guest)
 $(call run-host-unit,test-rlimit-unchanged-host,host rlimits across a guest)
 $(call run-host-unit,test-memfd-scm-host,memfd identity across independent elfuse instances)
+$(call run-host-unit,test-futex-shared-vm-host,shared futex across independent elfuse instances)
 $(call run-host-unit,test-guest-env-host,guest environment merge cross product)
 $(call run-host-unit,test-usb-desc-host,USB descriptor blob walk unit test)
 $(call run-host-unit,test-usbdev-urb-host,usbdevfs URB bookkeeping unit test)

@@ -896,6 +896,28 @@ same-flags pre-fix futex build reaches only 340/2,000. Neither reports a failed
 lock acquisition. The contention-count lane remains failed; the rearm fix does
 not establish a throughput improvement.
 
+`test-futex-shared-vm-host` transfers a memfd between two independently launched
+VMs and requires both peers to exit successfully. The guest also runs in one
+fork family and on native Linux. Checks cover wake counts, mask selection,
+changed values, retired waiters, timeout and signal completion, offset/object/
+private-mapping isolation, and survival after the backing creator exits.
+The independent host driver passes 2 checks; fork and native Linux peers pass
+20 and 26 checks. The rearm host regression passes both wake and signal cases.
+
+File-backed shared waits use a bounded per-user host registry: 256 process
+slots, 32,768 waiter records and 8,192 local records. Atomic record claims
+select waiters; one helper per active VM receives coalesced notifications.
+Missing Darwin shared-wait support returns an error. Cross-VM PI donation
+and anonymous shared-mm synchronization remain outside this path.
+
+The real Umaru AudioRecord consumer receives 48,000 silent samples in 1,001 ms
+from a separate service-core VM, without periodic guest polling. Its subsequent
+audio/video startup fails before service-core READY and is not a passed scene.
+The ARM64 matrix reports 335 passes, zero failures and ten skips. `make check`
+reports 111 passes and one PI contention-count failure (741/2,000), so that
+whole gate remains failed. Lock-order, atomic, character-set and EINTR checks
+pass; changed C files pass commentflow and clang-format.
+
 ## Anonymous backing policies
 
 `make test-memory-mode` runs private zero fill, fixed replacement, discard,

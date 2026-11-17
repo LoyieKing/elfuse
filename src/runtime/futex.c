@@ -5,19 +5,11 @@
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Hash table of wait queues keyed by a futex_key_t captured when the operation
- * starts. A private key is this process plus the raw guest address. A shared
- * key is the backing object and the file offset of the word, so two MAP_SHARED
- * mappings of one object and offset name one queue. Each bucket has its own
- * mutex. Waiters are singly-linked lists with per-waiter condition variables.
- *
- * Atomicity: the critical FUTEX_WAIT race (guest writes the futex word after
- * the current read but before the waiter sleeps) is prevented by holding the
- * bucket lock across the word-read, enqueue, and cond_wait. FUTEX_WAKE takes
- * the same bucket lock, so a wake cannot slip between the read and the wait.
- *
- * Timeout: FUTEX_WAIT with a non-NULL timeout uses an absolute deadline.
- * FUTEX_WAIT_BITSET always uses absolute time.
+ * Private wait queues use per-process buckets. File-backed shared waiters also
+ * publish in a per-user host registry keyed by backing object and byte offset.
+ * Its atomic claims select exact wake counts and masks; a process notification
+ * only asks the host helper to complete those claims through the scheduler.
+ * Neither a parked waiter nor that helper retains a guest mapping pointer.
  */
 
 #include <errno.h>
@@ -31,6 +23,14 @@
 #include <limits.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <libproc.h>
+#include <sys/file.h>
+#include <sys/proc.h>
 
 #include "utils.h"
 
@@ -54,6 +54,23 @@
 #include "proved/futexwaitv.h"
 #include "proved/futexwakeop.h"
 #include "proved/timespec.h"
+
+/* Only the process notification uses Darwin's shared address wait. Selection
+ * and cancellation use the registry record, since wake_any has no count/mask
+ * contract. Older hosts refuse shared waits instead of splitting their queues.
+ */
+extern int os_sync_wait_on_address_with_timeout(void *addr,
+                                                uint64_t value,
+                                                size_t size,
+                                                uint32_t flags,
+                                                uint32_t clockid,
+                                                uint64_t timeout_ns)
+    __attribute__((weak_import));
+extern int os_sync_wake_by_address_any(void *addr, size_t size, uint32_t flags)
+    __attribute__((weak_import));
+
+#define FUTEX_HOST_SHARED 1u
+#define FUTEX_HOST_CLOCK_MACH_ABSOLUTE 32u
 
 /* Interrupt flag: when set, futex_wait returns -EINTR. Raised only by teardown
  * through thread_wake_all_blocked, so every blocked wait can observe that the
@@ -178,11 +195,12 @@ struct futex_pi_lock;
 struct futex_waitv_group;
 
 typedef struct futex_key {
-    bool shared;     /* MAP_SHARED word; private otherwise */
-    uint64_t uaddr;  /* Guest VA. Private identity, and the word's location. */
-    uint64_t dev;    /* Host st_dev of the backing object. Shared only. */
-    uint64_t ino;    /* Host st_ino of the backing object. Shared only. */
-    uint64_t offset; /* Byte offset of the word in that object. Shared only. */
+    bool shared;      /* MAP_SHARED word; private otherwise */
+    bool file_backed; /* Shared host file identity, reachable by other VMs. */
+    uint64_t uaddr;   /* Guest VA. Private identity, and the word's location. */
+    uint64_t dev;     /* Host st_dev of the backing object. Shared only. */
+    uint64_t ino;     /* Host st_ino of the backing object. Shared only. */
+    uint64_t offset;  /* Byte offset of the word in that object. Shared only. */
 } futex_key_t;
 
 typedef struct futex_waiter {
@@ -256,6 +274,10 @@ typedef struct futex_waiter {
      */
     struct futex_waitv_group *waitv_group;
     int waitv_index;
+
+    unsigned shared_slot; /* Registry index plus one; zero is unregistered. */
+    int shared_fd;        /* Pins the inode until this waiter retires. */
+    struct futex_waiter *shared_next;
 } futex_waiter_t;
 
 /* futex_waitv publishes its group in t->async_futex_waiter with the low bit
@@ -305,12 +327,13 @@ static inline struct futex_waitv_group *futex_async_waitv_group(const void *p)
  * reason; it is this lock now, so single waiters, group members and tagged
  * group tokens all retire under one rule.
  *
- * Lock order: futex_lifetime_mutex -> futex_pi_mutex -> bucket locks, and above
- * sched_lock where a completion is published. It is never taken while holding a
- * bucket, futex_pi_mutex, sched_lock, thread_lock or sig_lock: the sync wait
- * paths claim under the bucket and acquire it only after dropping it, and a
- * signal claim (sig_lock) runs before it. Nothing below it takes it again, so a
- * completion that runs sched_dispatch under it cannot recurse.
+ * Lock order: futex_lifetime_mutex -> futex_shared_mutex -> futex_pi_mutex ->
+ * bucket locks, and above sched_lock where a completion is published. It is
+ * never taken while holding a bucket, futex_shared_mutex, futex_pi_mutex,
+ * sched_lock, thread_lock or sig_lock: the sync wait paths claim under the
+ * bucket and acquire it only after dropping it, and a signal claim (sig_lock)
+ * runs before it. Nothing below it takes it again, so a completion that runs
+ * sched_dispatch under it cannot recurse.
  */
 static pthread_mutex_t futex_lifetime_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -332,6 +355,74 @@ typedef struct {
 } __attribute__((aligned(128))) futex_bucket_t;
 
 static futex_bucket_t buckets[FUTEX_BUCKETS];
+
+/* Safety bounds on host-private state shared by independent launches. Records
+ * contain no pointers. flock serializes keys and slot allocation; state CAS
+ * arbitrates wake against cancellation without transport under a bucket lock.
+ */
+#define FUTEX_SHARED_PROCESSES 256u
+#define FUTEX_SHARED_WAITERS 32768u
+#define FUTEX_SHARED_PER_PROCESS 8192u
+#define FUTEX_SHARED_MAGIC 0x454c465554455831ULL
+
+enum futex_shared_state {
+    FUTEX_SHARED_FREE,
+    FUTEX_SHARED_ARMED,
+    FUTEX_SHARED_WOKEN,
+    FUTEX_SHARED_CANCELLED,
+};
+
+typedef struct {
+    int32_t pid;
+    uint32_t reserved;
+    uint64_t start_us;
+    _Atomic uint64_t notify;
+} futex_shared_process_t;
+
+typedef struct {
+    _Atomic uint32_t state;
+    _Atomic uint32_t process;
+    uint32_t bitset;
+    uint32_t reserved;
+    uint64_t dev;
+    uint64_t ino;
+    uint64_t offset;
+} futex_shared_record_t;
+
+typedef struct {
+    uint64_t magic;
+    _Atomic uint32_t high_water;
+    uint32_t reserved;
+    futex_shared_process_t processes[FUTEX_SHARED_PROCESSES];
+    futex_shared_record_t records[FUTEX_SHARED_WAITERS];
+} futex_shared_registry_t;
+
+_Static_assert(sizeof(futex_shared_process_t) == 24,
+               "shared futex process record layout");
+_Static_assert(sizeof(futex_shared_record_t) == 40,
+               "shared futex waiter record layout");
+
+static pthread_mutex_t futex_shared_mutex = PTHREAD_MUTEX_INITIALIZER;
+static futex_shared_registry_t *futex_shared_registry;
+static int futex_shared_fd = -1;
+static unsigned futex_shared_process;
+static futex_waiter_t *futex_shared_local;
+static unsigned futex_shared_local_count;
+static bool futex_shared_helper_running;
+
+static void *futex_shared_helper(void *arg);
+static void futex_shared_retire(futex_waiter_t *w);
+
+/* A remote claim can precede local bucket unlink. Queue decisions use the
+ * registry state; the selected waiter still completes through its owner.
+ */
+static bool futex_waiter_is_queued(const futex_waiter_t *w)
+{
+    return !w->shared_slot ||
+           atomic_load_explicit(
+               &futex_shared_registry->records[w->shared_slot - 1].state,
+               memory_order_acquire) == FUTEX_SHARED_ARMED;
+}
 
 /* Hash a guest VA to a bucket index.
  *
@@ -393,6 +484,7 @@ static bool futex_key_get(guest_t *g,
                           futex_key_t *out)
 {
     out->shared = false;
+    out->file_backed = false;
     out->uaddr = uaddr;
     out->dev = 0;
     out->ino = 0;
@@ -421,6 +513,7 @@ static bool futex_key_get(guest_t *g,
             return false;
         }
         out->shared = true;
+        out->file_backed = true;
         out->dev = (uint64_t) st.st_dev;
         out->ino = (uint64_t) st.st_ino;
         out->offset = r->offset + delta;
@@ -449,6 +542,390 @@ static void futex_key_retarget(futex_key_t *dst,
 {
     *dst = *src;
     dst->uaddr = uaddr;
+}
+
+static int futex_shared_process_alive(const futex_shared_process_t *p)
+{
+    int32_t pid = p->pid;
+    uint64_t start_us = p->start_us;
+    if (pid <= 0)
+        return 0;
+    struct proc_bsdinfo info;
+    /* XNU proc_info.c enables proc_find_zombref for BSD info when arg is 1. */
+    if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 1, &info, sizeof(info)) !=
+        (int) sizeof(info))
+        return errno == ESRCH ? 0 : -1;
+    return info.pbi_status != SZOMB &&
+           start_us ==
+               info.pbi_start_tvsec * 1000000ULL + info.pbi_start_tvusec;
+}
+
+static bool futex_shared_reap_locked(void)
+{
+    unsigned high_water = atomic_load_explicit(
+        &futex_shared_registry->high_water, memory_order_relaxed);
+    if (high_water > FUTEX_SHARED_WAITERS)
+        return false;
+    for (unsigned i = 0; i < high_water; i++) {
+        futex_shared_record_t *r = &futex_shared_registry->records[i];
+        uint32_t state = atomic_load_explicit(&r->state, memory_order_acquire);
+        uint32_t process =
+            atomic_load_explicit(&r->process, memory_order_relaxed);
+        if (state > FUTEX_SHARED_CANCELLED ||
+            (state != FUTEX_SHARED_FREE && process >= FUTEX_SHARED_PROCESSES))
+            return false;
+    }
+    for (unsigned i = 0; i < FUTEX_SHARED_PROCESSES; i++) {
+        futex_shared_process_t *p = &futex_shared_registry->processes[i];
+        if (p->pid == 0)
+            continue;
+        int alive = futex_shared_process_alive(p);
+        if (alive < 0)
+            return false;
+        if (alive)
+            continue;
+        for (unsigned j = 0; j < high_water; j++) {
+            futex_shared_record_t *r = &futex_shared_registry->records[j];
+            uint32_t process =
+                atomic_load_explicit(&r->process, memory_order_relaxed);
+            if (process == i)
+                atomic_store_explicit(&r->state, FUTEX_SHARED_FREE,
+                                      memory_order_release);
+        }
+        p->pid = 0;
+    }
+    while (high_water != 0 &&
+           atomic_load_explicit(
+               &futex_shared_registry->records[high_water - 1].state,
+               memory_order_acquire) == FUTEX_SHARED_FREE)
+        high_water--;
+    atomic_store_explicit(&futex_shared_registry->high_water, high_water,
+                          memory_order_relaxed);
+    return true;
+}
+
+/* Returns with the process mutex and flock held. File allocation and registry
+ * locking happen before any bucket lock. The file is never replaced/truncated
+ * once published, so helpers' notification addresses remain valid.
+ */
+static int futex_shared_begin(void)
+{
+    if (!os_sync_wait_on_address_with_timeout || !os_sync_wake_by_address_any)
+        return -LINUX_ENOSYS;
+    pthread_mutex_lock(&futex_shared_mutex);
+    int fd = futex_shared_fd;
+    int saved_errno;
+    bool first = fd < 0;
+    if (first) {
+        char dir[64], path[96];
+        snprintf(dir, sizeof(dir), "/tmp/elfuse-futex-%u", (unsigned) getuid());
+        if (create_private_dir(dir) < 0)
+            goto fail;
+        snprintf(path, sizeof(path), "%s/registry", dir);
+        fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (fd < 0)
+            goto fail;
+        struct stat st;
+        if (fstat(fd, &st) < 0)
+            goto fail_fd;
+        if (!S_ISREG(st.st_mode) || st.st_uid != getuid() || st.st_nlink != 1 ||
+            (st.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+            errno = EACCES;
+            goto fail_fd;
+        }
+    }
+    while (flock(fd, LOCK_EX) < 0) {
+        if (errno != EINTR)
+            goto fail_fd;
+    }
+    if (first) {
+        struct stat st;
+        if (fstat(fd, &st) < 0)
+            goto fail_unlock;
+        bool created = st.st_size == 0;
+        if (created && ftruncate(fd, sizeof(futex_shared_registry_t)) < 0)
+            goto fail_unlock;
+        if (!created && st.st_size != (off_t) sizeof(futex_shared_registry_t)) {
+            errno = EIO;
+            goto fail_unlock;
+        }
+        futex_shared_registry_t *registry = mmap(
+            NULL, sizeof(*registry), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (registry == MAP_FAILED)
+            goto fail_unlock;
+        if (created || registry->magic == 0)
+            registry->magic = FUTEX_SHARED_MAGIC;
+        if (registry->magic != FUTEX_SHARED_MAGIC) {
+            munmap(registry, sizeof(*registry));
+            errno = EIO;
+            goto fail_unlock;
+        }
+        futex_shared_registry = registry;
+        if (!futex_shared_reap_locked()) {
+            errno = EIO;
+            goto fail_map;
+        }
+        struct proc_bsdinfo info;
+        if (proc_pidinfo(getpid(), PROC_PIDTBSDINFO, 0, &info, sizeof(info)) !=
+            (int) sizeof(info)) {
+            errno = ESRCH;
+            goto fail_map;
+        }
+        unsigned process;
+        for (process = 0; process < FUTEX_SHARED_PROCESSES; process++) {
+            if (registry->processes[process].pid == 0)
+                break;
+        }
+        if (process == FUTEX_SHARED_PROCESSES) {
+            errno = ENOSPC;
+            goto fail_map;
+        }
+        futex_shared_process_t *p = &registry->processes[process];
+        p->start_us = info.pbi_start_tvsec * 1000000ULL + info.pbi_start_tvusec;
+        atomic_store_explicit(&p->notify, 0, memory_order_relaxed);
+        p->pid = getpid();
+        futex_shared_process = process;
+        futex_shared_fd = fd;
+    } else {
+        if (!futex_shared_reap_locked()) {
+            errno = EIO;
+            goto fail_unlock;
+        }
+    }
+    return 0;
+
+fail_map:
+    saved_errno = errno;
+    munmap(futex_shared_registry, sizeof(*futex_shared_registry));
+    futex_shared_registry = NULL;
+    errno = saved_errno;
+fail_unlock:
+    saved_errno = errno;
+    (void) flock(fd, LOCK_UN);
+    errno = saved_errno;
+fail_fd:
+    saved_errno = errno;
+    if (first)
+        close(fd);
+    errno = saved_errno;
+fail: {
+    int error = (int) linux_errno();
+    pthread_mutex_unlock(&futex_shared_mutex);
+    return error;
+}
+}
+
+static void futex_shared_end(void)
+{
+    (void) flock(futex_shared_fd, LOCK_UN);
+    pthread_mutex_unlock(&futex_shared_mutex);
+}
+
+static int futex_shared_guard_begin(bool shared, bool *mmap_owned)
+{
+    *mmap_owned = false;
+    if (!shared)
+        return 0;
+    if (!mmap_lock_held()) {
+        mmap_lock_acquire();
+        *mmap_owned = true;
+    }
+    int rc = futex_shared_begin();
+    if (rc < 0 && *mmap_owned)
+        mmap_lock_release();
+    return rc;
+}
+
+static void futex_shared_guard_end(bool shared, bool mmap_owned)
+{
+    if (shared) {
+        futex_shared_end();
+        if (mmap_owned)
+            mmap_lock_release();
+    }
+}
+
+static void futex_shared_notify(unsigned process)
+{
+    futex_shared_process_t *p = &futex_shared_registry->processes[process];
+
+    /* Release publishes the selected record; the helper loads before scanning.
+     * The counter closes a notification arriving before the host wait arms.
+     */
+    atomic_fetch_add_explicit(&p->notify, 1, memory_order_release);
+    (void) os_sync_wake_by_address_any(&p->notify, sizeof(p->notify),
+                                       FUTEX_HOST_SHARED);
+}
+
+static int futex_shared_pin_locked(guest_t *g, const futex_key_t *key)
+{
+    const guest_region_t *region = guest_region_find(g, key->uaddr);
+    struct stat st;
+    if (!region || !region->shared || region->backing_fd < 0 ||
+        fstat(region->backing_fd, &st) < 0 ||
+        (uint64_t) st.st_dev != key->dev || (uint64_t) st.st_ino != key->ino ||
+        region->offset + (key->uaddr - region->start) != key->offset)
+        return -LINUX_EFAULT;
+    int pin = fcntl(region->backing_fd, F_DUPFD_CLOEXEC, 0);
+    return pin < 0 ? (int) linux_errno() : pin;
+}
+
+static int futex_shared_attach_locked(futex_waiter_t *w, guest_t *g)
+{
+    if (!w->key.file_backed)
+        return 0;
+    if (futex_shared_local_count == FUTEX_SHARED_PER_PROCESS)
+        return -LINUX_ENOMEM;
+    unsigned high_water = atomic_load_explicit(
+        &futex_shared_registry->high_water, memory_order_relaxed);
+    if (high_water > FUTEX_SHARED_WAITERS)
+        return -LINUX_EIO;
+    int pin = futex_shared_pin_locked(g, &w->key);
+    if (pin < 0)
+        return pin;
+    unsigned slot;
+    for (slot = 0; slot < high_water; slot++) {
+        if (atomic_load_explicit(&futex_shared_registry->records[slot].state,
+                                 memory_order_acquire) == FUTEX_SHARED_FREE)
+            break;
+    }
+    if (slot >= FUTEX_SHARED_WAITERS) {
+        close(pin);
+        return -LINUX_ENOMEM;
+    }
+    if (slot == high_water)
+        atomic_store_explicit(&futex_shared_registry->high_water, slot + 1,
+                              memory_order_relaxed);
+    if (!futex_shared_helper_running) {
+        pthread_attr_t attr;
+        int error = pthread_attr_init(&attr);
+        if (error == 0) {
+            error = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+            if (error == 0) {
+                pthread_t helper;
+                error =
+                    pthread_create(&helper, &attr, futex_shared_helper, NULL);
+            }
+            pthread_attr_destroy(&attr);
+        }
+        if (error != 0) {
+            close(pin);
+            errno = error;
+            return (int) linux_errno();
+        }
+        futex_shared_helper_running = true;
+    }
+    futex_shared_record_t *r = &futex_shared_registry->records[slot];
+    atomic_store_explicit(&r->process, futex_shared_process,
+                          memory_order_relaxed);
+    r->bitset = w->bitset;
+    r->dev = w->key.dev;
+    r->ino = w->key.ino;
+    r->offset = w->key.offset;
+    w->shared_slot = slot + 1;
+    w->shared_fd = pin;
+    w->shared_next = futex_shared_local;
+    futex_shared_local = w;
+    futex_shared_local_count++;
+    atomic_store_explicit(&r->state, FUTEX_SHARED_ARMED, memory_order_release);
+    return 0;
+}
+
+/* Caller owns the waiter under futex_lifetime_mutex, or it never published it
+ * and still holds the registry transaction. FREE follows list removal and fd
+ * close, so a slot cannot name both the old and the next local waiter.
+ */
+static void futex_shared_retire_locked(futex_waiter_t *w)
+{
+    if (!w->shared_slot)
+        return;
+    for (futex_waiter_t **pp = &futex_shared_local; *pp;
+         pp = &(*pp)->shared_next) {
+        if (*pp == w) {
+            *pp = w->shared_next;
+            break;
+        }
+    }
+    futex_shared_local_count--;
+    close(w->shared_fd);
+    atomic_store_explicit(
+        &futex_shared_registry->records[w->shared_slot - 1].state,
+        FUTEX_SHARED_FREE, memory_order_release);
+    w->shared_slot = 0;
+    if (futex_shared_local_count == 0)
+        futex_shared_notify(futex_shared_process);
+}
+
+static void futex_shared_retire(futex_waiter_t *w)
+{
+    if (!w->shared_slot)
+        return;
+    pthread_mutex_lock(&futex_shared_mutex);
+    futex_shared_retire_locked(w);
+    pthread_mutex_unlock(&futex_shared_mutex);
+}
+
+static int futex_shared_retarget_locked(futex_waiter_t *w,
+                                        guest_t *g,
+                                        const futex_key_t *dst)
+{
+    if (!dst->file_backed) {
+        futex_shared_retire_locked(w);
+        return 0;
+    }
+    if (!w->shared_slot) {
+        futex_key_t old = w->key;
+        w->key = *dst;
+        int rc = futex_shared_attach_locked(w, g);
+        w->key = old;
+        return rc;
+    }
+    int pin = futex_shared_pin_locked(g, dst);
+    if (pin < 0)
+        return pin;
+    futex_shared_record_t *r =
+        &futex_shared_registry->records[w->shared_slot - 1];
+    r->dev = dst->dev;
+    r->ino = dst->ino;
+    r->offset = dst->offset;
+    close(w->shared_fd);
+    w->shared_fd = pin;
+    return 0;
+}
+
+static int futex_shared_wake_locked(const futex_key_t *key,
+                                    uint32_t count,
+                                    uint32_t bitset)
+{
+    bool notify[FUTEX_SHARED_PROCESSES] = {false};
+    int woken = 0;
+    unsigned high_water = atomic_load_explicit(
+        &futex_shared_registry->high_water, memory_order_relaxed);
+    if (high_water > FUTEX_SHARED_WAITERS)
+        return -LINUX_EIO;
+    for (unsigned i = 0; i < high_water && (uint32_t) woken < count; i++) {
+        futex_shared_record_t *r = &futex_shared_registry->records[i];
+        uint32_t process =
+            atomic_load_explicit(&r->process, memory_order_relaxed);
+        if (atomic_load_explicit(&r->state, memory_order_acquire) !=
+                FUTEX_SHARED_ARMED ||
+            process >= FUTEX_SHARED_PROCESSES || r->dev != key->dev ||
+            r->ino != key->ino || r->offset != key->offset ||
+            (r->bitset & bitset) == 0)
+            continue;
+        uint32_t expected = FUTEX_SHARED_ARMED;
+        if (atomic_compare_exchange_strong_explicit(
+                &r->state, &expected, FUTEX_SHARED_WOKEN, memory_order_acq_rel,
+                memory_order_acquire)) {
+            notify[process] = true;
+            woken++;
+        }
+    }
+    for (unsigned i = 0; i < FUTEX_SHARED_PROCESSES; i++) {
+        if (notify[i])
+            futex_shared_notify(i);
+    }
+    return woken;
 }
 
 /* Linux requires a futex word to be naturally aligned, and every op checks this
@@ -538,7 +1015,7 @@ static bool bucket_has_key_locked(const futex_bucket_t *b,
                                   const futex_key_t *key)
 {
     for (const futex_waiter_t *w = b->head; w; w = w->next) {
-        if (futex_key_equal(&w->key, key))
+        if (futex_key_equal(&w->key, key) && futex_waiter_is_queued(w))
             return true;
     }
     return false;
@@ -576,6 +1053,7 @@ static bool futex_async_claim_pre_unmount_locked(thread_entry_t *self,
 static void futex_async_free_claimed(futex_waiter_t *waiter)
 {
     pthread_mutex_lock(&futex_lifetime_mutex);
+    futex_shared_retire(waiter);
     pthread_cond_destroy(&waiter->cond);
     free(waiter);
     pthread_mutex_unlock(&futex_lifetime_mutex);
@@ -626,6 +1104,7 @@ static void futex_async_finish_bookkeeping_locked(thread_entry_t *t,
          * record. Do not free or leak that link.
          */
         futex_pi_forget_waiter(w);
+        futex_shared_retire(w);
         pthread_cond_destroy(&w->cond);
         free(w);
     }
@@ -755,9 +1234,17 @@ static void futex_async_wake_flush(void)
  * acquire load of woken. On return *pp points at the next entry, so a scanning
  * loop should re-test *pp without advancing pp.
  */
-static void futex_wake_waiter_locked(futex_waiter_t **pp)
+static bool futex_wake_waiter_locked(futex_waiter_t **pp)
 {
     futex_waiter_t *w = *pp;
+    bool counted = true;
+    if (w->shared_slot) {
+        uint32_t expected = FUTEX_SHARED_ARMED;
+        counted = atomic_compare_exchange_strong_explicit(
+            &futex_shared_registry->records[w->shared_slot - 1].state,
+            &expected, FUTEX_SHARED_WOKEN, memory_order_acq_rel,
+            memory_order_acquire);
+    }
     *pp = w->next; /* unlink before signaling */
     atomic_store_explicit(&w->woken, 1, memory_order_release);
     pthread_cond_signal(&w->cond);
@@ -766,6 +1253,7 @@ static void futex_wake_waiter_locked(futex_waiter_t **pp)
         futex_waitv_note_wake(w);
     if (w->async_owner)
         futex_async_wake_queue(w);
+    return counted;
 }
 
 /* Wake the first waiter queued under @key, whichever op parked it. The bucket
@@ -775,7 +1263,7 @@ static void futex_wake_waiter_locked(futex_waiter_t **pp)
 static void futex_wake_first_locked(futex_bucket_t *b, const futex_key_t *key)
 {
     for (futex_waiter_t **pp = &b->head; *pp; pp = &(*pp)->next) {
-        if (futex_key_equal(&(*pp)->key, key)) {
+        if (futex_key_equal(&(*pp)->key, key) && futex_waiter_is_queued(*pp)) {
             futex_wake_waiter_locked(pp);
             return;
         }
@@ -1511,6 +1999,10 @@ void futex_pi_task_priority_changed(thread_entry_t *t)
 
 void futex_init(void)
 {
+    /* Fork uses posix_spawn: the child starts with no registry fd, helper or
+     * notification owner. O_CLOEXEC keeps the parent's flock description out of
+     * that fresh process; no fork-family namespace is needed for files.
+     */
     for (unsigned i = 0; i < FUTEX_BUCKETS; i++) {
         pthread_mutex_init(&buckets[i].lock, NULL);
         buckets[i].head = NULL;
@@ -1732,12 +2224,18 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
      * path is one that path makes regardless; an untimed wait short-circuits
      * before it.
      */
-    if (!has_timeout ||
-        futex_remaining_ns(&deadline, FUTEX_POLL_QUANTUM_NS, NULL) > 0) {
+    if (!key->file_backed &&
+        (!has_timeout ||
+         futex_remaining_ns(&deadline, FUTEX_POLL_QUANTUM_NS, NULL) > 0)) {
         const uint32_t *spin_word = (const uint32_t *) guest_ptr(g, uaddr);
         if (spin_word && futex_spin_word_moved(spin_word, expected))
             return -LINUX_EAGAIN;
     }
+
+    bool mmap_owned;
+    int shared_error = futex_shared_guard_begin(key->file_backed, &mmap_owned);
+    if (shared_error < 0)
+        return shared_error;
 
     pthread_mutex_lock(&b->lock);
 
@@ -1748,12 +2246,14 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
     int64_t block = futex_should_block(g, uaddr, expected);
     if (block != 0) {
         pthread_mutex_unlock(&b->lock);
+        futex_shared_guard_end(key->file_backed, mmap_owned);
         return block;
     }
 
     thread_entry_t *self = current_thread;
     if (!self) {
         pthread_mutex_unlock(&b->lock);
+        futex_shared_guard_end(key->file_backed, mmap_owned);
         return -LINUX_ESRCH;
     }
 
@@ -1761,6 +2261,7 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
         futex_waiter_t *waiter = calloc(1, sizeof(*waiter));
         if (!waiter) {
             pthread_mutex_unlock(&b->lock);
+            futex_shared_guard_end(key->file_backed, mmap_owned);
             return -LINUX_ENOMEM;
         }
         waiter->key = *key;
@@ -1772,6 +2273,14 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
         atomic_store_explicit(&waiter->home, idx, memory_order_relaxed);
         waiter->async_owner = self;
         pthread_cond_init(&waiter->cond, NULL);
+        shared_error = futex_shared_attach_locked(waiter, g);
+        if (shared_error < 0) {
+            pthread_cond_destroy(&waiter->cond);
+            free(waiter);
+            pthread_mutex_unlock(&b->lock);
+            futex_shared_guard_end(key->file_backed, mmap_owned);
+            return shared_error;
+        }
         b->head = waiter;
 
         exec_park_kind_store(self, PARK_KIND_FUTEX);
@@ -1811,7 +2320,13 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
                 clock_gettime(CLOCK_MONOTONIC, &now_mono) != 0) {
                 bucket_unlink_locked(b, waiter);
                 bool ours = futex_async_claim_pre_unmount_locked(self, waiter);
+                if (waiter->shared_slot)
+                    atomic_store_explicit(
+                        &futex_shared_registry->records[waiter->shared_slot - 1]
+                             .state,
+                        FUTEX_SHARED_CANCELLED, memory_order_release);
                 pthread_mutex_unlock(&b->lock);
+                futex_shared_guard_end(key->file_backed, mmap_owned);
                 if (ours)
                     futex_async_free_claimed(waiter);
                 return -LINUX_EINTR;
@@ -1826,7 +2341,13 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
                  */
                 bucket_unlink_locked(b, waiter);
                 bool ours = futex_async_claim_pre_unmount_locked(self, waiter);
+                if (waiter->shared_slot)
+                    atomic_store_explicit(
+                        &futex_shared_registry->records[waiter->shared_slot - 1]
+                             .state,
+                        FUTEX_SHARED_CANCELLED, memory_order_release);
                 pthread_mutex_unlock(&b->lock);
+                futex_shared_guard_end(key->file_backed, mmap_owned);
                 if (ours)
                     futex_async_free_claimed(waiter);
                 return -LINUX_ETIMEDOUT;
@@ -1853,6 +2374,7 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
          */
         bool kicked = futex_kick_consume();
         pthread_mutex_unlock(&b->lock);
+        futex_shared_guard_end(key->file_backed, mmap_owned);
 
         if (kicked) {
             bool teardown =
@@ -1928,6 +2450,8 @@ static bool futex_pi_waiter_within(const futex_bucket_t *b,
     for (const futex_waiter_t *w = b->head; w && budget != 0; w = w->next) {
         if (!futex_key_equal(&w->key, key) || (w->bitset & bitset) == 0)
             continue;
+        if (!futex_waiter_is_queued(w))
+            continue;
 
         /* A LOCK_PI waiter or a WAIT_REQUEUE_PI waiter cannot be reached by a
          * plain FUTEX_WAKE; Linux reports EINVAL.
@@ -1960,6 +2484,10 @@ static int64_t futex_wake(guest_t *g,
     unsigned idx = futex_hash_key(&key);
     futex_bucket_t *b = &buckets[idx];
     int woken = 0;
+    bool mmap_owned;
+    int shared_error = futex_shared_guard_begin(key.file_backed, &mmap_owned);
+    if (shared_error < 0)
+        return shared_error;
 
     pthread_mutex_lock(&b->lock);
 #ifdef ELFUSE_CONTRACT_ASSERT
@@ -2006,21 +2534,24 @@ static int64_t futex_wake(guest_t *g,
 
     if (futex_pi_waiter_within(b, &key, bitset, val)) {
         pthread_mutex_unlock(&b->lock);
+        futex_shared_guard_end(key.file_backed, mmap_owned);
         return -LINUX_EINVAL;
     }
+    if (key.file_backed)
+        woken = futex_shared_wake_locked(&key, val, bitset);
 
     futex_waiter_t **pp = &b->head;
     while (*pp && (uint32_t) woken < val) {
         futex_waiter_t *w = *pp;
         if (futex_key_equal(&w->key, &key) && (w->bitset & bitset) != 0) {
-            futex_wake_waiter_locked(pp);
-            woken++;
+            woken += futex_wake_waiter_locked(pp);
         } else {
             pp = &w->next;
         }
     }
 
     pthread_mutex_unlock(&b->lock);
+    futex_shared_guard_end(key.file_backed, mmap_owned);
     futex_async_wake_flush();
 
     return woken;
@@ -2063,6 +2594,11 @@ static int64_t futex_requeue(guest_t *g,
     unsigned idx_dst = futex_hash_key(dst);
     futex_bucket_t *b_src = &buckets[idx_src];
     futex_bucket_t *b_dst = &buckets[idx_dst];
+    bool host_shared = src->file_backed || dst->file_backed;
+    bool mmap_owned;
+    int shared_error = futex_shared_guard_begin(host_shared, &mmap_owned);
+    if (shared_error < 0)
+        return shared_error;
     if (idx_src == idx_dst) {
         pthread_mutex_lock(&b_src->lock);
     } else if (idx_src < idx_dst) {
@@ -2080,6 +2616,7 @@ static int64_t futex_requeue(guest_t *g,
             if (idx_src != idx_dst)
                 pthread_mutex_unlock(&b_dst->lock);
             pthread_mutex_unlock(&b_src->lock);
+            futex_shared_guard_end(host_shared, mmap_owned);
             return block;
         }
     }
@@ -2095,6 +2632,8 @@ static int64_t futex_requeue(guest_t *g,
     for (futex_waiter_t *w = b_src->head; w && checked != 0; w = w->next) {
         if (!futex_key_equal(&w->key, src))
             continue;
+        if (!futex_waiter_is_queued(w))
+            continue;
 
         /* The same PI rejection as futex_wake: a WAIT_REQUEUE_PI waiter is not
          * movable by a plain requeue.
@@ -2103,6 +2642,7 @@ static int64_t futex_requeue(guest_t *g,
             if (idx_src != idx_dst)
                 pthread_mutex_unlock(&b_dst->lock);
             pthread_mutex_unlock(&b_src->lock);
+            futex_shared_guard_end(host_shared, mmap_owned);
             return -LINUX_EINVAL;
         }
         checked--;
@@ -2118,13 +2658,28 @@ static int64_t futex_requeue(guest_t *g,
             pp = &w->next;
             continue;
         }
+        if (w->shared_slot &&
+            atomic_load_explicit(
+                &futex_shared_registry->records[w->shared_slot - 1].state,
+                memory_order_acquire) == FUTEX_SHARED_WOKEN) {
+            (void) futex_wake_waiter_locked(pp);
+            continue;
+        }
+        if (!futex_waiter_is_queued(w)) {
+            pp = &w->next;
+            continue;
+        }
 
         if ((uint32_t) woken < wake_count) {
             /* Wake this waiter: unlink from source, then signal */
-            futex_wake_waiter_locked(pp);
-            woken++;
+            woken += futex_wake_waiter_locked(pp);
             /* Leave pp unchanged because *pp is already the next node */
         } else if ((uint32_t) requeued < requeue_count) {
+            if (host_shared) {
+                shared_error = futex_shared_retarget_locked(w, g, dst);
+                if (shared_error < 0)
+                    break;
+            }
             if (idx_src == idx_dst) {
                 /* Same bucket: only the key changes. Linux's requeue_futex()
                  * takes this path too (hb1 == hb2), rewriting q->key without
@@ -2174,9 +2729,10 @@ static int64_t futex_requeue(guest_t *g,
         pthread_mutex_unlock(&b_src->lock);
         pthread_mutex_unlock(&b_dst->lock);
     }
+    futex_shared_guard_end(host_shared, mmap_owned);
     futex_async_wake_flush();
 
-    return (int64_t) woken + requeued;
+    return shared_error < 0 ? shared_error : (int64_t) woken + requeued;
 }
 
 /* FUTEX_WAKE_OP: atomically modify *uaddr2, wake val waiters at uaddr, then
@@ -2246,6 +2802,11 @@ static int64_t futex_wake_op(guest_t *g,
     unsigned idx2 = futex_hash_key(key2);
     futex_bucket_t *b1 = &buckets[idx1];
     futex_bucket_t *b2 = &buckets[idx2];
+    bool host_shared = key1->file_backed || key2->file_backed;
+    bool mmap_owned;
+    int shared_error = futex_shared_guard_begin(host_shared, &mmap_owned);
+    if (shared_error < 0)
+        return shared_error;
 
     /* Lock ordering */
     if (idx1 == idx2) {
@@ -2264,6 +2825,7 @@ static int64_t futex_wake_op(guest_t *g,
         if (idx1 != idx2)
             pthread_mutex_unlock(&b2->lock);
         pthread_mutex_unlock(&b1->lock);
+        futex_shared_guard_end(host_shared, mmap_owned);
         return -LINUX_EFAULT;
     }
 
@@ -2285,6 +2847,7 @@ static int64_t futex_wake_op(guest_t *g,
         if (idx1 != idx2)
             pthread_mutex_unlock(&b2->lock);
         pthread_mutex_unlock(&b1->lock);
+        futex_shared_guard_end(host_shared, mmap_owned);
         return -LINUX_EFAULT;
     }
 
@@ -2295,6 +2858,7 @@ static int64_t futex_wake_op(guest_t *g,
         if (idx1 != idx2)
             pthread_mutex_unlock(&b2->lock);
         pthread_mutex_unlock(&b1->lock);
+        futex_shared_guard_end(host_shared, mmap_owned);
         return -LINUX_ENOSYS;
     }
 
@@ -2315,37 +2879,49 @@ static int64_t futex_wake_op(guest_t *g,
         if (idx1 != idx2)
             pthread_mutex_unlock(&b2->lock);
         pthread_mutex_unlock(&b1->lock);
+        futex_shared_guard_end(host_shared, mmap_owned);
         return -LINUX_EINVAL;
     }
 
     /* Wake up to val waiters at uaddr (unlink woken entries) */
-    int woken1 = 0;
+    int woken1 = 0, woken2 = 0;
+    if (key1->file_backed)
+        woken1 = futex_shared_wake_locked(key1, val, FUTEX_BITSET_MATCH_ANY);
+    if (woken1 < 0) {
+        shared_error = woken1;
+        goto out_wake;
+    }
     futex_waiter_t **pp1 = &b1->head;
     while (*pp1 && (uint32_t) woken1 < val) {
         futex_waiter_t *w = *pp1;
         if (futex_key_equal(&w->key, key1)) {
-            futex_wake_waiter_locked(pp1);
-            woken1++;
+            woken1 += futex_wake_waiter_locked(pp1);
         } else {
             pp1 = &w->next;
         }
     }
 
     /* Conditionally wake up to val2 waiters at uaddr2 (unlink woken) */
-    int woken2 = 0;
     if (cond_met) {
+        if (key2->file_backed)
+            woken2 =
+                futex_shared_wake_locked(key2, val2, FUTEX_BITSET_MATCH_ANY);
+        if (woken2 < 0) {
+            shared_error = woken2;
+            goto out_wake;
+        }
         futex_waiter_t **pp2 = &b2->head;
         while (*pp2 && (uint32_t) woken2 < val2) {
             futex_waiter_t *w2 = *pp2;
             if (futex_key_equal(&w2->key, key2)) {
-                futex_wake_waiter_locked(pp2);
-                woken2++;
+                woken2 += futex_wake_waiter_locked(pp2);
             } else {
                 pp2 = &w2->next;
             }
         }
     }
 
+out_wake:
     /* Unlock reverse order */
     if (idx1 == idx2) {
         pthread_mutex_unlock(&b1->lock);
@@ -2356,9 +2932,10 @@ static int64_t futex_wake_op(guest_t *g,
         pthread_mutex_unlock(&b1->lock);
         pthread_mutex_unlock(&b2->lock);
     }
+    futex_shared_guard_end(host_shared, mmap_owned);
     futex_async_wake_flush();
 
-    return (int64_t) woken1 + woken2;
+    return shared_error < 0 ? shared_error : (int64_t) woken1 + woken2;
 }
 
 /* PI futexes use the futex word itself as an atomic lock:
@@ -2867,6 +3444,15 @@ static void futex_async_cancel_seq_locked(thread_entry_t *t,
      */
     bool was_woken = atomic_load_explicit(&w->woken, memory_order_acquire);
     if (!was_woken) {
+        if (w->shared_slot) {
+            uint32_t expected = FUTEX_SHARED_ARMED;
+            if (!atomic_compare_exchange_strong_explicit(
+                    &futex_shared_registry->records[w->shared_slot - 1].state,
+                    &expected, FUTEX_SHARED_CANCELLED, memory_order_acq_rel,
+                    memory_order_acquire) &&
+                expected == FUTEX_SHARED_WOKEN)
+                result = 0;
+        }
         bucket_unlink_locked(b, w);
         if (pi_waiter)
             futex_pi_unlink_waiter_locked(w);
@@ -2876,7 +3462,7 @@ static void futex_async_cancel_seq_locked(thread_entry_t *t,
     if (pi_waiter)
         pthread_mutex_unlock(&futex_pi_mutex);
 
-    if (was_woken)
+    if (was_woken && result != 0)
         return;
 
     /* This may run on a waker or timer thread. A relative FUTEX_WAIT timeout
@@ -2892,6 +3478,61 @@ static void futex_async_cancel_seq_locked(thread_entry_t *t,
     guest_t *g_done = t->park_guest;
     futex_async_finish_bookkeeping_locked(t, w_done, g_done);
     (void) sched_park_try_complete_seq(t, PARK_KIND_FUTEX, seq, result);
+}
+
+static void *futex_shared_helper(void *arg)
+{
+    futex_shared_process_t *p =
+        &futex_shared_registry->processes[futex_shared_process];
+    for (;;) {
+        uint64_t notify =
+            atomic_load_explicit(&p->notify, memory_order_acquire);
+        pthread_mutex_lock(&futex_lifetime_mutex);
+        for (;;) {
+            pthread_mutex_lock(&futex_shared_mutex);
+            if (!futex_shared_local) {
+                futex_shared_helper_running = false;
+                pthread_mutex_unlock(&futex_shared_mutex);
+                pthread_mutex_unlock(&futex_lifetime_mutex);
+                return NULL;
+            }
+            thread_entry_t *owner = NULL;
+            uint64_t seq = 0;
+            for (futex_waiter_t *w = futex_shared_local; w;
+                 w = w->shared_next) {
+                if (atomic_load_explicit(
+                        &futex_shared_registry->records[w->shared_slot - 1]
+                             .state,
+                        memory_order_acquire) == FUTEX_SHARED_WOKEN &&
+                    exec_park_active_load(w->async_owner) &&
+                    exec_park_kind_load(w->async_owner) == PARK_KIND_FUTEX &&
+                    sched_park_seq(w->async_owner) != 0 &&
+                    exec_park_waiter_load(w->async_owner) ==
+                        (w->waitv_group ? futex_waitv_tag(w->waitv_group)
+                                        : (void *) w)) {
+                    owner = w->async_owner;
+                    seq = sched_park_seq(owner);
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&futex_shared_mutex);
+            if (!owner)
+                break;
+            futex_async_cancel_seq_locked(owner, 0, seq);
+        }
+        pthread_mutex_unlock(&futex_lifetime_mutex);
+
+        /* A producer can die between its claim and notify. This timeout scans
+         * registry claims only; it never polls or invents a guest-word wake.
+         */
+        int rc = os_sync_wait_on_address_with_timeout(
+            &p->notify, notify, sizeof(p->notify), FUTEX_HOST_SHARED,
+            FUTEX_HOST_CLOCK_MACH_ABSOLUTE, 1000000000ULL);
+        if (rc < 0 && errno != EINTR && errno != ETIMEDOUT) {
+            struct timespec retry = {.tv_nsec = 1000000};
+            nanosleep(&retry, NULL);
+        }
+    }
 }
 
 static void futex_async_cancel_seq(thread_entry_t *t,
@@ -3323,7 +3964,7 @@ static int64_t futex_cmp_requeue_pi(guest_t *g,
      * targeting uaddr2 is EINVAL.
      */
     for (futex_waiter_t *w = b_src->head; w; w = w->next) {
-        if (!futex_key_equal(&w->key, src))
+        if (!futex_key_equal(&w->key, src) || !futex_waiter_is_queued(w))
             continue;
         if (!w->requeue_pi || w->requeue_pi_uaddr != uaddr2) {
             rc = -LINUX_EINVAL;
@@ -3338,7 +3979,8 @@ static int64_t futex_cmp_requeue_pi(guest_t *g,
     }
 
     for (first_pp = &b_src->head; *first_pp; first_pp = &(*first_pp)->next) {
-        if (futex_key_equal(&(*first_pp)->key, src)) {
+        if (futex_key_equal(&(*first_pp)->key, src) &&
+            futex_waiter_is_queued(*first_pp)) {
             first = *first_pp;
             break;
         }
@@ -3437,7 +4079,8 @@ static int64_t futex_cmp_requeue_pi(guest_t *g,
         futex_waiter_t **pp = &b_src->head;
         futex_waiter_t *w = NULL;
         while (*pp) {
-            if (futex_key_equal(&(*pp)->key, src)) {
+            if (futex_key_equal(&(*pp)->key, src) &&
+                futex_waiter_is_queued(*pp)) {
                 w = *pp;
                 break;
             }
@@ -3537,17 +4180,27 @@ static int64_t futex_robust_unlock(guest_t *g,
     uint64_t uaddr = key->uaddr;
     if (!futex_uaddr_is_aligned(uaddr))
         return -LINUX_EINVAL;
+    bool mmap_owned;
+    int shared_error = futex_shared_guard_begin(key->file_backed, &mmap_owned);
+    if (shared_error < 0)
+        return shared_error;
 
     uint32_t *word = (uint32_t *) guest_ptr_w(g, uaddr);
-    if (!word)
+    if (!word) {
+        futex_shared_guard_end(key->file_backed, mmap_owned);
         return -LINUX_EFAULT;
+    }
 
     uint32_t cur;
-    if (!futex_word_load(word, &cur))
+    if (!futex_word_load(word, &cur)) {
+        futex_shared_guard_end(key->file_backed, mmap_owned);
         return -LINUX_EFAULT;
+    }
     /* Owner check: val carries the expected TID (test passes gettid()). */
-    if (futex_pi_owner_tid(cur) != futex_pi_owner_tid(val))
+    if (futex_pi_owner_tid(cur) != futex_pi_owner_tid(val)) {
+        futex_shared_guard_end(key->file_backed, mmap_owned);
         return -LINUX_EPERM;
+    }
 
     /* Clear the word under the bucket lock so a concurrent waiter enqueue
      * cannot miss the wake after observing a non-zero owner.
@@ -3557,15 +4210,18 @@ static int64_t futex_robust_unlock(guest_t *g,
     for (;;) {
         if (!futex_word_load(word, &cur)) {
             pthread_mutex_unlock(&b->lock);
+            futex_shared_guard_end(key->file_backed, mmap_owned);
             return -LINUX_EFAULT;
         }
         if (futex_pi_owner_tid(cur) != futex_pi_owner_tid(val)) {
             pthread_mutex_unlock(&b->lock);
+            futex_shared_guard_end(key->file_backed, mmap_owned);
             return -LINUX_EPERM;
         }
         bool done = false;
         if (!futex_word_cas(word, &cur, 0, &done)) {
             pthread_mutex_unlock(&b->lock);
+            futex_shared_guard_end(key->file_backed, mmap_owned);
             return -LINUX_EFAULT;
         }
         if (done)
@@ -3582,28 +4238,24 @@ static int64_t futex_robust_unlock(guest_t *g,
          * kselftest uses an uncontended word (expects 0).
          */
         int nr = (cmd == FUTEX_UNLOCK_PI) ? 1 : 0x7fffffff;
-        for (int i = 0; i < nr; i++) {
-            futex_waiter_t *w = NULL;
-            for (futex_waiter_t *it = b->head; it; it = it->next) {
-                if (!futex_key_equal(&it->key, key))
-                    continue;
-                if (cmd == FUTEX_WAKE_BITSET && (it->bitset & bitset) == 0)
-                    continue;
-                w = it;
-                break;
-            }
-            if (!w)
-                break;
-            bucket_unlink_locked(b, w);
-            atomic_store_explicit(&w->woken, 1, memory_order_release);
-            if (w->async_owner)
-                futex_async_wake_queue(w);
+        if (key->file_backed)
+            woke = futex_shared_wake_locked(key, (uint32_t) nr, bitset);
+        if (woke < 0) {
+            pthread_mutex_unlock(&b->lock);
+            futex_shared_guard_end(key->file_backed, mmap_owned);
+            return woke;
+        }
+        futex_waiter_t **pp = &b->head;
+        while (*pp && woke < nr) {
+            futex_waiter_t *w = *pp;
+            if (futex_key_equal(&w->key, key) && (w->bitset & bitset) != 0)
+                woke += futex_wake_waiter_locked(pp);
             else
-                pthread_cond_signal(&w->cond);
-            woke++;
+                pp = &w->next;
         }
     }
     pthread_mutex_unlock(&b->lock);
+    futex_shared_guard_end(key->file_backed, mmap_owned);
     futex_async_wake_flush();
 
     if (pending_gva) {
@@ -3843,11 +4495,6 @@ static bool futex_waitv_retire_locked(thread_entry_t *t,
     if (atomic_exchange_explicit(&grp->completed, 1, memory_order_acq_rel))
         return false;
 
-    int published = atomic_load_explicit(&grp->result, memory_order_acquire);
-    int64_t result =
-        published != FUTEX_WAITV_RESULT_UNSET ? published : fallback;
-    if (result == FUTEX_WAITV_RESULT_UNSET)
-        result = -LINUX_EAGAIN;
 
     guest_t *g_snap = t->park_guest;
     unsigned pubs[FUTEX_WAITV_MAX];
@@ -3858,14 +4505,29 @@ static bool futex_waitv_retire_locked(thread_entry_t *t,
             &buckets[atomic_load_explicit(&w->home, memory_order_acquire)];
         pthread_mutex_lock(&b->lock);
         b = futex_waiter_follow(b, w);
+        if (w->shared_slot) {
+            uint32_t expected = FUTEX_SHARED_ARMED;
+            if (!atomic_compare_exchange_strong_explicit(
+                    &futex_shared_registry->records[w->shared_slot - 1].state,
+                    &expected, FUTEX_SHARED_CANCELLED, memory_order_acq_rel,
+                    memory_order_acquire) &&
+                expected == FUTEX_SHARED_WOKEN)
+                futex_waitv_note_wake(w);
+        }
         if (!atomic_load_explicit(&w->woken, memory_order_acquire))
             bucket_unlink_locked(b, w);
         atomic_store_explicit(&w->woken, 1, memory_order_release);
         pubs[i] = w->pub_bucket;
         pthread_mutex_unlock(&b->lock);
     }
+    int published = atomic_load_explicit(&grp->result, memory_order_acquire);
+    int64_t result =
+        published != FUTEX_WAITV_RESULT_UNSET ? published : fallback;
+    if (result == FUTEX_WAITV_RESULT_UNSET)
+        result = -LINUX_EAGAIN;
 
     for (uint32_t i = 0; i < grp->n; i++) {
+        futex_shared_retire(&grp->waiters[i]);
         pthread_cond_destroy(&grp->waiters[i].cond);
         if (g_snap)
             shim_globals_futex_waiters_add(g_snap, pubs[i], -1);
@@ -4029,10 +4691,12 @@ int64_t sys_futex_waitv(guest_t *g,
     }
 
     futex_key_t keys[FUTEX_WAITV_MAX];
+    bool host_shared = false;
     for (uint32_t i = 0; i < nr_futexes; i++) {
         bool shared = (elts[i].flags & FUTEX2_PRIVATE) == 0;
         if (!futex_key_get(g, elts[i].uaddr, shared, &keys[i]))
             return -LINUX_EFAULT;
+        host_shared |= keys[i].file_backed;
     }
 
     thread_entry_t *self = current_thread;
@@ -4051,6 +4715,13 @@ int64_t sys_futex_waitv(guest_t *g,
     grp->owner = self;
     grp->n = nr_futexes;
     grp->waiters = waiters;
+    bool mmap_owned;
+    int shared_error = futex_shared_guard_begin(host_shared, &mmap_owned);
+    if (shared_error < 0) {
+        free(waiters);
+        free(grp);
+        return shared_error;
+    }
 
     unsigned bucket_ids[FUTEX_WAITV_MAX];
     int nbuckets = waitv_collect_buckets(keys, nr_futexes, bucket_ids);
@@ -4094,6 +4765,11 @@ int64_t sys_futex_waitv(guest_t *g,
         w->waitv_index = (int) i;
         atomic_store_explicit(&w->home, idx, memory_order_relaxed);
         pthread_cond_init(&w->cond, NULL);
+        result_err = futex_shared_attach_locked(w, g);
+        if (result_err < 0) {
+            pthread_cond_destroy(&w->cond);
+            goto unlock_early;
+        }
         b->head = w;
         enqueued++;
     }
@@ -4123,6 +4799,7 @@ int64_t sys_futex_waitv(guest_t *g,
 
     for (int i = nbuckets - 1; i >= 0; i--)
         pthread_mutex_unlock(&buckets[bucket_ids[i]].lock);
+    futex_shared_guard_end(host_shared, mmap_owned);
 
     /* A waker or the wait timer can retire the whole set as soon as the bucket
      * locks drop. Read only the pointer and the task's result until the tag
@@ -4159,10 +4836,13 @@ unlock_early:
         futex_waiter_t *w = &waiters[i];
         unsigned home = atomic_load_explicit(&w->home, memory_order_relaxed);
         bucket_unlink_locked(&buckets[home], w);
+        if (w->shared_slot)
+            futex_shared_retire_locked(w);
         pthread_cond_destroy(&w->cond);
     }
     for (int i = nbuckets - 1; i >= 0; i--)
         pthread_mutex_unlock(&buckets[bucket_ids[i]].lock);
+    futex_shared_guard_end(host_shared, mmap_owned);
 
     for (uint32_t i = 0; i < nr_futexes; i++)
         shim_globals_futex_waiters_add(
@@ -4230,12 +4910,24 @@ static bool futex_pi_state_has_waiters(thread_entry_t *t,
  */
 static bool futex_wake_key_if_queued(const futex_key_t *key)
 {
+    if (key->file_backed && futex_shared_begin() < 0)
+        return false;
     futex_bucket_t *b = &buckets[futex_hash_key(key)];
     pthread_mutex_lock(&b->lock);
-    bool queued = bucket_has_key_locked(b, key);
-    if (queued)
+    int selected = key->file_backed ? futex_shared_wake_locked(
+                                          key, 1, FUTEX_BITSET_MATCH_ANY)
+                                    : 0;
+    if (selected < 0) {
+        pthread_mutex_unlock(&b->lock);
+        futex_shared_end();
+        return false;
+    }
+    bool queued = selected || bucket_has_key_locked(b, key);
+    if (queued && !selected)
         futex_wake_first_locked(b, key);
     pthread_mutex_unlock(&b->lock);
+    if (key->file_backed)
+        futex_shared_end();
     return queued;
 }
 

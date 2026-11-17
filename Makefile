@@ -388,6 +388,10 @@ $(BUILD_DIR)/test-memfd-scm-host: tests/test-memfd-scm-host.c | $(BUILD_DIR)
 	@echo "  CC      $<"
 	$(Q)$(CC) $(CFLAGS) -Itests -o $@ $<
 
+$(BUILD_DIR)/test-futex-shared-vm-host: tests/test-futex-shared-vm-host.c | $(BUILD_DIR)
+	@echo "  CC      $<"
+	$(Q)$(CC) $(CFLAGS) -Itests -o $@ $<
+
 # Guest test binaries (cross-compiled, aarch64-linux)
 # Only used when GUEST_TEST_BINARIES is not set.
 
@@ -783,6 +787,11 @@ $(BUILD_DIR)/test-futex-wake-nowaiter: tests/test-futex-wake-nowaiter.c \
 
 # test-futex-shared-alias waits on one MAP_SHARED mapping and wakes another.
 $(BUILD_DIR)/test-futex-shared-alias: tests/test-futex-shared-alias.c \
+    | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+$(BUILD_DIR)/test-futex-shared-vm: tests/test-futex-shared-vm.c \
     | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
