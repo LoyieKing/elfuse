@@ -76,6 +76,8 @@
  *   mq_lock (syscall/mqueue.c): queue objects; nests fd_lock and scheduler
  *                                     timer operations while arming waits
  *   fd_lock      (syscall/fdtable.c): FD table (alloc/close/dup)
+ *   owner_store_lock (syscall/chown-overlay.c): ownership-store writer;
+ *                                     holds only the table fd's flock
  *   epoll inst   (syscall/poll.c):    per-epoll-instance regs[]; taken under
  *                                     fd_lock by the close hook, taken alone
  *                                     (no fd_lock held) by epoll_ctl/pwait
