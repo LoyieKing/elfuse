@@ -55,6 +55,7 @@
 #include "syscall/abi.h"
 #include "syscall/linux-wire.h"
 #include "syscall/asyncio.h"
+#include "syscall/chown-overlay.h"
 #include "syscall/exec.h"
 #include "syscall/fd.h"
 #include "syscall/fuse.h"
@@ -2002,6 +2003,10 @@ static int64_t sc_memfd_create(guest_t *g,
     int fd = tmpfile_anon("memfd");
     if (fd < 0)
         return linux_errno();
+    if (!chown_owner_claim_fd(fd, proc_get_euid(), proc_get_egid())) {
+        close(fd);
+        return -LINUX_ENOMEM;
+    }
 
     /* Before the slot exists, so a sibling scanning /proc/self/fd cannot send
      * the descriptor without the identity on its backing file.

@@ -1,16 +1,31 @@
 /*
- * Virtual chown overlay (fakeroot-style)
+ * Guest-visible file ownership
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * Records intended owner/group for files whose host chown returned EPERM
- * (rootless macOS cannot chown to arbitrary uids/gids) so a subsequent
- * stat/statx/fstat from the guest returns the value the program just "chowned"
- * to instead of the host's real owner.
+ * One table answers "who owns this inode" for the guest, shared by every elfuse
+ * process that uses the same sysroot. A record is written when a syscall
+ * creates an inode or the guest chowns one, and stat reports it, so a file
+ * created by one process has one owner in every process. Files with no record
+ * keep the host owner, and recording is skipped for an identity the host
+ * already reports correctly.
  *
- * Keyed by host (st_dev, st_ino) so overrides survive rename and apply
- * uniformly to every hard link.
+ * The table is a private directory beside the canonical sysroot
+ * (<sysroot>.elfuse-owner/), so it is exactly as durable as the tree it
+ * describes and is removed with that tree, never by clearing a global scratch
+ * directory.
+ *
+ * While that table exists it is authoritative: the process-local chown overlay
+ * below is not consulted, because a chown another process records later would
+ * otherwise stay hidden behind this process's older entry. Without a table,
+ * when there is no sysroot or the private file cannot be mapped, the overlay is
+ * the only layer, and an owner it cannot express is a failure for the caller
+ * rather than a silent fallback to the host uid.
+ *
+ * Both layers key on host inode identity, so an entry survives rename and
+ * covers every hard link; the shared record also keys on birth time, so a
+ * reused inode cannot inherit a previous file's owner.
  */
 
 #pragma once
@@ -60,3 +75,54 @@ int chown_overlay_send(int ipc_sock);
  * in-build cap (malformed wire), or allocation failure during install.
  */
 int chown_overlay_recv(int ipc_sock);
+
+/* The three states the store can be in, which decide what a caller may rely on.
+ *
+ * NO_STORE means this run was never meant to share owners: no sysroot is
+ * configured, so there is no tree to share. The process-local chown overlay is
+ * the whole answer there, exactly as it was before a shared table existed, and
+ * an identity the host cannot express is not an error.
+ *
+ * READ_ONLY means a sysroot is configured but its table cannot be written here
+ * (another user's private directory, no room, a mapping failure). Records other
+ * processes wrote are still honoured; a caller that needs to add one is told so
+ * and fails, rather than quietly answering with the host uid.
+ *
+ * SHARED is the normal case and is authoritative over the local overlay.
+ */
+typedef enum {
+    CHOWN_OWNER_NO_STORE = 0,
+    CHOWN_OWNER_READ_ONLY = 1,
+    CHOWN_OWNER_SHARED = 2,
+} chown_owner_mode_t;
+
+chown_owner_mode_t chown_owner_mode(void);
+
+/* If @st's inode has an owner record, substitute its uid/gid in place. Falls
+ * back to the process-local overlay only in CHOWN_OWNER_NO_STORE mode, where
+ * that overlay is authoritative.
+ */
+void chown_owner_apply(struct stat *st);
+
+/* Record @uid/@gid as the owner of the inode @host_st describes, replacing an
+ * earlier record and resolving the @uid/@gid sentinel ((uint32_t)-1) against
+ * the record it replaces, in one critical section, so concurrent partial chowns
+ * cannot lose each other's field.
+ *
+ * Returns false only when a record was required and could not be written, which
+ * includes every case the local overlay could not express in NO_STORE mode, so
+ * the caller's failure matches what the guest would see from an unanswered
+ * chown.
+ */
+bool chown_owner_record(const struct stat *host_st, uint32_t uid, uint32_t gid);
+
+/* Record the owner after a successful atomic creation. Reopening an existing
+ * inode must not call this; a fresh creation replaces a stale record when the
+ * filesystem reuses an inode number.
+ */
+bool chown_owner_claim(const struct stat *host_st, uint32_t uid, uint32_t gid);
+bool chown_owner_claim_fd(int host_fd, uint32_t uid, uint32_t gid);
+bool chown_owner_claim_at(int host_dirfd,
+                          const char *host_path,
+                          uint32_t uid,
+                          uint32_t gid);

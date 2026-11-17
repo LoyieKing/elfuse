@@ -130,7 +130,7 @@ static int write_linux_stat(guest_t *g,
                             const struct stat *mac_st)
 {
     struct stat overlaid = *mac_st;
-    chown_overlay_apply(&overlaid);
+    chown_owner_apply(&overlaid);
 
     linux_stat_t lin_st;
 
@@ -144,7 +144,7 @@ static int write_linux_statx(guest_t *g,
                              unsigned int mask)
 {
     struct stat overlaid = *mac_st;
-    chown_overlay_apply(&overlaid);
+    chown_owner_apply(&overlaid);
 
     linux_statx_t sx;
 

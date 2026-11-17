@@ -114,6 +114,16 @@ files take precedence; inheriting a numeric ID does not import macOS usernames.
 guest's syscalls, so the number the guest sees is elfuse's to choose. The spec is
 numeric, and a bare `UID` sets the group to the same value.
 
+With a sysroot, newly created inodes report the guest's effective UID/GID.
+Other elfuse processes using that tree observe the same owners through stat
+and statx. Reopening, renaming, hard-linking or changing timestamps preserves
+ownership; explicit chown updates the same record without changing host IDs.
+The private `<canonical-sysroot>.elfuse-owner/v3` table is outside the guest
+namespace and persists with instance data. Remove that sibling directory when
+deleting the sysroot. The table holds 65,536 inode records; a required record
+that cannot be written fails the operation instead of returning a wrong owner.
+Without a sysroot, explicit chown uses the process-local overlay.
+
 `--pid N` and `--ppid N` set the identity the guest reports through `getpid`
 and `getppid`, and the initial session and process group. The defaults are PID
 `1` and parent PID `0`; `--pid` alone leaves the parent at `0`, and `--ppid`

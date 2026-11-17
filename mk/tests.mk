@@ -62,9 +62,13 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-usage-synopsis \
         probe-volume-naming perf
 .PHONY: test-initial-identity test-strict-sysroot
+.PHONY: test-created-owner
 
 test-initial-identity: $(ELFUSE_BIN) $(TEST_DIR)/test-initial-identity
 	@bash tests/test-initial-identity.sh $(ELFUSE_BIN) $(TEST_DIR)/test-initial-identity
+
+test-created-owner: $(ELFUSE_BIN) $(TEST_DIR)/test-created-owner
+	@bash tests/test-created-owner.sh $(ELFUSE_BIN) $(TEST_DIR)/test-created-owner
 
 test-strict-sysroot: $(ELFUSE_BIN) $(BUILD_DIR)/test-strict-sysroot
 	@set -e; \
@@ -331,6 +335,7 @@ $(call run-lane,test-dir-union-alias,a dup shares one listing position and one u
 $(call run-lane,test-dir-primary-read-error,a failed synthetic read is reported not ended)
 $(call run-lane,test-getdents64-small-buf,a getdents64 buffer too small for one entry)
 $(call run-lane,test-fstatat-empty-path,AT_EMPTY_PATH stat by fd under a sysroot)
+$(call run-lane,test-created-owner,inode ownership across independently launched guests)
 $(call run-lane,test-sysroot-name-unique,one on-disk name per guest name)
 $(call run-lane,test-sysroot-name-relative,relative and dirfd-relative names)
 $(call run-lane,test-sysroot-name-i18n,non-ASCII guest filenames)

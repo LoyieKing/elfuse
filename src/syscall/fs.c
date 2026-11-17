@@ -826,6 +826,95 @@ static int open_nonblocking_writer(int dirfd,
     }
 }
 
+/* One O_CREAT open that also reports whether this call created the inode, which
+ * a name precheck cannot answer: the kernel decides it, so two processes racing
+ * for one absent name cannot both believe they created it.
+ *
+ * Two invariants hold together. A retry must never create an inode unnoticed,
+ * so every attempt that can create is an O_EXCL attempt whose success sets
+ * @created and whose EEXIST means somebody else owns the inode; the ordinary
+ * reopen is made without O_CREAT, so a name that vanishes underneath it cannot
+ * be silently recreated. And a dangling leaf symlink must not loop: O_EXCL
+ * answers EEXIST for the link itself while a following open reaches ENOENT, and
+ * that pair says the create belongs to the link's target. The target is found
+ * by handing the guest's own path back to the resolver with follow semantics,
+ * so containment, root clamping, case folding and the MAXSYMLINKS budget all
+ * stay one resolver's answer; nothing here reads a host symlink or rebuilds a
+ * host path.
+ *
+ * A guest that asked for O_EXCL or O_NOFOLLOW keeps exactly that: EEXIST and
+ * ELOOP, including for a dangling leaf link, are the answers it requested, and
+ * neither request reaches the follow retry.
+ */
+static int open_create_tracked(guest_fd_t dirfd,
+                               host_fd_t host_dirfd,
+                               const char *guest_path,
+                               const char *host_path,
+                               int flags,
+                               mode_t mode,
+                               bool *created)
+{
+    *created = false;
+    if (!(flags & O_CREAT))
+        return open_nonblocking_writer(host_dirfd, host_path, flags, mode);
+    if (flags & O_EXCL) {
+        int excl = open_nonblocking_writer(host_dirfd, host_path, flags, mode);
+        *created = excl >= 0;
+        return excl;
+    }
+
+    int excl =
+        open_nonblocking_writer(host_dirfd, host_path, flags | O_EXCL, mode);
+    if (excl >= 0) {
+        *created = true;
+        return excl;
+    }
+    if (errno != EEXIST)
+        return -1;
+
+    int existing =
+        open_nonblocking_writer(host_dirfd, host_path, flags & ~O_CREAT, mode);
+    if (existing >= 0)
+        return existing;
+    if (errno != ENOENT)
+        return -1;
+
+    /* A guest that asked not to follow the leaf is owed ELOOP here, and the
+     * non-creating probe above already produced it; following the chain now
+     * would hand back a descriptor the guest refused.
+     */
+    if (flags & O_NOFOLLOW) {
+        errno = ELOOP;
+        return -1;
+    }
+
+    /* The leaf is a dangling symlink: the O_EXCL attempt saw the entry and the
+     * ordinary open reached no target. Resolve the guest's own path again with
+     * follow semantics -- the resolver unwinds the chain in guest space under
+     * its own MAXSYMLINKS budget and reports the host spelling the create lands
+     * on -- then ask the one create question about that spelling.
+     */
+    path_translation_t tx;
+    if (path_translate_at(dirfd, guest_path, PATH_TR_NONE, &tx) < 0)
+        return -1;
+    if (!tx.host_path) {
+        errno = ENOENT;
+        return -1;
+    }
+
+    host_fd_t retry_dirfd = tx.is_dev_shm ? AT_FDCWD : host_dirfd;
+    int retry_flags = flags | (tx.is_dev_shm ? O_NOFOLLOW : 0);
+    int retry = open_nonblocking_writer(retry_dirfd, tx.host_path,
+                                        retry_flags | O_EXCL, mode);
+    if (retry >= 0) {
+        *created = true;
+        return retry;
+    }
+    if (errno != EEXIST)
+        return -1;
+    return open_nonblocking_writer(retry_dirfd, tx.host_path,
+                                   retry_flags & ~O_CREAT, mode);
+}
 int64_t sys_openat_path(guest_t *g,
                         int dirfd,
                         const char *pathp,
@@ -862,7 +951,7 @@ int64_t sys_openat_path(guest_t *g,
     unsigned int tx_flags =
         (linux_flags & LINUX_O_NOFOLLOW) ? PATH_TR_NOFOLLOW : PATH_TR_NONE;
     if (linux_flags & LINUX_O_CREAT)
-        tx_flags = PATH_TR_CREATE | PATH_TR_CREATE_PARENTS;
+        tx_flags |= PATH_TR_CREATE | PATH_TR_CREATE_PARENTS;
     if (path_translate_at(dirfd, pathp, tx_flags, &tx) < 0)
         return linux_errno();
 
@@ -1012,10 +1101,21 @@ int64_t sys_openat_path(guest_t *g,
     }
 
     if (dirfd == LINUX_AT_FDCWD) {
-        int host_fd =
-            open_nonblocking_writer(AT_FDCWD, tx.host_path, flags, mode);
+        bool created = false;
+        int host_fd = open_create_tracked(LINUX_AT_FDCWD, AT_FDCWD, pathp,
+                                          tx.host_path, flags, mode, &created);
         if (host_fd < 0)
             return linux_errno();
+
+        /* The host stamps a new file with its own uid, so a create has to say
+         * who made it. The host reported the creation itself, so a reopen of
+         * somebody else's inode never reaches this claim.
+         */
+        if (created &&
+            !chown_owner_claim_fd(host_fd, proc_get_euid(), proc_get_egid())) {
+            close_keep_errno(host_fd);
+            return -LINUX_ENOMEM;
+        }
 
         int type = opened_fd_type(host_fd, linux_flags);
         if (type < 0) {
@@ -1034,8 +1134,9 @@ int64_t sys_openat_path(guest_t *g,
     if (ref_err < 0)
         return ref_err;
 
-    int host_fd =
-        open_nonblocking_writer(dir_ref.fd, tx.host_path, flags, mode);
+    bool created = false;
+    int host_fd = open_create_tracked(dirfd, dir_ref.fd, pathp, tx.host_path,
+                                      flags, mode, &created);
     if (host_fd < 0 && errno == ENOENT) {
         /* Relative walkers (systemd chase() opens one component per openat)
          * step from host-backed directories into synthetic subtrees the host
@@ -1059,6 +1160,11 @@ int64_t sys_openat_path(guest_t *g,
     host_fd_ref_close(&dir_ref);
     if (host_fd < 0)
         return linux_errno();
+    if (created &&
+        !chown_owner_claim_fd(host_fd, proc_get_euid(), proc_get_egid())) {
+        close_keep_errno(host_fd);
+        return -LINUX_ENOMEM;
+    }
 
     int type = opened_fd_type(host_fd, linux_flags);
     if (type < 0) {
@@ -3329,12 +3435,21 @@ int64_t sys_mkdirat(guest_t *g, int dirfd, uint64_t path_gva, int mode)
     if (ref_err < 0)
         return ref_err;
 
-    if (mkdirat(path_translation_dirfd(&tx, &dir_ref), tx.host_path,
-                (mode_t) mode) < 0) {
+    host_fd_t host_dirfd = path_translation_dirfd(&tx, &dir_ref);
+    if (mkdirat(host_dirfd, tx.host_path, (mode_t) mode) < 0) {
         host_fd_ref_close(&dir_ref);
         return linux_errno();
     }
 
+    /* The directory exists now, so a record that cannot be written would leave
+     * it reporting the host's owner; remove it and report the failure.
+     */
+    if (!chown_owner_claim_at(host_dirfd, tx.host_path, proc_get_euid(),
+                              proc_get_egid())) {
+        (void) unlinkat(host_dirfd, tx.host_path, AT_REMOVEDIR);
+        host_fd_ref_close(&dir_ref);
+        return -LINUX_ENOMEM;
+    }
     host_fd_ref_close(&dir_ref);
     return 0;
 }
@@ -3486,11 +3601,17 @@ int64_t sys_mknodat(guest_t *g, int dirfd, uint64_t path_gva, int mode, int dev)
     /* FIFO via mkfifoat and regular files via openat are supported; device
      * nodes need root
      */
+    host_fd_t host_dirfd = path_translation_dirfd(&tx, &dir_ref);
     if (S_ISFIFO(mode)) {
-        if (mkfifoat(path_translation_dirfd(&tx, &dir_ref), tx.host_path,
-                     mode & 0777) < 0) {
+        if (mkfifoat(host_dirfd, tx.host_path, mode & 0777) < 0) {
             host_fd_ref_close(&dir_ref);
             return linux_errno();
+        }
+        if (!chown_owner_claim_at(host_dirfd, tx.host_path, proc_get_euid(),
+                                  proc_get_egid())) {
+            (void) unlinkat(host_dirfd, tx.host_path, 0);
+            host_fd_ref_close(&dir_ref);
+            return -LINUX_ENOMEM;
         }
         host_fd_ref_close(&dir_ref);
         return 0;
@@ -3498,11 +3619,16 @@ int64_t sys_mknodat(guest_t *g, int dirfd, uint64_t path_gva, int mode, int dev)
 
     /* Regular files: create an empty file */
     if (S_ISREG(mode) || (mode & S_IFMT) == 0) {
-        int fd = openat(path_translation_dirfd(&tx, &dir_ref), tx.host_path,
-                        O_CREAT | O_WRONLY | O_EXCL, mode & 0777);
+        int fd = openat(host_dirfd, tx.host_path, O_CREAT | O_WRONLY | O_EXCL,
+                        mode & 0777);
         host_fd_ref_close(&dir_ref);
         if (fd < 0)
             return linux_errno();
+        if (!chown_owner_claim_fd(fd, proc_get_euid(), proc_get_egid())) {
+            (void) unlinkat(host_dirfd, tx.host_path, 0);
+            close_keep_errno(fd);
+            return -LINUX_ENOMEM;
+        }
         close(fd);
         return 0;
     }
@@ -3669,10 +3795,16 @@ int64_t sys_symlinkat(guest_t *g,
     }
 
     /* Resolve linkpath (the new symlink location) through sysroot */
-    if (symlinkat(host_target, path_translation_dirfd(&tx, &dir_ref),
-                  tx.host_path) < 0) {
+    host_fd_t host_dirfd = path_translation_dirfd(&tx, &dir_ref);
+    if (symlinkat(host_target, host_dirfd, tx.host_path) < 0) {
         host_fd_ref_close(&dir_ref);
         return linux_errno();
+    }
+    if (!chown_owner_claim_at(host_dirfd, tx.host_path, proc_get_euid(),
+                              proc_get_egid())) {
+        (void) unlinkat(host_dirfd, tx.host_path, 0);
+        host_fd_ref_close(&dir_ref);
+        return -LINUX_ENOMEM;
     }
 
     host_fd_ref_close(&dir_ref);
@@ -4151,22 +4283,23 @@ static int64_t chown_result(int host_rc,
 {
     if (host_rc < 0 && errno != EPERM)
         return linux_errno();
-    if (host_st) {
-        /* The overlay's no-op and removal checks need the guest-visible owner,
-         * including any earlier virtual chown on this inode.
+    if (!host_st)
+        return 0;
+
+    /* One entry point for all three modes. In a shared table it resolves the
+     * sentinels and writes the pair in one critical section, so concurrent
+     * partial chowns cannot lose each other's field; in no-store mode it writes
+     * the process-local overlay, which is that mode's owner state. A chown is
+     * never written to both, because the local entry would shadow the record
+     * with an older view of the inode.
+     */
+    if (!chown_owner_record(host_st, owner, group)) {
+        /* The owner could not be recorded (a full table, a read-only table, or
+         * no writable private file). A success here would be contradicted by
+         * the next stat, so report the allocation failure Linux's chown(2)
+         * lists for its own bookkeeping.
          */
-        struct stat guest_st = *host_st;
-        chown_overlay_apply(&guest_st);
-        if (chown_overlay_set((uint64_t) host_st->st_dev,
-                              (uint64_t) host_st->st_ino, owner, group,
-                              guest_st.st_uid, guest_st.st_gid) < 0) {
-            /* Override allocation failed; reporting success would lie about the
-             * post-call stat round-trip. Linux's chown(2) lists ENOMEM among
-             * its possible errors for related allocation paths, so surface that
-             * to the guest instead.
-             */
-            return -LINUX_ENOMEM;
-        }
+        return -LINUX_ENOMEM;
     }
     return 0;
 }

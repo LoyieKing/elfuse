@@ -710,7 +710,7 @@ static int64_t exec_preload_interp(const guest_t *g,
     if (fstat(interp->fd, &interp_st) < 0) {
         return linux_errno();
     }
-    chown_overlay_apply(&interp_st);
+    chown_owner_apply(&interp_st);
 
     int64_t err = exec_check_permission(&interp_st);
     if (err < 0) {
@@ -1231,7 +1231,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      * elevation but never conjure one.
      */
     struct stat exec_st_seen = exec_st;
-    chown_overlay_apply(&exec_st_seen);
+    chown_owner_apply(&exec_st_seen);
 
     err = exec_check_permission(&exec_st_seen);
     if (err < 0) {
@@ -1392,7 +1392,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
             err = linux_errno();
             goto fail;
         }
-        chown_overlay_apply(&interp_st);
+        chown_owner_apply(&interp_st);
         err = exec_check_permission(&interp_st);
         if (err < 0) {
             goto fail;
@@ -1577,8 +1577,8 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     /* The surviving task keeps its own SP_EL1 slot across execve. de_thread
      * just retired the old leader, so slot 0 (the shim data block top, which
      * the old staging used) is free for the next clone; re-entering on it would
-     * hand a new thread the same EL1 stack the new leader is still using,
-     * and the two would overwrite each other's saved SVC frames. Use the task's
+     * hand a new thread the same EL1 stack the new leader is still using, and
+     * the two would overwrite each other's saved SVC frames. Use the task's
      * allocation instead: the recorded stack must resolve to the slot the
      * thread table allocated to it, the same address guest_ctx_restore installs
      * on every other mount.
