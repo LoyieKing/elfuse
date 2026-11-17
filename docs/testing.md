@@ -92,9 +92,12 @@ make lint
 make clean
 ```
 
-
 Dispatch generation checks every manifest handler against the C wrappers,
 including the I/O and paired-descriptor macros, before writing `build/dispatch.h`.
+
+The default runtime matrix does not connect to an X server or launch XQuartz.
+Umaru graphics validation uses its GPUI/AppKit and Skia/Metal backend.
+
 What they do:
 
 - `make elfuse`: build and sign `build/elfuse`

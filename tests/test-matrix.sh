@@ -1120,9 +1120,6 @@ run_unit_tests()
     printf "\nfstatat/statx AT_EMPTY_PATH\n"
     test_rc "$runner" "test-fstatat-empty-path" 0 "$bindir/test-fstatat-empty-path"
 
-    printf "\nX11 raw protocol\n"
-    test_check "$runner" "test-x11" "0 failed" "$bindir/test-x11"
-
     # Filenames, against the reference kernel. These pin what Linux does with
     # names that collide only under case folding or Unicode normalization, and
     # with names at the length limit, the expectations the sysroot's on-disk
